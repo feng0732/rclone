@@ -176,14 +176,35 @@ func (c *Cipher) encryptFileName(in string) string {
 
 ```go
 type encrypter struct {
-    in       io.Reader          // 底层输入流（明文）
-    c        *Cipher            // 密码器引用
-    nonce    nonce              // 当前块的 nonce，每块递增
-    buf      *[blockSize]byte   // 加密输出缓冲区
-    readBuf  *[blockDataSize]byte // 明文读取缓冲区
-    bufIndex int                // 当前读取位置
-    bufSize  int                // 缓冲区有效数据大小
+    in       io.Reader        // 底层输入流（明文）
+    c        *Cipher          // 密码器引用
+    nonce    nonce            // 当前块的 nonce，每块递增
+    buf      *[blockSize]byte // 加密输出缓冲区（65552B，来自 sync.Pool）
+    readBuf  *[blockSize]byte // 明文读取缓冲区（65552B，来自 sync.Pool，使用时只截取前 65536B）
+    bufIndex int              // 当前读取位置
+    bufSize  int              // 缓冲区有效数据大小
     // ...
+}
+```
+
+> **关键说明**：`buf` 和 `readBuf` **都是 `*[blockSize]byte`（65552 字节）**，两者都由同一个 `Cipher.buffers`（`sync.Pool`）通过 `getBlock()` 分配。只是用途不同，使用切片截取来控制实际读写长度。
+
+#### 缓冲区池 — `Cipher.buffers` / `getBlock()` / `putBlock()`（`backend/crypt/cipher.go`）
+
+```go
+// Cipher 初始化时创建 sync.Pool，每个元素是 65552 字节的数组指针
+c.buffers.New = func() any {
+    return new([blockSize]byte) // blockSize = 65552
+}
+
+// 从池里取一个 65552B 块
+func (c *Cipher) getBlock() *[blockSize]byte {
+    return c.buffers.Get().(*[blockSize]byte)
+}
+
+// 把 65552B 块归还池
+func (c *Cipher) putBlock(buf *[blockSize]byte) {
+    c.buffers.Put(buf)
 }
 ```
 
@@ -192,22 +213,38 @@ type encrypter struct {
 ```go
 func (fh *encrypter) Read(p []byte) (n int, err error) {
     if fh.bufIndex >= fh.bufSize {
-        // 1. 读取一块明文数据（最多 64KB）
-        n, err = readers.ReadFill(fh.in, readBuf[:blockDataSize])
+        // 1. 从 65552B 的 readBuf 中**只截取前 65536B** 来读明文
+        //    （blockDataSize = 64KB，一个块最多存这么多明文）
+        readBuf := (*fh.readBuf)[:blockDataSize]
+        n, err = readers.ReadFill(fh.in, readBuf)
         if n == 0 {
-            return fh.finish(err) // EOF
+            return fh.finish(err) // EOF，finish() 会把 buf 和 readBuf 都归还 Pool
         }
         // 2. 使用 secretbox 加密（XSalsa20 + Poly1305 认证加密）
+        //    输出到 buf 的全部 65552B 空间（实际写 16+n 字节）
         secretbox.Seal((*fh.buf)[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
         fh.bufIndex = 0
         fh.bufSize = blockHeaderSize + n // 16 + n 字节
         // 3. nonce 递增（每个块用不同 nonce）
         fh.nonce.increment()
     }
-    // 4. 从缓冲区拷贝给调用者
+    // 4. 从 buf 中拷贝给调用者
     n = copy(p, (*fh.buf)[fh.bufIndex:fh.bufSize])
     fh.bufIndex += n
     return n, nil
+}
+```
+
+#### `encrypter.finish()` — 缓冲区归还
+
+```go
+func (fh *encrypter) finish(err error) (int, error) {
+    // ...
+    fh.c.putBlock(fh.buf)     // 归还 65552B 输出块
+    fh.buf = nil
+    fh.c.putBlock(fh.readBuf) // 归还 65552B 输入块
+    fh.readBuf = nil
+    return 0, err
 }
 ```
 
@@ -222,36 +259,40 @@ func (fh *encrypter) Read(p []byte) (n int, err error) {
 
 ```go
 type decrypter struct {
-    rc           io.ReadCloser   // 底层输入流（密文）
-    nonce        nonce           // 当前块的 nonce
-    initialNonce nonce           // 初始 nonce（用于 seek）
+    rc           io.ReadCloser     // 底层输入流（密文）
+    nonce        nonce             // 当前块的 nonce
+    initialNonce nonce             // 初始 nonce（用于 seek）
     c            *Cipher
-    buf          *[blockSize]byte    // 解密输出缓冲区
-    readBuf      *[blockSize]byte    // 密文读取缓冲区
+    buf          *[blockSize]byte  // 解密输出缓冲区（65552B，来自 sync.Pool，存 65536B 明文）
+    readBuf      *[blockSize]byte  // 密文读取缓冲区（65552B，来自 sync.Pool，读 65552B 密文块）
     bufIndex     int
     bufSize      int
-    limit        int64           // 读取限制（用于 Range 请求）
-    open         OpenRangeSeek   // 用于重新打开底层流（seek 时）
+    limit        int64             // 读取限制（用于 Range 请求）
+    open         OpenRangeSeek     // 用于重新打开底层流（seek 时）
 }
 ```
+
+> **关键说明**：`buf` 和 `readBuf` **也都是 `*[blockSize]byte`（65552 字节）**，与 encrypter 共用同一个 `sync.Pool`。不同场景下截取不同长度。
 
 #### 初始化 — `newDecrypter()`（`backend/crypt/cipher.go`）
 
 ```go
 func (c *Cipher) newDecrypter(rc io.ReadCloser) (*decrypter, error) {
-    // 1. 读取文件头（magic + nonce）= 32 字节
-    readBuf := (*fh.readBuf)[:fileHeaderSize] // 32 字节
+    // 1. 从 65552B 的 readBuf 中截取前 32B 读文件头
+    readBuf := (*fh.readBuf)[:fileHeaderSize] // 截取 32 字节
     n, err := readers.ReadFill(fh.rc, readBuf)
-    // 2. 校验魔术字节
-    if !bytes.Equal(readBuf[:fileMagicSize], fileMagicBytes) { // 前 8 字节
+    // 2. 校验魔术字节（readBuf 前 8 字节）
+    if !bytes.Equal(readBuf[:fileMagicSize], fileMagicBytes) {
         return nil, ErrorEncryptedBadMagic
     }
-    // 3. 获取初始 nonce（从第 8 字节开始的 24 字节）
-    fh.nonce.fromBuf(readBuf[fileMagicSize:]) // 偏移 8，读 24 字节
+    // 3. 获取初始 nonce（readBuf 从第 8 字节开始的 24 字节）
+    fh.nonce.fromBuf(readBuf[fileMagicSize:]) // [8:32]，共 24 字节
     fh.initialNonce = fh.nonce
     return fh, nil
 }
 ```
+
+> `readBuf` 的复用：32B 文件头读完后，同一块 65552B 内存后续会被当作密文块读取缓冲区再次使用，底层没有重新分配。
 
 #### 解密流程 — `decrypter.Read()`（`backend/crypt/cipher.go`）
 
@@ -260,10 +301,10 @@ func (fh *decrypter) Read(p []byte) (n int, err error) {
     if fh.bufIndex >= fh.bufSize {
         err = fh.fillBuffer() // 读取并解密一个块
         if err != nil {
-            return 0, fh.finish(err)
+            return 0, fh.finish(err) // finish() 把 buf 和 readBuf 归还 Pool
         }
     }
-    // 从缓冲区拷贝，考虑 limit 限制
+    // 从 buf 中拷贝，考虑 limit 限制
     toCopy := fh.bufSize - fh.bufIndex
     if fh.limit >= 0 && fh.limit < int64(toCopy) {
         toCopy = int(fh.limit)
@@ -278,9 +319,11 @@ func (fh *decrypter) Read(p []byte) (n int, err error) {
 
 ```go
 func (fh *decrypter) fillBuffer() (err error) {
-    // 1. 读取一个密文块（最多 65552 字节 = 16 + 65536）
-    n, err := readers.ReadFill(fh.rc, (*readBuf)[:])
-    // 2. secretbox 解密 + 认证
+    // 1. 用 readBuf 的**全部 65552B** 读取一个密文块
+    n, err := readers.ReadFill(fh.rc, (*readBuf)[:]) // [:65552]
+    // 2. secretbox 解密 + 认证：
+    //    - 输入：readBuf[:n]（16B 认证头 + 密文）
+    //    - 输出：buf 的前 (n - 16)B 明文
     _, ok := secretbox.Open((*fh.buf)[:0], (*readBuf)[:n], fh.nonce.pointer(), &fh.c.dataKey)
     if !ok {
         if !fh.c.passBadBlocks {
@@ -294,6 +337,13 @@ func (fh *decrypter) fillBuffer() (err error) {
     return nil
 }
 ```
+
+#### 两结构体的缓冲区对比总结
+
+| 字段 | encrypter 中 | decrypter 中 | 统一底层类型 | 来源 |
+|------|-------------|-------------|-------------|------|
+| `buf` | 存密文（头32B初始化 + 后续每块16+n B输出） | 存明文（每块解密后最多65536B） | `*[blockSize]byte`（65552B） | `Cipher.buffers` sync.Pool |
+| `readBuf` | 存明文，截取 `[:65536]` 读；初始化时不参与 | 先截 `[:32]` 读文件头，再用全 `[:65552]` 读密文块 | `*[blockSize]byte`（65552B） | `Cipher.buffers` sync.Pool |
 
 ### 4.4 随机访问（Seek）
 
@@ -656,6 +706,6 @@ crypt.Fs.ListP(ctx, dir, callback)
 
 5. **可配置性**：文件名加密模式（standard/obfuscate/off）、目录名加密、数据加密、后缀、编码方式（base32/base64/base32768）等均可配置。
 
-6. **缓冲区池**：使用 `sync.Pool` 复用加密/解密缓冲区（`blockSize` = 65552 字节），减少 GC 压力。
+6. **统一缓冲区池**：`Cipher.buffers` 使用单一 `sync.Pool` 管理所有块，元素类型统一为 `*[blockSize]byte`（65552 字节）。`encrypter` 和 `decrypter` 的 `buf` / `readBuf` 四个字段**都从这个池分配**，只是用途不同，通过切片截取（`[:blockDataSize]` / `[:fileHeaderSize]` / `[:]`）适配不同场景。流结束时通过 `finish()` 把四个块统一归还，大幅减少高并发场景下的 GC 压力。
 
-7. **随机访问支持**：`decrypter` 实现 `RangeSeeker` 接口，支持 HTTP Range 请求场景。通过 `calculateUnderlying()` 计算底层偏移，重新定位 nonce 即可实现随机读取。
+7. **随机访问支持**：`decrypter` 实现 `RangeSeeker` 接口，支持 HTTP Range 请求场景。通过 `calculateUnderlying()` 计算底层偏移，从 `initialNonce` 按块数重放 nonce 即可实现随机读取。

@@ -133,25 +133,116 @@ type Directory struct {
 
 ### 3.1 认证初始化流程
 
-认证中间件在 `Server.initAuth()` 函数 [server.go#L431-L464](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/server.go#L431-L464) 中初始化，优先级从高到低：
+认证中间件在 `Server.initAuth()` 函数 [server.go#L431-L464](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/server.go#L431-L464) 中初始化。
+
+**关键逻辑**：
+
+```go
+func (s *Server) initAuth() {
+    s.usingAuth = false
+    altUsernameEnabled := s.auth.HtPasswd == "" && s.auth.BasicUser == ""
+
+    // 第一阶段：备选用户名来源（仅当未配置 htpasswd 和 basic user 时）
+    if altUsernameEnabled {
+        s.usingAuth = true
+        if s.auth.UserFromHeader != "" {
+            s.mux.Use(MiddlewareAuthGetUserFromHeader(s.auth.UserFromHeader))
+        } else if s.tlsConfig != nil && s.tlsConfig.ClientAuth != tls.NoClientCert {
+            s.mux.Use(MiddlewareAuthCertificateUser())
+        } else {
+            s.usingAuth = false
+            altUsernameEnabled = false
+        }
+    }
+
+    // 第二阶段：主认证方式
+    if s.auth.CustomAuthFn != nil {
+        s.usingAuth = true
+        s.mux.Use(MiddlewareAuthCustom(s.auth.CustomAuthFn, s.auth.Realm, altUsernameEnabled))
+        return
+    }
+    // ... htpasswd 和 basic user 认证
+}
+```
+
+**优先级判定**：
+1. `CustomAuthFn` > `Htpasswd` > `BasicUser` （三者互斥）
+2. `UserFromHeader` 和 `CertificateUser` 作为**备选用户名来源**，不独立使用，必须配合 `CustomAuthFn`
+
+### 3.2 请求头/证书认证与自定义认证的衔接
+
+这是最关键的衔接逻辑。当同时配置了 `--auth-proxy`（启用 CustomAuthFn）和 `--user-from-header`（或客户端证书）时，认证流程如下：
 
 ```
-CustomAuthFn (自定义认证)
+HTTP 请求
     ↓
-Htpasswd 文件认证
+[MiddlewareAuthGetUserFromHeader 或 MiddlewareAuthCertificateUser]
+    │  职责：仅提取用户名
+    │  - 从 HTTP 头（如 X-Remote-User）提取用户名
+    │  - 或从客户端证书 CN 提取用户名
+    │  - 验证用户名格式
+    ↓  通过 ctxKeyUser 注入 context
     ↓
-Basic 单用户认证
+[MiddlewareAuthCustom]  ← altUsernameEnabled = true
+    │  核心衔接逻辑 [middleware.go#L128-L131]：
+    │  1. 首先尝试从 Basic Auth 头解析 user/pass
+    │  2. 如果解析失败（!ok）且 userFromContext=true
+    │     → 从 context 的 ctxKeyUser 获取用户名
+    │  3. pass 为空字符串（因为头/证书认证不提供密码）
     ↓
-UserFromHeader (从 HTTP 头获取用户)
+调用自定义认证函数 fn(user, pass="")
+    │
+    ↓  （在 HTTP serve 中，fn 就是 s.auth）
     ↓
-CertificateUser (客户端证书用户)
+proxy.Call(user, pass="", false)
+    │
+    ↓
+创建/获取 VFS，通过 ctxKeyAuth 注入 context
+    ↓
+业务 Handler
 ```
 
-### 3.2 五种认证方式
+**关键代码衔接点**在 `MiddlewareAuthCustom` [middleware.go#L118-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L118-L155)：
 
-#### 3.2.1 自定义认证（CustomAuthFn）
+```go
+func MiddlewareAuthCustom(fn CustomAuthFn, realm string, userFromContext bool) Middleware {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // 第一步：尝试从 Basic Auth 解析
+            user, pass, ok := parseAuthorization(r)
+            
+            // 第二步：如果解析失败且允许从上下文获取
+            if !ok && userFromContext {
+                user, ok = CtxGetUser(r.Context())  // 从上游中间件获取
+            }
 
-优先级最高，用于代理模式。通过 `MiddlewareAuthCustom` 中间件 [middleware.go#L118-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L118-L155) 实现：
+            if !ok {
+                // 返回 401
+            }
+
+            // 调用自定义认证函数（pass 可能为空）
+            value, err := fn(user, pass)
+            
+            // 认证成功，value（通常是 VFS）注入 context
+            if value != nil {
+                r = r.WithContext(context.WithValue(r.Context(), ctxKeyAuth, value))
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+```
+
+**重要边界**：
+- 当使用 `UserFromHeader` 或 `CertificateUser` 时，`pass` 参数为空字符串
+- 代理程序（`--auth-proxy`）需要能够处理 `pass=""` 的情况
+- 这两种认证方式**不独立工作**，必须配合 `CustomAuthFn` 使用
+
+### 3.3 五种认证方式详解
+
+#### 3.3.1 自定义认证（CustomAuthFn）
+
+最高优先级，用于代理模式。通过 `MiddlewareAuthCustom` 中间件实现：
 
 - 支持从 Basic Auth 或上下文（`userFromContext`）获取用户名
 - 调用自定义函数 `fn(user, pass)` 进行认证
@@ -169,7 +260,7 @@ func (s *HTTP) auth(user, pass string) (value any, err error) {
 }
 ```
 
-#### 3.2.2 Htpasswd 文件认证
+#### 3.3.2 Htpasswd 文件认证
 
 通过 `MiddlewareAuthHtpasswd` 中间件 [middleware.go#L96-L102](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L96-L102) 实现：
 
@@ -177,29 +268,31 @@ func (s *HTTP) auth(user, pass string) (value any, err error) {
 - 支持 MD5、SHA1、BCrypt 等多种哈希算法
 - 文件可在运行时更新
 
-#### 3.2.3 Basic 单用户认证
+#### 3.3.3 Basic 单用户认证
 
 通过 `MiddlewareAuthBasic` 中间件 [middleware.go#L104-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L104-L116) 实现：
 
 - 使用 MD5 Crypt 哈希密码（带 salt）
 - 通过 `--user` 和 `--pass` 标志配置
 
-#### 3.2.4 HTTP 头用户认证
+#### 3.3.4 HTTP 头用户认证
 
 通过 `MiddlewareAuthGetUserFromHeader` 中间件 [middleware.go#L159-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L159-L175) 实现：
 
 - 适用于反向代理场景，由代理完成认证
 - 从指定 HTTP 头（如 `X-Remote-User`）提取用户名
 - 用户名需通过正则验证：`^[\p{L}\d@._-]+$`
+- **不独立使用**，需配合 CustomAuthFn
 
-#### 3.2.5 客户端证书认证
+#### 3.3.5 客户端证书认证
 
 通过 `MiddlewareAuthCertificateUser` 中间件 [middleware.go#L78-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L78-L94) 实现：
 
 - 当配置了 `--client-ca` 时启用
 - 从客户端证书的 Common Name (CN) 提取用户名
+- **不独立使用**，需配合 CustomAuthFn
 
-### 3.3 认证上下文传递
+### 3.4 认证上下文传递
 
 认证结果通过 Go context 传递，定义在 [context.go#L9-L16](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/context.go#L9-L16)：
 
@@ -210,28 +303,49 @@ const (
     ctxKeyAuth ctxKey = iota    // 自定义认证返回的值（如 VFS）
     ctxKeyPublicURL
     ctxKeyUnixSock
-    ctxKeyUser                  // 用户名
+    ctxKeyUser                  // 用户名（来自头/证书/basic auth）
 )
 ```
 
 辅助函数：
-- `CtxGetAuth(ctx)` - 获取认证值
+- `CtxGetAuth(ctx)` - 获取认证值（VFS 实例）
 - `CtxGetUser(ctx)` - 获取用户名
 - `IsAuthenticated(r)` - 检查是否已认证
 
-### 3.4 代理认证（Auth Proxy）
+### 3.5 代理认证（Auth Proxy）
 
 当使用 `--auth-proxy` 参数时，rclone 调用外部程序动态创建后端和 VFS，实现在 [proxy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/proxy/proxy.go)。
 
-工作流程：
+**完整工作流程**：
 
-1. 客户端发起请求，携带 Basic Auth 凭证
-2. 中间件调用 `CustomAuthFn`（即 `s.auth`）
-3. `s.auth` 调用 `proxy.Call(user, pass, false)`
-4. `proxy.Call` 检查缓存，未命中则调用外部程序
-5. 外部程序接收 JSON 输入（含 user/pass），返回后端配置 JSON
-6. 根据返回的配置创建 `fs.Fs` 和 `vfs.VFS`
-7. 将 VFS 存入缓存和请求 context
+```
+1. 客户端发起请求
+   ├─ 场景 A：携带 Basic Auth 凭证（user:pass）
+   └─ 场景 B：反向代理已认证，注入 X-Remote-User 头
+    ↓
+2. 中间件链执行
+   ├─ 场景 A：直接进入 MiddlewareAuthCustom
+   │    └─ parseAuthorization → user, pass, ok=true
+   └─ 场景 B：先执行 MiddlewareAuthGetUserFromHeader
+        ├─ 从 X-Remote-User 提取 user
+        ├─ 注入 ctxKeyUser
+        └─ 进入 MiddlewareAuthCustom
+             ├─ parseAuthorization → ok=false
+             └─ CtxGetUser → user, ok=true, pass=""
+    ↓
+3. 调用 s.auth(user, pass) → proxy.Call(user, pass, false)
+    ↓
+4. proxy.Call 检查缓存
+   ├─ 缓存命中 → 返回缓存的 VFS
+   └─ 缓存未命中 → 调用外部程序
+        ├─ 输入 JSON：{"user": "...", "pass": "..."}
+        ├─ 输出 JSON：后端配置（含 type、_root 等）
+        └─ 创建 fs.Fs 和 vfs.VFS
+    ↓
+5. VFS 存入 context（ctxKeyAuth）
+    ↓
+6. 业务 Handler 通过 getVFS(ctx) 获取 VFS
+```
 
 缓存机制：
 - 使用 `libcache.Cache` 缓存 VFS
@@ -304,34 +418,92 @@ func (s *HTTP) getVFS(ctx context.Context) (VFS *vfs.VFS, err error) {
 - **普通模式**：启动时创建单一 VFS（`s._vfs`），所有请求共用
 - **代理模式**：每个用户通过认证后获得独立的 VFS，存储在 request context 中
 
-### 4.3 文件读取流程
+### 4.3 文件读取的两条路径与边界关系
 
-文件服务在 `serveFile` 函数 [http.go#L336-L422](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/http/http.go#L336-L422) 中处理，完整流程：
+HTTP serve 生态中存在**两条独立的文件读取路径**，以及 Range 请求的两种实现方式，它们的职责边界清晰。
+
+#### 4.3.1 三条核心组件的边界定义
+
+| 组件 | 类型 | 职责边界 | 关键接口 | 适用场景 |
+|------|------|---------|---------|---------|
+| **VFS 句柄** (ReadFileHandle) | VFS 层 | 提供类 `os.File` 的 `io.ReadSeeker` 接口，适配标准库 | `Read(p []byte)`, `Seek(offset, whence)` | HTTP serve、WebDAV、DLNA 等需要目录抽象的场景 |
+| **通用对象服务** (serve.Object) | HTTP 层 | 直接操作 `fs.Object`，不经过 VFS 层 | `Object(w, r, o fs.Object)` | Restic 后端等简单对象服务场景 |
+| **Range** | HTTP 协议层 | 字节范围请求的解析与响应 | `Range:` 头, `Content-Range:` 头 | 断点续传、视频流媒体等 |
+
+#### 4.3.2 路径 A：VFS 句柄路径（HTTP serve 主路径）
+
+这是 `cmd/serve/http` 使用的路径，在 `serveFile` 函数 [http.go#L336-L422](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/http/http.go#L336-L422) 中实现：
 
 ```
-1. 获取 VFS
-   ↓
-2. VFS.Stat(remote) → Node (检查文件是否存在)
-   ↓
-3. 验证是文件而非目录
-   ↓
-4. 获取 fs.Object (node.DirEntry())
-   ↓
-5. 设置响应头：
-   - Content-Length
-   - Content-Type (通过 fs.MimeType)
-   - Last-Modified
-   ↓
-6. HEAD 请求：直接返回
-   ↓
-7. GET 请求：
-   a. file.Open(os.O_RDONLY) → Handle
-   b. 创建 accounting.Transfer 统计传输
-   c. 已知大小：http.ServeContent (支持 Range)
-   d. 未知大小：io.Copy (不支持 Range)
-   ↓
-8. 关闭文件句柄
+HTTP 请求
+    ↓
+serveFile(w, r, remote)
+    ├─ VFS.Stat(remote) → Node (*vfs.File)
+    ├─ node.DirEntry() → fs.Object （获取元数据）
+    ├─ 设置响应头（Content-Length, Content-Type, Last-Modified）
+    ├─ file.Open(os.O_RDONLY) → vfs.Handle (*ReadFileHandle)
+    │   └─ 此时并未真正打开底层对象（延迟打开）
+    └─ http.ServeContent(w, r, name, modTime, readSeeker)
+         ├─ 标准库函数，内部实现：
+         │   ├─ 解析 Range 头
+         │   ├─ 调用 ReadSeeker.Seek() 定位
+         │   └─ 调用 ReadSeeker.Read() 读取数据
+         └─ ReadFileHandle 内部：
+              ├─ 第一次 Read/Seek 触发 openPending()
+              ├─ 创建 chunkedreader（支持 RangeSeek）
+              └─ 真正打开底层 fs.Object
 ```
+
+**关键边界**：
+- `http.ServeContent` 要求 reader 实现 `io.ReadSeeker` 接口
+- VFS 句柄通过封装 `chunkedreader` 提供 Seek 能力
+- Range 请求由标准库内部处理，通过 `Seek()` 间接实现
+
+#### 4.3.3 路径 B：通用对象服务路径（serve.Object）
+
+这是 `lib/http/serve/serve.go` 中的通用函数，在 `serve.Object` [serve.go#L15-L115](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L15-L115) 中实现，被 restic 等服务使用：
+
+```
+HTTP 请求
+    ↓
+serve.Object(w, r, o fs.Object)
+    ├─ 方法检查（仅 HEAD/GET）
+    ├─ 设置响应头
+    ├─ HEAD 请求：直接返回
+    └─ GET 请求：
+         ├─ 解析 Range 头 → fs.ParseRangeOption → *RangeOption
+         ├─ o.Open(ctx, RangeOption) → io.ReadCloser
+         │   └─ 直接向后端传递范围参数，由后端实现 Range 读取
+         ├─ accounting.Transfer 统计
+         └─ io.Copy(w, in)
+```
+
+**关键边界**：
+- 不经过 VFS 层，直接操作 `fs.Object`
+- 自行解析 Range，通过 `OpenOption` 传递给后端
+- reader 只需要实现 `io.Reader`，不需要 Seek
+- 不支持 VFS 缓存、目录抽象等功能
+
+#### 4.3.4 Range 请求的两种实现方式对比
+
+| 实现方式 | 所在路径 | Range 解析者 | 定位方式 | 后端接口 |
+|---------|---------|-------------|---------|---------|
+| **Seek 方式** | VFS 句柄路径 | `http.ServeContent` 内部 | `ReadSeeker.Seek()` → `chunkedreader.RangeSeek()` | 后端 `Open(ctx)` 完整打开，由 chunkedreader 控制读取范围 |
+| **OpenOption 方式** | 通用对象服务路径 | `fs.ParseRangeOption` | 将 `*RangeOption` 作为 `OpenOption` 传递 | 后端 `Open(ctx, RangeOption)` 直接打开指定范围 |
+
+**RangeOption 数据结构** [open_options.go#L51-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/open_options.go#L51-L54)：
+
+```go
+type RangeOption struct {
+    Start int64  // 起始偏移，-1 表示未指定
+    End   int64  // 结束偏移，-1 表示未指定
+}
+```
+
+**Range 边界条件** [http.go#L410-L413](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/http/http.go#L410-L413)：
+- 未知大小文件（`obj.Size() < 0`）**不能使用 Range**
+- 因为无法计算 `Content-Range` 响应头的总长度
+- 此时如果收到 Range 请求，返回 `416 Requested Range Not Satisfiable`
 
 ### 4.4 ReadFileHandle 读取实现
 
@@ -371,7 +543,6 @@ func (fh *ReadFileHandle) openPending() (err error) {
         int64(opt.ChunkSize), 
         int64(opt.ChunkSizeLimit), 
         opt.ChunkStreams).Open()
-    // ...
     tr := accounting.GlobalStats().NewTransfer(o, nil)
     fh.done = tr.Done
     fh.r = tr.Account(fh.file.ctx, r).WithBuffer()
@@ -380,23 +551,59 @@ func (fh *ReadFileHandle) openPending() (err error) {
 }
 ```
 
+**Seek 实现** [read.go#L116-L168](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/vfs/read.go#L116-L168)：
+
+```go
+func (fh *ReadFileHandle) seek(offset int64, reopen bool) (err error) {
+    // 尝试通过缓冲区丢弃满足 seek（小范围跳转）
+    if !reopen {
+        ar := fh.r.GetAsyncReader()
+        if ar != nil && ar.SkipBytes(int(offset-fh.offset)) {
+            fh.offset = offset
+            return nil
+        }
+    }
+    // 尝试使用 chunkedreader.RangeSeek（高效定位）
+    r, ok := oldReader.(chunkedreader.ChunkedReader)
+    if !reopen && ok {
+        _, err = r.RangeSeek(fh.file.ctx, offset, io.SeekStart, -1)
+        // ...
+    } else {
+        // 关闭并重新打开（最重量级方式）
+        oldReader.Close()
+        r = chunkedreader.New(...)
+        r.Seek(offset, 0)
+        r, _ = r.Open()
+    }
+    fh.r.UpdateReader(fh.file.ctx, r)
+    fh.offset = offset
+    return nil
+}
+```
+
 关键特性：
 - 使用 `chunkedreader` 进行分块读取，支持并发预读
-- 支持 `Seek`（随机访问）
+- 支持 `Seek`（随机访问），三级优化：缓冲区丢弃 → RangeSeek → 重新打开
 - 通过 `accounting.Account` 统计传输流量
 - 可选的校验和计算
 
-### 4.5 Range 请求支持
+### 4.5 ChunkedReader 接口
 
-在 `lib/http/serve/serve.go` 中的 `Object` 函数 [serve.go#L66-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L66-L93) 展示了完整的 Range 支持：
+`ChunkedReader` 是 VFS 层与底层 fs 之间的桥梁，定义在 [chunkedreader.go#L18-L25](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/chunkedreader/chunkedreader.go#L18-L25)：
 
-1. 解析 `Range` 请求头
-2. 使用 `fs.ParseRangeOption` 解析范围
-3. 调用 `o.Open(ctx, options...)` 打开指定范围
-4. 设置 `Content-Range` 响应头
-5. 返回 `206 Partial Content` 状态码
+```go
+type ChunkedReader interface {
+    io.Reader
+    io.Seeker
+    io.Closer
+    fs.RangeSeeker  // 关键接口，支持高效范围定位
+    Open() (ChunkedReader, error)
+}
+```
 
-在 `cmd/serve/http/http.go` 的 `serveFile` 中，对于已知大小的文件使用标准库 `http.ServeContent`，它内置了 Range 支持。
+两种实现：
+- **sequential**：单流顺序读取，适合小文件或顺序访问
+- **parallel**：多流并行预读，适合大文件和随机访问
 
 ### 4.6 目录读取流程
 
@@ -489,3 +696,34 @@ SetHeader (Accept-Ranges, Server)
 2. **自定义模板**：通过 `--template` 参数自定义目录列表 HTML 模板
 3. **代理模式**：通过 `--auth-proxy` 动态创建后端，支持多租户
 4. **响应头**：通过 `--response-header` 添加自定义响应头
+
+---
+
+## 7. 核心边界总结
+
+### 7.1 认证边界
+
+| 认证方式 | 独立使用 | 需配合 | 用户名来源 | 密码来源 |
+|---------|---------|-------|-----------|---------|
+| Htpasswd | ✅ | - | Basic Auth | Basic Auth |
+| Basic User | ✅ | - | Basic Auth | Basic Auth |
+| UserFromHeader | ❌ | CustomAuthFn | HTTP 头 | 空字符串 |
+| CertificateUser | ❌ | CustomAuthFn | 客户端证书 CN | 空字符串 |
+| CustomAuthFn | ✅ | - | Basic Auth 或上游 | Basic Auth 或空 |
+
+### 7.2 文件读取边界
+
+| 路径 | 使用组件 | Range 实现 | 依赖接口 | VFS 缓存 | 目录抽象 |
+|-----|---------|-----------|---------|---------|---------|
+| HTTP serve 主路径 | VFS 句柄 + http.ServeContent | Seek 方式 | `io.ReadSeeker` | ✅ | ✅ |
+| 通用对象服务 | serve.Object | OpenOption 方式 | `io.Reader` | ❌ | ❌ |
+| 未知大小文件 | io.Copy | 不支持 | `io.Reader` | - | - |
+
+### 7.3 Range 边界
+
+| 条件 | 是否支持 Range | 原因 |
+|-----|---------------|------|
+| 已知大小文件 + VFS 路径 | ✅ | http.ServeContent 内部处理 |
+| 已知大小文件 + 通用服务 | ✅ | 自行解析 Range 头 |
+| 未知大小文件（Size < 0） | ❌ | 无法计算 Content-Range 总长度 |
+| 多范围请求（逗号分隔） | ❌ | fs.ParseRangeOption 不支持 |

@@ -441,73 +441,195 @@ default:
 
 ---
 
-### 场景四：partial 文件命名和清理
+### 场景四：partial 文件命名和清理（含 suffix 超长处理）
 
-#### partial 模式 vs inplace 模式
+#### 两段式校验：配置加载 vs 每次复制
 
-[checkPartial](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L91-L116) 判定：
+`--partial-suffix` 的长度限制（>16 字符为非法）存在**两处独立校验**：
 
-**强制 inplace（不使用 partial）的条件：**
-1. `--inplace` 标志为 true
-2. 目标后端不支持 `Features.Move`（无法重命名）
-3. 目标后端不支持 `Features.PartialUploads`（不支持部分上传可见性控制）
-4. 文件后缀为 `.rclonelink`（符号链接文件）
-5. `--partial-suffix` 长度超过 16 字符（返回错误并强制 inplace）
+| 校验阶段 | 所在函数 | 代码位置 | 行为 |
+|----------|----------|----------|------|
+| 配置加载时 | `ConfigInfo.Reload()` | [config.go:728-731](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/config.go#L728-L731) | 返回错误，阻止配置生效 |
+| 每次执行 Copy 时 | `(c *copy) checkPartial()` | [copy.go:96-97](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L96-L97) | 返回错误 |
 
-其他情况 → 使用 partial 模式。
+配置加载时校验是第一道防线；运行时校验是兜底（防止绕过配置修改的调用方式）。
 
-#### partial 文件命名规则
+#### partial-suffix 超长时：错误返回与 inplace 的真实关系
+
+这是最容易产生误解的地方。[checkPartial](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L91-L116) 的完整分支：
+
+```go
+func (c *copy) checkPartial(ctx context.Context) (remoteForCopy string, inplace bool, err error) {
+    remoteForCopy = c.remote
+    // 分支 A: 强制 inplace（正常情况，err=nil）
+    if c.ci.Inplace || c.dstFeatures.Move == nil || !c.dstFeatures.PartialUploads || strings.HasSuffix(c.remote, ".rclonelink") {
+        return remoteForCopy, true, nil
+    }
+    // 分支 B: suffix 超长（同时设 inplace=true 且返回 err）
+    if len(c.ci.PartialSuffix) > 16 {
+        return remoteForCopy, true, fmt.Errorf("expecting length of --partial-suffix to be not greater than %d but got %d", 16, len(c.ci.PartialSuffix))
+    }
+    // 分支 C: 正常 partial 命名
+    // ... 生成 remoteForCopy，返回 inplace=false, err=nil
+}
+```
+
+**关键事实**：分支 B 返回 `(remote, true, err)` 中 `inplace=true` **实际不会生效**。
+
+查看调用方 [Copy:419-422](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L419-L422)：
+```go
+c.remoteForCopy, c.inplace, err = c.checkPartial(ctx)
+if err != nil {
+    return nil, err   // ← 只要 err != nil 就直接返回，c.inplace 被丢弃
+}
+```
+
+所以后缀超长时的**真实行为**是：
+1. `checkPartial` 返回错误
+2. `Copy()` 直接 `return nil, err`，复制未开始
+3. `c.inplace` 虽被设为 true，但因为函数立即返回，该值从未被使用
+4. 没有文件写入、没有 partial 创建、没有清理动作
+
+> **修正之前的理解**：不是"返回错误并强制 inplace"，而是**直接返回错误终止 Copy**。`inplace=true` 是一个死代码路径上的返回值，对执行无任何影响。
+
+#### 正常 partial 模式 vs inplace 模式
+
+以下情况触发 **inplace 模式**（直接写入最终文件名，不使用 partial），来自 [checkPartial:93-94](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L93-L94)：
+
+| 条件 | 原因 |
+|------|------|
+| `--inplace` 为 true | 用户明确要求 |
+| `dstFeatures.Move == nil` | 后端不支持重命名，无法把 partial 改成最终名 |
+| `!dstFeatures.PartialUploads` | 后端不支持部分上传可见性控制（上传中途文件可能对用户可见） |
+| 文件名后缀为 `.rclonelink` | 符号链接特殊处理 |
+
+其他所有情况 → **partial 模式**。
+
+#### 普通 partial 文件命名规则
+
+命名逻辑在 [checkPartial:102-114](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L102-L114)：
 
 ```
-格式: {truncated_remote}.{crc32_hash}{partial_suffix}
+完整后缀: "." + CRC32(remote + Fingerprint) + PartialSuffix
+          |<-- 8 位十六进制 -->|   |<-- 默认 ".partial" -->|
 ```
 
-参数说明：
-- `partial_suffix`：默认 `.partial`（通过 `--partial-suffix` 配置，最长 16 字符）
-- `crc32_hash`：`CRC32(IEEE(remote + Fingerprint(ctx, src, true)))` 的 8 位十六进制表示
-- `truncated_remote`：若文件名（basename）> 100 字符，截断 remote 为 `len(remote) - len(suffix)`，再拼接后缀
+**各部分说明**：
 
-示例：
-- 原文件：`docs/report.pdf`
-- partial 文件：`docs/report.pdf.a1b2c3d4.partial`
+| 组成部分 | 计算方式 |
+|----------|----------|
+| `crc32_hash` | `CRC32(IEEE, remote + Fingerprint(ctx, src, true))`，输出 8 位十六进制 |
+| `Fingerprint` | 基于 modtime、size、id 等生成的对象指纹，见 [fingerprint.go:21](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/fingerprint.go#L21) |
+| `PartialSuffix` | 默认 `.partial`，由 `--partial-suffix` 配置 |
 
-> **稳定性设计**：hash 基于 remote 和源文件指纹生成，同一文件的重试会使用相同的 partial 文件名，便于续传和清理。
+**文件名长度保护**：
+```go
+base := path.Base(remoteForCopy)
+if len(base) > 100 {
+    // 截断 remote 到 len(remote) - len(suffix)，再拼接 suffix
+    remoteForCopy = TruncateString(remoteForCopy, len(remoteForCopy)-len(suffix)) + suffix
+} else {
+    remoteForCopy += suffix
+}
+```
+- `TruncateString` 是 UTF-8 安全的截断，避免把多字节字符劈成两半
+- 仅当文件名（不含目录）**basename > 100 字符**时才触发截断
 
-#### partial 文件的清理触发点
+**示例**：
+| 原路径 | basename 长度 | partial 路径 |
+|--------|-------------|-------------|
+| `docs/report.pdf` | 10 ≤ 100 | `docs/report.pdf.a1b2c3d4.partial` |
+| `a/verylongname_120chars....pdf` | 120 > 100 | `a/verylongname_120char....pdf.a1b2c3d4.partial`（前面被截断以容纳后缀） |
 
-| 触发场景 | 清理方式 | 代码位置 |
-|----------|----------|----------|
-| 复制主循环最终失败（非 inplace） | `removeFailedPartialCopy()` | [copy.copy:348-349](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L345-L352) |
-| 程序异常退出（非 inplace） | atexit 钩子调用 `removeFailedPartialCopy()` | [copy.manualCopy:247-250](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L244-L251) |
-| 复制成功但校验（size/hash）失败 | `removeFailedCopy(newDst)` 删除已复制的目标/partial | [copy.copy:359](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L354-L361) |
-| partial→最终 Move 失败 | `removeFailedCopy(newDst)` 删除 partial | [copy.copy:369](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L364-L374) |
-| 多线程复制 chunk 失败 | `chunkWriter.Abort(ctx)` 取消上传 | [multithread.go:165-175](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/multithread.go#L165-L175) |
+> **稳定性设计**：hash 基于 remote + 源文件指纹生成，同一文件的重试会使用**相同的 partial 文件名**，便于跨重试识别残留。
 
-#### 清理函数实现
+#### 清理函数的错误传播：全部吞掉，只记日志
+
+两个清理函数都**没有返回值**，内部错误只通过 `fs.Infof` 记录：
+
+[removeFailedCopy](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L45-L54)：
+```go
+func (c *copy) removeFailedCopy(ctx context.Context, o fs.Object) {
+    if o == nil {
+        return
+    }
+    fs.Infof(o, "Removing failed copy")
+    err := o.Remove(ctx)
+    if err != nil {
+        fs.Infof(o, "Failed to remove failed copy: %s", err)
+        // ← 没有 return err，错误被吞掉
+    }
+}
+```
 
 [removeFailedPartialCopy](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L57-L68)：
 ```go
 func (c *copy) removeFailedPartialCopy(ctx context.Context, f fs.Fs, remote string) {
     o, err := f.NewObject(ctx, remote)
     if errors.Is(err, fs.ErrorObjectNotFound) {
-        return  // 对象不存在视为已清理
+        return   // 对象不存在 → 视为已清理
     }
     if err != nil {
         fs.Infof(remote, "Failed to remove failed partial copy: %s", err)
-        return
+        return   // ← NewObject 失败只记日志
     }
-    c.removeFailedCopy(ctx, o)
+    c.removeFailedCopy(ctx, o)   // ← 内部同样吞错误
 }
 ```
 
-清理失败仅记录日志，**不影响主错误返回**（best-effort 清理）。
+**统一原则**：清理是 best-effort。清理失败不会影响主错误返回，也不会覆盖原始错误。用户只能通过日志发现 partial 文件残留。
+
+#### 清理触发时机总览
+
+| 触发点 | 条件 | 清理函数 | 代码位置 |
+|--------|------|----------|----------|
+| 复制主循环最终失败 | `err != nil && !c.inplace` | `removeFailedPartialCopy(ctx, c.f, c.remoteForCopy)` | [copy.copy:345-352](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L345-L352) |
+| 程序异常退出（信号） | `!c.inplace`，manualCopy 内注册的 atexit 钩子 | `removeFailedPartialCopy(context.Background(), c.f, c.remoteForCopy)` | [copy.manualCopy:247-250](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L244-L251) |
+| 复制成功但 size/hash 校验失败 | `verify()` 返回错误 | `removeFailedCopy(ctx, newDst)` | [copy.copy:354-361](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L354-L361) |
+| partial→最终 Move（重命名）失败 | `dstFeatures.Move` 返回错误 | `removeFailedCopy(ctx, newDst)` | [copy.copy:364-374](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L364-L374) |
+| 多线程复制 chunk 失败 | 任意 goroutine 返回错误 | `chunkWriter.Abort(ctx)`（通过 `atexit.OnError`） | [multithread.go:165-175](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/multithread.go#L165-L175) |
+
+**注意**：校验失败和 partial→最终 Move 失败时，调用的是 `removeFailedCopy(newDst)` 而不是 `removeFailedPartialCopy()`，因为此时 `newDst` 已经是一个有效的 Object（无论是 partial 名还是最终名），直接对该 Object 调 Remove 即可，无需再按 remote 查找。
+
+#### atexit 钩子的生命周期
+
+[atexit.Register](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/lib/atexit/atexit.go#L32-L59) 的行为：
+- 注册一个函数，在收到退出信号（SIGINT/SIGTERM 等）时执行
+- `Unregister` 可在正常退出时取消
+
+[copy.manualCopy:246-251](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/copy.go#L244-L251)：
+```go
+if !c.inplace {
+    defer atexit.Unregister(atexit.Register(func() {
+        ctx := context.Background()       // ← 注意：用全新 Background ctx，避免原 ctx 已取消
+        c.removeFailedPartialCopy(ctx, c.f, c.remoteForCopy)
+    }))
+}
+```
+
+执行路径：
+- **正常退出**：`defer Unregister` 在函数返回时执行，钩子被注销，不触发清理
+- **信号退出**：atexit 的 signal handler 在 `defer Unregister` 之前抢到执行权，运行清理函数
+- 注意使用 `context.Background()` 而不是函数参数中的 ctx，因为信号触发时原 ctx 可能已被取消
 
 #### 多线程复制的 Abort 机制
 
-[multiThreadCopy](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/multithread.go#L162-L175) 使用 `atexit.OnError` 注册清理：
-- `info.LeavePartsOnError = true` 时不清理（保留已上传分片用于断点续传）
-- `uploadedOK = true` 时不清理（上传完全成功）
-- 其他错误 → 调用 `chunkWriter.Abort(ctx)` 清理后端分片
+[multiThreadCopy](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/multithread.go#L162-L175) 使用 `atexit.OnError`：
+```go
+defer atexit.OnError(&err, func() {
+    cancel()
+    if info.LeavePartsOnError || uploadedOK {
+        return   // ← 配置了留片或已成功，不清理
+    }
+    abortErr := chunkWriter.Abort(ctx)   // ← 通知后端销毁未完成分片
+    ...
+})()
+```
+
+三种不清理的情况：
+1. `info.LeavePartsOnError = true` —— 用户希望保留已上传分片用于断点续传
+2. `uploadedOK = true` —— 所有 chunk 写完且 Close 成功
+3. `err == nil` —— 函数正常返回，`OnError` 检测到 `*perr == nil` 不执行回调
 
 ---
 

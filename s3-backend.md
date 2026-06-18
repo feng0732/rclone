@@ -1,15 +1,589 @@
 # S3 后端代码分析报告
 
-## 一、整体架构概览
+rclone 项目中与 S3 相关的代码分为两个独立模块：
 
-rclone 的 S3 模块分为两部分：
+| 模块 | 目录 | 角色 | 核心职责 |
+|------|------|------|----------|
+| **S3 客户端后端** | `backend/s3/` | rclone 作为客户端 | 连接外部 S3 兼容存储，实现 `fs.Fs` 统一接口 |
+| **S3 服务端** | `cmd/serve/s3/` | rclone 作为服务端 | 对外提供 S3 兼容 API，通过 VFS 对接 `fs.Fs` |
 
-| 模块 | 目录 | 职责 |
+---
+
+# 上篇：S3 客户端后端 (backend/s3/)
+
+## 一、整体架构
+
+S3 客户端后端基于 **AWS SDK v2 for Go**（`github.com/aws/aws-sdk-go-v2/service/s3`）构建，向上实现 rclone 的 `fs.Fs` 统一后端接口。
+
+### 架构分层
+
+```
+┌──────────────────────────────────────────────────────┐
+│                rclone 上层逻辑 (sync/copy 等)        │
+└──────────────────────┬───────────────────────────────┘
+                       │ fs.Fs / fs.Object 统一接口
+┌──────────────────────▼───────────────────────────────┐
+│            S3 客户端后端 (backend/s3/)               │
+│   - Fs: 实现 fs.Fs 接口                               │
+│   - Object: 实现 fs.Object 接口                       │
+│   - list/listP/listR: 列表实现                        │
+│   - Put/Update: 上传实现 (单分片/多分片)               │
+│   - Open: 下载实现                                    │
+│   - pacer: 请求限速与重试                              │
+└──────────────────────┬───────────────────────────────┘
+                       │ AWS SDK v2 S3 Client API
+┌──────────────────────▼───────────────────────────────┐
+│              AWS SDK v2 (service/s3)                 │
+│   - 签名 (v4 / v2 / IBM IAM)                          │
+│   - REST 请求构建                                      │
+│   - 重试机制                                          │
+└──────────────────────┬───────────────────────────────┘
+                       │ HTTP
+┌──────────────────────▼───────────────────────────────┐
+│              S3 兼容存储服务 (AWS/MinIO/...)          │
+└──────────────────────────────────────────────────────┘
+```
+
+### Provider 适配机制
+
+S3 后端通过 **provider.yaml** 文件定义了数十种 S3 兼容提供商的特性与 quirk，在 [providers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/providers.go) 中加载：
+
+- `Provider` 结构体：定义每个提供商的 region、endpoint、ACL、storage class、SSE 等配置选项
+- `Quirks` 结构体：定义各提供商的行为差异（列表版本、路径风格、URL 编码、ETag 是否为 MD5 等）
+- 所有 provider 配置通过 `embed.FS` 内嵌在 `provider/*.yaml` 文件中
+
+---
+
+## 二、认证配置与请求签名
+
+### 2.1 认证配置入口
+
+认证相关选项定义在 [backend/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L89-L200)，主要包括：
+
+| 配置项 | 说明 |
+|--------|------|
+| `env_auth` | 是否从运行时环境获取凭证（环境变量 / EC2/ECS 元数据） |
+| `access_key_id` | AWS Access Key ID |
+| `secret_access_key` | AWS Secret Access Key |
+| `session_token` | 会话令牌（临时凭证） |
+| `region` | 区域 |
+| `endpoint` | S3 API 端点（S3 兼容存储必填） |
+| `role_arn` | 需扮演的 IAM Role ARN |
+| `role_session_name` | Role 会话名称 |
+| `provider` | S3 提供商类型（AWS/MinIO/Ceph 等） |
+
+### 2.2 客户端创建流程
+
+核心函数：[s3Connection](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1475-L1629)
+
+```go
+func s3Connection(ctx context.Context, opt *Options, client *http.Client) (
+    s3Client *s3.Client, provider *Provider, err error)
+```
+
+**执行流程**：
+
+```
+1. 初始化静态凭证
+   └─► credentials.StaticCredentialsProvider{AccessKeyID, SecretAccessKey, SessionToken}
+
+2. 凭证来源分支判断
+   ├─ env_auth=true + key 为空
+   │    └─► awsconfig.LoadDefaultConfig()
+   │         从环境变量 / 共享配置文件 / IAM 角色加载
+   │
+   ├─ IBMCOS + V2Auth
+   │    └─► NoOpCredentialsProvider (使用 IBM IAM signer)
+   │
+   ├─ access_key 与 secret_key 都为空
+   │    └─► aws.AnonymousCredentials (匿名访问)
+   │
+   └─ 其余情况：使用静态凭证
+
+3. Assume Role 处理（如 role_arn 非空）
+   └─► sts.NewFromConfig(awsConfig)
+   └─► stscreds.NewAssumeRoleProvider(stsClient, roleARN)
+   └─► aws.NewCredentialsCache(...) 包装缓存
+
+4. 加载 Provider 配置与 Quirks
+   └─► loadProvider(opt.Provider)
+   └─► setQuirks(opt, provider)
+
+5. 配置 S3 Client Options
+   ├─► UsePathStyle (路径风格 / 虚拟主机风格)
+   ├─► UseAccelerate / UseDualStack / UseARNRegion
+   ├─► BaseEndpoint (自定义端点)
+   └─► RequestChecksumCalculation (数据完整性校验)
+
+6. 签名器替换（如使用 v2 签名或 IBM IAM）
+   ├─► v2Signer (S3 v2 签名)
+   └─► IbmIamSigner (IBM IAM 认证)
+
+7. 创建 s3.Client
+   └─► s3.NewFromConfig(awsConfig, options...)
+```
+
+### 2.3 签名机制
+
+| 签名方式 | 触发条件 | 实现位置 |
+|---------|---------|---------|
+| **AWS Signature v4** (默认) | 默认情况 | AWS SDK v2 内置 |
+| **S3 v2 签名** | `v2_auth=true` 或 `region=other-v2-signature` | [v2sign.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go) |
+| **IBM IAM 签名** | `provider=IBMCOS` + `ibm_api_key` / `ibm_instance_id` | [ibm_signer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go) |
+| **匿名** | access_key 和 secret_key 都为空 | `aws.AnonymousCredentials` |
+
+**签名器注入点**：
+
+```go
+// s3Connection 中通过 HTTPSignerV4 选项替换默认签名器
+options = append(options, func(s3Opt *s3.Options) {
+    s3Opt.HTTPSignerV4 = &v2Signer{opt: opt}  // 或 &IbmIamSigner{...}
+})
+```
+
+### 2.4 Pacer 限流与重试
+
+每个 `Fs` 实例持有一个 `*fs.Pacer`，基于令牌桶算法对 S3 API 调用进行限速和重试：
+
+- **初始配置**：`pacer.NewS3(pacer.MinSleep(minSleep))`
+- **重试策略**：SDK 自身已有重试，pacer 再额外提供 2 次重试（主要用于列表 XML 解析错误回退）
+- **使用方式**：`f.pacer.Call(func() (bool, error) { ... })` 包裹所有 S3 API 调用
+
+---
+
+## 三、对象列表 (List) 接入分析
+
+### 3.1 接口映射
+
+| `fs.Fs` 接口 | S3 后端实现 | 底层 S3 API |
+|-------------|-------------|------------|
+| `List(ctx, dir)` | `Fs.List` → `list.WithListP` → `Fs.ListP` | ListObjectsV2 |
+| `ListP(ctx, dir, callback)` | `Fs.ListP` → `Fs.listDir` | ListObjectsV2 (单页) |
+| `ListR(ctx, dir, callback)` | `Fs.ListR` → `Fs.list(recurse=true)` | ListObjectsV2 (递归/不分隔符) |
+
+### 3.2 核心列表函数 List
+
+[Fs.List](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2654-L2656)
+
+```go
+func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+    return list.WithListP(ctx, dir, f)
+}
+```
+
+`List` 直接委托给 `list.WithListP`，后者调用 `ListP` 来实现单级目录列表。
+
+### 3.3 ListP — 非递归列表
+
+[Fs.ListP](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2671-L2695)
+
+```go
+func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
+    bucket, directory := f.split(dir)
+    if bucket == "" {
+        // 根目录：列出所有 bucket
+        entries, err := f.listBuckets(ctx)     // 调用 ListBuckets API
+        for _, entry := range entries { list.Add(entry) }
+    } else {
+        // 指定 bucket：列出目录
+        err := f.listDir(ctx, bucket, directory, ..., list.Add)
+    }
+    return list.Flush()
+}
+```
+
+### 3.4 listDir — 目录列表实现
+
+[Fs.listDir](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2597-L2652)
+
+`listDir` 内部调用核心的 `list` 函数，传入 `recurse=false`（带 delimiter）。
+
+### 3.5 list — 核心分页列表循环
+
+[Fs.list](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2387-L2577) 是最核心的列表实现。
+
+**输入参数** `listOpt`：
+
+| 字段 | 含义 |
+|------|------|
+| `bucket` | S3 bucket 名称 |
+| `directory` | 目录前缀（映射到 S3 prefix） |
+| `prefix` | 额外前缀过滤 |
+| `recurse` | 是否递归（决定是否使用 delimiter） |
+| `addBucket` | 返回条目的 remote 是否包含 bucket 名 |
+| `withVersions` | 是否列出版本 |
+| `versionAt` | 指定时间点的版本 |
+
+**执行流程**：
+
+```
+1. 构造 ListObjectsV2Input
+   ├─► Bucket
+   ├─► Delimiter = "/" (仅当非递归时)
+   ├─► Prefix = directory
+   └─► MaxKeys = ListChunk (默认 1000)
+
+2. 选择列表实现 bucketLister
+   ├─► 版本化列表 → newVersionsList
+   ├─► ListVersion=1 → newV1List (ListObjects v1)
+   └─► 默认 → newV2List (ListObjects v2)
+
+3. 分页循环
+   for {
+       pacer.Call() {
+           resp, versionIDs, err = listBucket.List(ctx)
+           // 如遇 XML 语法错误且未启用 URL 编码，自动重试启用 URL 编码
+       }
+       
+       // 处理 CommonPrefixes (目录)
+       for _, commonPrefix := range resp.CommonPrefixes {
+           remote = URL 解码 + Enc.ToStandardPath 处理
+           fn(remote, object, nil, isDirectory=true)
+       }
+       
+       // 处理 Contents (文件)
+       for i, object := range resp.Contents {
+           remote = URL 解码 + Enc.ToStandardPath 处理
+           // 识别目录标记：以 / 结尾且 size=0
+           isDirectory = (remote 以 / 结尾 && size==0)
+           fn(remote, object, versionIDs[i], isDirectory)
+       }
+       
+       if !resp.IsTruncated { break }
+   }
+
+4. 空目录检测（DirectoryMarkers 模式）
+   如 foundItems==0 且 directory 非空，通过 HeadObject 检测目录标记是否存在
+```
+
+**关键实现细节**：
+
+- **URL 编码列表**：部分 S3 兼容存储支持在响应中 URL 编码对象键，以避免特殊字符导致 XML 解析错误。遇到 `xml.SyntaxError` 时自动重试启用 URL 编码。
+- **目录标记识别**：S3 没有原生目录概念，以 `/` 结尾且大小为 0 的对象被视为"目录标记"（directory marker）。
+- **编码转换**：所有对象键经过 `f.opt.Enc.ToStandardPath(remote)` 处理，将 S3 端的编码转换为 rclone 内部标准路径。
+
+### 3.6 itemToDirEntry — 条目类型转换
+
+[Fs.itemToDirEntry](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2580-L2594)
+
+```go
+func (f *Fs) itemToDirEntry(ctx context.Context, remote string,
+    object *types.Object, versionID *string, isDirectory bool) (fs.DirEntry, error) {
+    if isDirectory {
+        return fs.NewDir(remote, time.Time{}).SetSize(size), nil  // → fs.Directory
+    }
+    return f.newObjectWithInfo(ctx, remote, object, versionID)  // → *Object (fs.Object)
+}
+```
+
+---
+
+## 四、上传路径接入分析
+
+### 4.1 接口映射
+
+| `fs.Fs` / `fs.Object` 接口 | S3 后端实现 | 底层 S3 API |
+|--------------------------|-------------|------------|
+| `Fs.Put(ctx, in, src)` | `Fs.Put` → `Object.Update` | PutObject / MultipartUpload |
+| `Object.Update(ctx, in, src)` | `Object.Update` | 同上 |
+| `Fs.Mkdir(ctx, dir)` | `Fs.Mkdir` → 检测 bucket / 创建目录标记 | CreateBucket / PutObject (空对象) |
+
+### 4.2 Fs.Put — 上传入口
+
+[Fs.Put](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2764-L2771)
+
+```go
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo,
+    options ...fs.OpenOption) (fs.Object, error) {
+    fs := &Object{ fs: f, remote: src.Remote() }
+    return fs, fs.Update(ctx, in, src, options...)
+}
+```
+
+`Put` 创建一个临时 `Object`，然后调用 `Update` 完成实际上传。
+
+### 4.3 Object.Update — 上传调度器
+
+[Object.Update](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L5022-L5105)
+
+```go
+func (o *Object) Update(ctx context.Context, in io.Reader,
+    src fs.ObjectInfo, options ...fs.OpenOption) error {
+
+    size := src.Size()
+    multipart := size < 0 || size >= int64(o.fs.opt.UploadCutoff)
+
+    if multipart {
+        // 多分片上传
+        wantETag, gotETag, versionID, ui, err = o.uploadMultipart(ctx, src, in, options...)
+    } else {
+        // 单分片上传
+        ui, err = o.prepareUpload(ctx, src, options, false)
+        if o.fs.opt.UsePresignedRequest {
+            gotETag, lastModified, versionID, err =
+                o.uploadSinglepartPresignedRequest(ctx, ui.req, size, in)
+        } else {
+            gotETag, lastModified, versionID, err =
+                o.uploadSinglepartPutObject(ctx, ui.req, size, in)
+        }
+    }
+
+    // 上传后处理：HEAD 校验 / ETag 校验 / Object Lock 等
+    o.setMetaData(head)
+    return err
+}
+```
+
+**上传模式决策**：
+- **未知大小** (`size < 0`) → 多分片上传
+- **大小 >= UploadCutoff** → 多分片上传（默认 200MB）
+- **大小 < UploadCutoff** → 单分片上传
+
+### 4.4 prepareUpload — 上传准备
+
+[Object.prepareUpload](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4807-L4936)
+
+构造 `s3.PutObjectInput` 请求，设置所有上传相关参数：
+
+```
+1. 确保父目录/bucket 存在 → mkdirParent()
+
+2. 构造 PutObjectInput
+   ├─► Bucket, Key
+   ├─► ACL (访问控制列表)
+   ├─► StorageClass (存储层级，从 src.GetTier() 获取)
+   │
+   ├─► 元数据处理
+   │    ├─► cache-control → CacheControl
+   │    ├─► content-disposition → ContentDisposition
+   │    ├─► content-encoding → ContentEncoding
+   │    ├─► content-language → ContentLanguage
+   │    ├─► content-type → ContentType
+   │    ├─► x-amz-tagging → Tagging
+   │    ├─► mtime → 覆盖源 ModTime
+   │    ├─► object-lock-* → ObjectLockMode/RetainUntilDate/LegalHoldStatus
+   │    └─► 其余 → Metadata (x-amz-meta-*)
+   │
+   ├─► mtime 元数据 → Metadata[metaMtime]
+   │
+   ├─► MD5 校验
+   │    ├─► 计算 MD5 (src.Hash(ctx, hash.MD5))
+   │    ├─► ContentMD5 = base64(MD5) (完整性校验)
+   │    └─► 多分片/SSE 时：Metadata[metaMD5Hash] = base64(MD5)
+   │
+   ├─► ContentType (如未设置则自动检测)
+   ├─► ContentLength
+   ├─► RequestPayer (requester_pays)
+   │
+   └─► 服务端加密 (SSE)
+        ├─► ServerSideEncryption (SSE-S3 / SSE-KMS)
+        ├─► SSEKMSKeyId (KMS 密钥 ID)
+        └─► SSECustomer* (SSE-C 客户提供密钥)
+```
+
+### 4.5 单分片上传 — uploadSinglepartPutObject
+
+[Object.uploadSinglepartPutObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4704-L4735)
+
+```go
+func (o *Object) uploadSinglepartPutObject(ctx context.Context,
+    req *s3.PutObjectInput, size int64, in io.Reader) (...) {
+
+    req.Body = io.NopCloser(in)
+    // 无符号 payload 模式（避免 seek body）
+    if o.fs.opt.UseUnsignedPayload.Value {
+        // 用 SwapComputePayloadSHA256ForUnsignedPayloadMiddleware 替换
+    }
+    // 单分片不重试（Reader 只能读一次）
+    resp, err = o.fs.c.PutObject(ctx, req, options...)
+    return *resp.ETag, time.Now(), resp.VersionId, nil
+}
+```
+
+**替代方案 — 预签名 URL 上传**：
+[uploadSinglepartPresignedRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4738-L4796)
+使用 `s3.NewPresignClient` 生成预签名 URL，然后用原生 `http.Client` 发送 PUT 请求。
+
+### 4.6 多分片上传 — uploadMultipart
+
+当文件大小超过 `UploadCutoff` 或大小未知时，使用多分片上传：
+
+1. **CreateMultipartUpload** — 初始化分片上传，获取 UploadID
+2. **UploadPart** — 并发上传各个分片（受 `--transfers` 控制）
+3. **CompleteMultipartUpload** — 合并所有分片
+
+多分片还支持 `OpenChunkWriter` 接口（`fs.ChunkWriter`），允许上层按分片流式写入。
+
+### 4.7 上传后处理
+
+Update 函数在上传完成后进行：
+
+- **HEAD 校验**（除非 `--no-head`）：调用 `headObject` 获取对象元数据，确认上传成功
+- **ETag 校验**（多分片 + `--use-multipart-etag`）：比较期望 ETag 与实际 ETag
+- **Object Lock 设置**（如启用）：通过 PutObjectRetention / PutObjectLegalHold 设置
+
+---
+
+## 五、下载路径接入分析
+
+### 5.1 接口映射
+
+| `fs.Object` 接口 | S3 后端实现 | 底层 S3 API |
+|-----------------|-------------|------------|
+| `Object.Open(ctx, options...)` | `Object.Open` | GetObject |
+| `Object.Hash(ctx, type)` | 从元数据读取 / 计算 | HeadObject |
+| `Fs.NewObject(ctx, remote)` | `Fs.NewObject` → `headObject` | HeadObject |
+
+### 5.2 Object.Open — 下载入口
+
+[Object.Open](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4301-L4400)
+
+```go
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+    bucket, bucketPath := o.split()
+
+    // 自定义下载 URL（如 CloudFront CDN）
+    if o.fs.opt.DownloadURL != "" {
+        return o.downloadFromURL(ctx, bucketPath, options...)
+    }
+
+    // 1. 构造 GetObjectInput
+    req := s3.GetObjectInput{
+        Bucket:    &bucket,
+        Key:       &bucketPath,
+        VersionId: o.versionID,
+    }
+    // SSE-C / RequesterPays 等参数...
+
+    // 2. 处理 OpenOption
+    fs.FixRangeOption(options, o.bytes)
+    for _, option := range options {
+        switch option.(type) {
+        case *fs.RangeOption, *fs.SeekOption:
+            req.Range = &value      // Range: bytes=start-end
+        case *fs.HTTPOption:
+            APIOptions = append(APIOptions, smithyhttp.AddHeaderValue(key, value))
+        }
+    }
+
+    // 3. 调用 GetObject (pacer 限流重试)
+    resp, err = o.fs.c.GetObject(ctx, &req, s3.WithAPIOptions(APIOptions...))
+
+    // 4. 处理大小（从 ContentLength 或 ContentRange 解析）
+    size := resp.ContentLength
+    if resp.ContentRange != nil { /* 解析 total size */ }
+
+    // 5. 更新本地元数据
+    o.setMetaData(&head)
+
+    // 6. gzip 解压处理（如需要）
+    if content-encoding == "gzip" && o.fs.opt.Decompress {
+        return readers.NewGzipReader(resp.Body)
+    }
+
+    return resp.Body, nil
+}
+```
+
+### 5.3 Range 请求支持
+
+S3 后端原生支持字节范围请求：
+
+- **`fs.RangeOption`** / **`fs.SeekOption`** → 转换为 HTTP `Range` 头
+- `fs.FixRangeOption(options, o.bytes)` — 规范化范围（处理负数偏移等）
+- 返回的 `resp.Body` 已是范围数据，长度由 `Content-Range` 响应头确定
+
+### 5.4 元数据缓存
+
+`Object` 结构体缓存了对象元数据（`meta`、`mimeType`、`md5`、`lastModified` 等），避免重复调用 HeadObject：
+
+- **列表时填充**：List 返回的 `Contents` 包含 Key、Size、LastModified、ETag
+- **Open 时更新**：GetObject 响应头包含完整元数据
+- **主动获取**：`readMetaData()` → `headObject()` 调用 HeadObject API
+
+### 5.5 NewObject — 获取对象引用
+
+`Fs.NewObject(ctx, remote)` 通过 `headObject` 获取对象元数据并构造 `*Object`，对应 `fs.Fs.NewObject` 统一接口。
+
+---
+
+## 六、关键数据结构
+
+### 6.1 Fs 结构体
+
+[backend/s3/s3.go:Fs](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1156-L1174)
+
+| 字段 | 类型 | 用途 |
 |------|------|------|
-| **S3 客户端后端** | `backend/s3/` | rclone 作为客户端连接外部 S3 兼容存储 |
-| **S3 服务端** | `cmd/serve/s3/` | rclone 对外提供 S3 兼容 API 服务（重点分析） |
+| `name` | `string` | 远程名称 |
+| `root` | `string` | 根路径（bucket + 前缀） |
+| `opt` | `Options` | 解析后的配置选项 |
+| `ci` | `*fs.ConfigInfo` | 全局配置 |
+| `c` | `*s3.Client` | AWS SDK S3 客户端 |
+| `rootBucket` | `string` | root 中的 bucket 部分 |
+| `rootDirectory` | `string` | root 中的目录前缀部分 |
+| `cache` | `*bucket.Cache` | bucket 存在性缓存 |
+| `pacer` | `*fs.Pacer` | API 调用限速与重试 |
+| `srv` | `*http.Client` | 原生 HTTP 客户端（预签名上传用） |
+| `srvRest` | `*rest.Client` | REST 客户端 |
+| `etagIsNotMD5` | `bool` | ETag 是否非 MD5（SSE-KMS/SSE-C/目录桶） |
+| `features` | `*fs.Features` | 可选功能集 |
 
-本文重点分析 **S3 服务端**（`cmd/serve/s3/`）如何通过 VFS 层接入 rclone 的统一后端接口 `fs.Fs`。
+### 6.2 Object 结构体
+
+[backend/s3/s3.go:Object](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1177-L1202)
+
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `fs` | `*Fs` | 所属 Fs 实例 |
+| `remote` | `string` | 远程路径 |
+| `md5` | `string` | MD5 哈希 |
+| `bytes` | `int64` | 对象大小 |
+| `lastModified` | `time.Time` | 最后修改时间 |
+| `meta` | `map[string]string` | 元数据（小写 key） |
+| `mimeType` | `string` | MIME 类型 |
+| `versionID` | `*string` | 版本 ID（版本化 bucket） |
+| `storageClass` | `*string` | 存储层级 |
+| `cacheControl` 等 | `*string` | 其他系统元数据 |
+| `objectLock*` | `*string / *time.Time` | Object Lock 相关 |
+
+---
+
+## 七、统一后端接口调用汇总
+
+| `fs.Fs` / `fs.Object` 方法 | S3 客户端实现 | 底层 S3 API |
+|---------------------------|-------------|------------|
+| `Fs.Name()` | `f.name` | - |
+| `Fs.Root()` | `f.root` | - |
+| `Fs.String()` | 格式化 bucket/root | - |
+| `Fs.Precision()` | 通常为 1ns | - |
+| `Fs.Hashes()` | MD5 (如 ETag 是 MD5) | - |
+| `Fs.Features()` | `f.features` | - |
+| **`Fs.List(ctx, dir)`** | `list.WithListP` → `ListP` | ListObjectsV2 |
+| **`Fs.ListP(ctx, dir, cb)`** | `f.listDir()` → `f.list(recurse=false)` | ListObjectsV2 |
+| **`Fs.ListR(ctx, dir, cb)`** | `f.list(recurse=true)` | ListObjectsV2 |
+| **`Fs.NewObject(ctx, r)`** | `headObject` | HeadObject |
+| **`Fs.Put(ctx, in, src)`** | `Object.Update` | PutObject / Multipart |
+| `Fs.Mkdir(ctx, dir)` | bucket 检测 + 目录标记 | CreateBucket / PutObject |
+| `Fs.Rmdir(ctx, dir)` | 删除 bucket / 目录标记 | DeleteBucket / DeleteObject |
+| **`Object.Open(ctx, opts)`** | `s3.Client.GetObject` | GetObject |
+| **`Object.Update(ctx, in, src)`** | 单分片 / 多分片上传 | PutObject / Multipart |
+| **`Object.Remove(ctx)`** | `s3.Client.DeleteObject` | DeleteObject |
+| `Object.SetModTime(ctx, t)` | Copy 自身 (更新元数据) | CopyObject |
+| `Object.Hash(ctx, type)` | 读取缓存 / headObject | HeadObject |
+| `Object.Storable()` | `true` | - |
+| `Object.MimeType(ctx)` | 读取缓存 / headObject | HeadObject |
+| `Fs.Copy(ctx, dst, src)` | server-side copy | CopyObject |
+| `Fs.Purge(ctx, dir)` | 批量删除 | DeleteObjects |
+| `Fs.OpenChunkWriter(...)` | 多分片写入器 | CreateMultipartUpload + UploadPart |
+
+---
+
+# 下篇：S3 服务端 (cmd/serve/s3/)
+
+## 八、整体架构概览
+
+S3 服务端通过 `gofakes3` 库解析 S3 协议，再通过 VFS 层接入 rclone 的 `fs.Fs` 统一后端接口，从而让任何 rclone 支持的存储都能对外提供 S3 API。
 
 ### 核心架构分层
 
@@ -55,16 +629,16 @@ rclone 的 S3 模块分为两部分：
 
 ---
 
-## 二、统一后端接口定义
+## 九、统一后端接口定义（回顾）
 
 所有 rclone 后端必须实现 `fs.Fs` 接口，定义在 [fs/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/types.go#L17-L59)。
 
-### 2.1 核心接口 `fs.Fs`
+### 9.1 核心接口 `fs.Fs`
 
 ```go
 type Fs interface {
     Info
-    List(ctx context.Context, dir string) (DirEntries, error)
+    List(ctx context.Context, dir string) (entries DirEntries, error)
     NewObject(ctx context.Context, remote string) (Object, error)
     Put(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
     Mkdir(ctx context.Context, dir string) error
@@ -72,17 +646,7 @@ type Fs interface {
 }
 ```
 
-| 方法 | 用途 | 对应 S3 操作 |
-|------|------|-------------|
-| `List` | 列出目录下的对象和子目录 | ListObjectsV2 |
-| `NewObject` | 根据路径获取对象 | HeadObject / GetObject |
-| `Put` | 上传对象 | PutObject / MultipartUpload |
-| `Mkdir` | 创建目录/桶 | CreateBucket / PutObject (目录标记) |
-| `Rmdir` | 删除目录/桶 | DeleteBucket |
-
-### 2.2 对象接口 `fs.Object`
-
-定义在 [fs/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/types.go#L83-L101)：
+### 9.2 对象接口 `fs.Object`
 
 ```go
 type Object interface {
@@ -94,16 +658,9 @@ type Object interface {
 }
 ```
 
-| 方法 | 用途 | 对应 S3 操作 |
-|------|------|-------------|
-| `Open` | 打开文件读取流 | GetObject |
-| `Update` | 更新对象内容 | PutObject (覆盖) |
-| `Remove` | 删除对象 | DeleteObject |
-| `SetModTime` | 设置修改时间 | CopyObject (更新元数据) |
+### 9.3 VFS 层抽象
 
-### 2.3 VFS 层抽象
-
-VFS (Virtual File System) 在 `fs.Fs` 之上提供类 POSIX 文件系统语义，定义在 [vfs/vfs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/vfs/vfs.go)：
+VFS (Virtual File System) 在 `fs.Fs` 之上提供类 POSIX 文件系统语义：
 
 - **`*vfs.VFS`**：虚拟文件系统根实例，持有 `fs.Fs`
 - **`vfs.Node`**：节点接口（文件/目录统一抽象）
@@ -124,9 +681,9 @@ VFS 关键方法：
 
 ---
 
-## 三、认证流程接入分析
+## 十、认证流程接入分析
 
-### 3.1 认证配置入口
+### 10.1 认证配置入口
 
 认证相关配置定义在 [cmd/serve/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/s3.go#L24-L46)：
 
@@ -142,7 +699,7 @@ var OptionsInfo = fs.Options{{
 1. **静态 Key 认证**：通过 `--auth_key` 配置 access_key_id,secret_access_key 对
 2. **动态代理认证**：通过 `--auth-proxy` 调用外部程序动态生成后端
 
-### 3.2 静态 Key 认证流程
+### 10.2 静态 Key 认证流程
 
 **初始化阶段** — [server.go:newServer](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L47-L116)
 
@@ -163,22 +720,9 @@ w.faker = gofakes3.New(
 )
 ```
 
-**辅助函数** — [utils.go:authlistResolver](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go#L129-L139)：
-
-```go
-func authlistResolver(list []string) (map[string]string, error) {
-    authList := make(map[string]string)
-    for _, v := range list {
-        parts := strings.Split(v, ",")  // "access_id,secret_key"
-        authList[parts[0]] = parts[1]
-    }
-    return authList, nil
-}
-```
-
 **请求阶段**：gofakes3 内部自动处理 `Authorization` 头的 S3 v4 签名校验，与注册的 authList 比对。无需 s3Backend 介入。
 
-### 3.3 动态代理认证流程
+### 10.3 动态代理认证流程
 
 当配置 `--auth-proxy` 时，启用代理认证，实现位于 [server.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L91-L102)：
 
@@ -191,7 +735,7 @@ if proxy.Opt.AuthProxy != "" {
 }
 ```
 
-#### 中间件 1: `proxyAuthMiddleware` — 动态获取 VFS
+#### 中间件 1: proxyAuthMiddleware — 动态获取 VFS
 
 [server.go:179-192](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L179-L192)
 
@@ -203,23 +747,6 @@ func proxyAuthMiddleware(next http.Handler, ws *Server) http.Handler {
         if value != nil {
             r = r.WithContext(context.WithValue(r.Context(), ctxKeyID, value))
         }
-        next.ServeHTTP(w, r)
-    })
-}
-```
-
-#### 中间件 2: `authPairMiddleware` — 动态注入签名密钥
-
-[server.go:167-177](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L167-L177)
-
-```go
-func authPairMiddleware(next http.Handler, ws *Server) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        accessKey, _ := parseAccessKeyID(r)
-        authPair := map[string]string{
-            accessKey: ws.s3Secret,   // 注意：此处使用服务器端的 s3Secret
-        }
-        ws.faker.AddAuthKeys(authPair)
         next.ServeHTTP(w, r)
     })
 }
@@ -263,50 +790,18 @@ func (w *Server) getVFS(ctx context.Context) (VFS *vfs.VFS, err error) {
 }
 ```
 
-### 3.4 认证流程总结
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    S3 请求进入 HTTP Handler                    │
-└────────────────────────────┬──────────────────────────────────┘
-                             │
-              ┌──────────────┴───────────────┐
-              │                              │
-              ▼                              ▼
-      【静态 Key 模式】                【代理认证模式】
-     _vfs 已在 newServer 中创建         proxyAuthMiddleware
-              │                              │
-              │                    ┌─────────┴──────────┐
-              │                    │                    │
-              │                    ▼                    ▼
-              │           parseAccessKeyID      调用外部 proxy 程序
-              │           提取 access_key       生成后端配置
-              │                    │                    │
-              │                    ▼                    ▼
-              │           authPairMiddleware      创建 *vfs.VFS
-              │           注入签名密钥                │
-              │                    │                    │
-              └────────────────────┼────────────────────┘
-                                   ▼
-                    s3Backend 的每个方法通过
-                    getVFS(ctx) 获取 *vfs.VFS
-                                   │
-                                   ▼
-                          后续所有操作
-```
-
 ---
 
-## 四、对象列表 (List) 接入分析
+## 十一、对象列表 (List) 接入分析
 
-### 4.1 S3 列表接口映射
+### 11.1 S3 列表接口映射
 
 | S3 API | gofakes3.Backend 方法 | s3Backend 实现 |
 |--------|----------------------|----------------|
 | ListBuckets | `ListBuckets(ctx)` | 列出根目录下的一级子目录作为桶 |
 | ListObjectsV2 | `ListBucket(ctx, bucket, prefix, page)` | 递归/非递归列出指定前缀下的对象 |
 
-### 4.2 ListBuckets — 列出所有桶
+### 11.2 ListBuckets — 列出所有桶
 
 [backend.go:ListBuckets](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L51-L72)
 
@@ -317,26 +812,23 @@ func (b *s3Backend) ListBuckets(ctx context.Context) ([]gofakes3.BucketInfo, err
     var response []gofakes3.BucketInfo
     for _, entry := range dirEntries {
         if entry.IsDir() {                         // 只取目录作为 bucket
-            response = append(response, gofakes3.BucketInfo{
-                Name:         entry.Name(),
-                CreationDate: gofakes3.NewContentTime(entry.ModTime()),
-            })
+            response = append(response, gofakes3.BucketInfo{...})
         }
     }
     return response, nil
 }
 ```
 
-**VFS 调用链**：
+**调用链**：
 ```
 ListBuckets(ctx)
     └─► getVFS(ctx)                       获取 VFS 实例
-    └─► getDirEntries("/", _vfs)          [utils.go:18-38]
+    └─► getDirEntries("/", _vfs)
             └─► VFS.Stat("/")             验证根目录存在且为目录
             └─► Dir.ReadDirAll()          读取所有子条目 (底层调用 fs.Fs.List)
 ```
 
-### 4.3 ListBucket — 列出桶内对象
+### 11.3 ListBucket — 列出桶内对象
 
 [backend.go:ListBucket](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L75-L108)
 
@@ -346,9 +838,6 @@ func (b *s3Backend) ListBucket(ctx context.Context, bucket string,
 
     _vfs, err := b.s.getVFS(ctx)
     _, err = _vfs.Stat(bucket)                    // 验证 bucket 存在
-    if prefix == nil { prefix = emptyPrefix }
-
-    response := gofakes3.NewObjectList()
     path, remaining := prefixParser(prefix)       // 解析 prefix → (目录路径, 文件名前缀)
 
     err = b.entryListR(_vfs, bucket, path, remaining, prefix.HasDelimiter, response)
@@ -356,21 +845,7 @@ func (b *s3Backend) ListBucket(ctx context.Context, bucket string,
 }
 ```
 
-#### 前缀解析 `prefixParser`
-
-[utils.go:89-95](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go#L89-L95)：
-
-```go
-func prefixParser(p *gofakes3.Prefix) (path, remaining string) {
-    idx := strings.LastIndexByte(p.Prefix, '/')
-    if idx < 0 {
-        return "", p.Prefix     // 无斜杠：在根目录按前缀匹配文件名
-    }
-    return p.Prefix[:idx], p.Prefix[idx+1:]  // 有斜杠：拆分为子目录 + 文件名前缀
-}
-```
-
-#### 递归列表 `entryListR`
+#### 递归列表 entryListR
 
 [list.go:11-51](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/list.go#L11-L51)：
 
@@ -378,42 +853,25 @@ func prefixParser(p *gofakes3.Prefix) (path, remaining string) {
 func (b *s3Backend) entryListR(_vfs *vfs.VFS, bucket, fdPath, name string,
     addPrefix bool, response *gofakes3.ObjectList) error {
 
-    fp := path.Join(bucket, fdPath)
     dirEntries, err := getDirEntries(fp, _vfs)   // 读取当前目录
-
     for _, entry := range dirEntries {
-        object := entry.Name()
-        objectPath := path.Join(fdPath, object)
-
-        if !strings.HasPrefix(object, name) {    // 文件名前缀过滤
-            continue
-        }
+        if !strings.HasPrefix(object, name) { continue }  // 文件名前缀过滤
 
         if entry.IsDir() {
             if addPrefix {
-                // 有 delimiter：目录作为 CommonPrefix 返回（不递归）
-                response.AddPrefix(objectPath + "/")
+                response.AddPrefix(objectPath + "/")    // 有 delimiter：返回 CommonPrefix
             } else {
-                // 无 delimiter：递归进入子目录
-                b.entryListR(_vfs, bucket, path.Join(fdPath, object), "", false, response)
+                b.entryListR(_vfs, bucket, ..., false, response)  // 无 delimiter：递归
             }
         } else {
-            // 文件：构造 Content 条目
-            item := &gofakes3.Content{
-                Key:          objectPath,
-                LastModified: gofakes3.NewContentTime(entry.ModTime()),
-                ETag:         getFileHash(entry, b.s.etagHashType),
-                Size:         entry.Size(),
-                StorageClass: gofakes3.StorageStandard,
-            }
-            response.Add(item)
+            response.Add(&gofakes3.Content{...})  // 文件条目
         }
     }
     return nil
 }
 ```
 
-#### 分页处理 `pager`
+#### 分页处理 pager
 
 [pager.go:10-66](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/pager.go#L10-L66)：
 
@@ -422,52 +880,19 @@ func (b *s3Backend) entryListR(_vfs *vfs.VFS, bucket, fdPath, name string,
 3. 按 MaxKeys（默认 1000）截断列表
 4. 如果有截断，设置 `IsTruncated=true` 和 `NextMarker`
 
-### 4.4 对象列表流程总结
-
-```
-S3 ListObjects 请求 (bucket=b, prefix=p, delimiter=d, marker=m, maxKeys=n)
-    │
-    ▼
-ListBucket(ctx, "b", prefix{Prefix:p, Delimiter:d}, page{Marker:m, MaxKeys:n})
-    │
-    ├─► getVFS(ctx)
-    ├─► VFS.Stat("b")                         校验桶存在
-    ├─► prefixParser(p)                       拆分为 (dirPath, fileNamePrefix)
-    │
-    ▼
-entryListR(VFS, "b", dirPath, fileNamePrefix, hasDelimiter, response)
-    │
-    ├─► getDirEntries("b/dirPath", VFS)
-    │       └─► VFS.Stat(...)
-    │       └─► Dir.ReadDirAll()
-    │                  └─► fs.Fs.List(ctx, path)  ← 统一后端接口
-    │
-    └─► 遍历每个条目：
-         ├─► 目录 + 有 delimiter → response.AddPrefix("prefix/")
-         ├─► 目录 + 无 delimiter → 递归 entryListR(子目录)
-         └─► 文件 + 前缀匹配     → response.Add(Content{Key, Size, ETag, ...})
-    │
-    ▼
-pager(response, page)                        排序 + Marker 跳过 + MaxKeys 截断
-    │
-    ▼
-返回 ObjectList
-```
-
 ---
 
-## 五、上传路径接入分析
+## 十二、上传路径接入分析
 
-### 5.1 上传接口映射
+### 12.1 上传接口映射
 
 | S3 API | gofakes3.Backend 方法 | s3Backend 实现 |
 |--------|----------------------|----------------|
 | CreateBucket | `CreateBucket(ctx, name)` | VFS.Mkdir 创建目录 |
 | PutObject | `PutObject(ctx, bucket, object, meta, reader, size)` | VFS.Create + io.Copy |
 | CopyObject | `CopyObject(ctx, src, dst, meta)` | GetObject + PutObject |
-| TouchObject | `TouchObject(ctx, fp, meta)` | 创建空文件 / 更新元数据 |
 
-### 5.2 PutObject — 简单上传
+### 12.2 PutObject — 简单上传
 
 [backend.go:PutObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L299-L369)
 
@@ -477,71 +902,31 @@ func (b *s3Backend) PutObject(ctx context.Context, bucketName, objectName string
 
     _vfs, err := b.s.getVFS(ctx)
     _, err = _vfs.Stat(bucketName)                     // 验证 bucket 存在
-    if err != nil { return result, gofakes3.BucketNotFound(bucketName) }
 
     fp := path.Join(bucketName, objectName)
     objectDir := path.Dir(fp)
 
     // 1. 确保父目录存在（递归创建）
-    if objectDir != "." {
-        if err := mkdirRecursive(objectDir, _vfs); err != nil {
-            return result, err
-        }
-    }
+    if objectDir != "." { mkdirRecursive(objectDir, _vfs) }
 
-    // 2. 创建文件
+    // 2. 创建文件 + 流式拷贝
     f, err := _vfs.Create(fp)
-    if err != nil { return result, err }
-
-    // 3. 流式拷贝数据
     if _, err := io.Copy(f, input); err != nil {
-        _ = f.Close()
-        _ = _vfs.Remove(fp)   // I/O 错误清理
-        return result, err
+        _ = f.Close(); _ = _vfs.Remove(fp)   // 出错清理
     }
+    f.Close()
 
-    // 4. 关闭文件
-    if err := f.Close(); err != nil {
-        _ = _vfs.Remove(fp)   // 关闭错误清理
-        return result, err
-    }
-
-    // 5. 存储元数据 + 设置修改时间
+    // 3. 存储元数据 + 设置修改时间
     b.meta.Store(fp, meta)
     if val, ok := meta["X-Amz-Meta-Mtime"]; ok {
-        ti, err := swift.FloatStringToTime(val)
-        if err == nil {
-            b.storeModtime(fp, meta, val)
-            return result, _vfs.Chtimes(fp, ti, ti)
-        }
+        _vfs.Chtimes(fp, ti, ti)
     }
     return result, nil
 }
 ```
 
-#### 递归创建目录 `mkdirRecursive`
-
-[utils.go:98-112](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go#L98-L112)：
-
-```go
-func mkdirRecursive(path string, VFS *vfs.VFS) error {
-    path = strings.Trim(path, "/")
-    dirs := strings.Split(path, "/")
-    dir := ""
-    for _, d := range dirs {
-        dir += "/" + d
-        if _, err := VFS.Stat(dir); err != nil {
-            err := VFS.Mkdir(dir, 0777)   // 逐级创建
-            if err != nil { return err }
-        }
-    }
-    return nil
-}
-```
-
 #### VFS.Create → fs.Fs.Put 调用链
 
-`vfs.VFS.Create(path)` 内部会触发：
 ```
 VFS.Create(fp)
     └─► Dir.Create(leaf)                   目录内创建文件
@@ -550,110 +935,33 @@ VFS.Create(fp)
                         fs.Fs.Put(ctx, reader, objectInfo)   ← 统一后端接口
 ```
 
-### 5.3 Multipart Upload（分片上传）
+### 12.3 Multipart Upload（分片上传）
 
-s3Backend 结构体声明实现了 `gofakes3.MultipartBackend` 接口（见注释），支持两种模式：
+s3Backend 实现了 `gofakes3.MultipartBackend` 接口，支持两种模式：
 
 1. **流式模式（默认）**：分片数据直接流式传到后端，不落盘
 2. **内存缓冲模式**（`--disable-multipart-streaming`）：分片先在内存缓冲，完成后一次性上传
 
-相关字段在 [backend.go:s3Backend](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L29-L40)：
-
-```go
-type s3Backend struct {
-    s                *Server
-    meta             *sync.Map
-    multipartUploads sync.Map          // key: UploadID, value: 分片上传上下文
-    warnInMemoryOnce sync.Once         // 首次回退到内存模式时打日志
-}
-```
-
-### 5.4 CopyObject — 复制对象
-
-[backend.go:CopyObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L473-L529)
-
-```go
-func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string,
-    meta map[string]string) (result gofakes3.CopyObjectResult, err error) {
-
-    // 同源同键：仅更新元数据 / mtime
-    if srcBucket == dstBucket && srcKey == dstKey {
-        b.meta.Store(fp, meta)
-        // 解析 mtime 并调用 _vfs.Chtimes(...)
-        return
-    }
-
-    // 不同源：先读后写
-    c, err := b.GetObject(ctx, srcBucket, srcKey, nil)   // 读取源对象
-    defer c.Contents.Close()
-
-    // 合并元数据，复制 mtime
-    for k, v := range c.Metadata {
-        if _, found := meta[k]; !found && k != "X-Amz-Acl" {
-            meta[k] = v
-        }
-    }
-    meta["mtime"] = swift.TimeToFloatString(cStat.ModTime())
-
-    _, err = b.PutObject(ctx, dstBucket, dstKey, meta, c.Contents, c.Size)  // 写入目标
-    return
-}
-```
-
-### 5.5 上传流程总结
-
-```
-S3 PutObject 请求 (bucket=b, key=k, body, Content-MD5, metadata)
-    │
-    ▼
-PutObject(ctx, "b", "k", meta, bodyReader, size)
-    │
-    ├─► getVFS(ctx)
-    ├─► VFS.Stat("b")                          校验 bucket 存在
-    ├─► mkdirRecursive(parent("b/k"), VFS)     确保父目录存在
-    │       └─► VFS.Mkdir(dir, 0777)
-    │                └─► fs.Fs.Mkdir(ctx, dir) ← 统一后端接口
-    │
-    ├─► VFS.Create("b/k")                      创建文件句柄
-    │       └─► Dir.Create(leaf)
-    │                └─► WriteFileHandle
-    │
-    ├─► io.Copy(f, input)                      流式写入
-    │       └─► 最终调用:
-    │           fs.Fs.Put(ctx, reader, ObjectInfo{Size, ModTime})  ← 统一后端接口
-    │
-    ├─► f.Close()                              关闭 + flush
-    ├─► meta.Store("b/k", meta)                元数据存入 sync.Map
-    └─► VFS.Chtimes("b/k", ti, ti)             设置 mtime
-            └─► fs.Object.SetModTime(ctx, ti)  ← 统一后端接口
-```
-
 ---
 
-## 六、下载路径接入分析
+## 十三、下载路径接入分析
 
-### 6.1 下载接口映射
+### 13.1 下载接口映射
 
 | S3 API | gofakes3.Backend 方法 | s3Backend 实现 |
 |--------|----------------------|----------------|
 | HeadObject | `HeadObject(ctx, bucket, object)` | VFS.Stat 获取元数据 |
 | GetObject | `GetObject(ctx, bucket, object, rangeReq)` | VFS.Stat + File.Open + Range |
 
-### 6.2 HeadObject — 获取对象元数据
+### 13.2 HeadObject — 获取对象元数据
 
 [backend.go:HeadObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L120-L166)
 
 ```go
 func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName string) (*gofakes3.Object, error) {
     _vfs, err := b.s.getVFS(ctx)
-    _, err = _vfs.Stat(bucketName)
-    fp := path.Join(bucketName, objectName)
-    node, err := _vfs.Stat(fp)              // 路径存在性 + 类型校验
-    if !node.IsFile() { return nil, gofakes3.KeyNotFound(objectName) }
-
-    entry := node.DirEntry()                // 获取底层 fs.DirEntry
-    fobj := entry.(fs.Object)               // 断言为 fs.Object
-    size := node.Size()
+    node, err := _vfs.Stat(path.Join(bucketName, objectName))
+    fobj := node.DirEntry().(fs.Object)
     hash := getFileHashByte(fobj, b.s.etagHashType)   // 取 ETag
 
     meta := map[string]string{
@@ -661,21 +969,19 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
         "Content-Type":  fs.MimeType(context.Background(), fobj),
     }
     // 合并用户自定义元数据（从 sync.Map 中取出）
-    if val, ok := b.meta.Load(fp); ok {
-        maps.Copy(meta, val.(map[string]string))
-    }
+    if val, ok := b.meta.Load(fp); ok { maps.Copy(meta, val.(map[string]string)) }
 
     return &gofakes3.Object{
         Name:     objectName,
         Hash:     hash,
         Metadata: meta,
-        Size:     size,
-        Contents: noOpReadCloser{},         // Head 不返回内容
+        Size:     node.Size(),
+        Contents: noOpReadCloser{},
     }, nil
 }
 ```
 
-### 6.3 GetObject — 下载对象（含 Range）
+### 13.3 GetObject — 下载对象（含 Range）
 
 [backend.go:GetObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L169-L242)
 
@@ -684,208 +990,95 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
     rangeRequest *gofakes3.ObjectRangeRequest) (obj *gofakes3.Object, err error) {
 
     _vfs, err := b.s.getVFS(ctx)
-    _, err = _vfs.Stat(bucketName)
-    fp := path.Join(bucketName, objectName)
     node, err := _vfs.Stat(fp)
-    if !node.IsFile() { return nil, gofakes3.KeyNotFound(objectName) }
-
-    fobj := entry.(fs.Object)
     file := node.(*vfs.File)
-    size := node.Size()
-    hash := getFileHashByte(fobj, b.s.etagHashType)
 
     // 1. 打开文件获取可读流
     in, err := file.Open(os.O_RDONLY)
-    defer func() {
-        if err != nil { _ = in.Close() }   // 出错则关闭，否则交由调用方
-    }()
-
-    var rdr io.ReadCloser = in
 
     // 2. 处理 Range 请求
     rnge, err := rangeRequest.Range(size)
     if rnge != nil {
-        if _, err := in.Seek(rnge.Start, io.SeekStart); err != nil {
-            return nil, err
-        }
-        rdr = limitReadCloser(rdr, in.Close, rnge.Length)   // 限制读取长度
+        in.Seek(rnge.Start, io.SeekStart)
+        rdr = limitReadCloser(in, in.Close, rnge.Length)
     }
 
-    // 3. 构造元数据（同 HeadObject）
-    meta := map[string]string{...}
+    // 3. 构造元数据 + ETag
+    hash := getFileHashByte(fobj, b.s.etagHashType)
 
     return &gofakes3.Object{
         Name:     objectName,
         Hash:     hash,
-        Metadata: meta,
         Size:     size,
         Range:    rnge,
-        Contents: rdr,                       // 可读流交给 gofakes3 输出到 HTTP
+        Contents: rdr,
     }, nil
 }
 ```
 
-#### Range 包装器 `limitReadCloser`
-
-[ioutils.go:22-34](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/ioutils.go#L22-L34)：
-
-```go
-func limitReadCloser(rdr io.Reader, closer func() error, sz int64) io.ReadCloser {
-    return &readerWithCloser{
-        Reader: io.LimitReader(rdr, sz),   // 用 io.LimitReader 限制字节数
-        closer: closer,
-    }
-}
-```
-
-#### ETag 哈希计算 `getFileHash`
+#### ETag 哈希计算 getFileHash
 
 [utils.go:48-87](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go#L48-L87)：
 
 ```go
 func getFileHash(node any, hashType hash.Type) string {
-    if hashType == hash.None { return "" }
     switch b := node.(type) {
     case vfs.Node:
         fsObj, ok := b.DirEntry().(fs.Object)
-        if !ok {
-            // 上传中文件：从 VFS 缓存读取，手动计算哈希
-            in, _ := b.Open(os.O_RDONLY)
-            h, _ := hash.NewMultiHasherTypes(hash.NewHashSet(hashType))
-            io.Copy(h, in)
-            return h.Sums()[hashType]
+        if ok {
+            o = fsObj
+            hash, _ := o.Hash(context.Background(), hashType)  // ← 统一后端接口
+            return hash
         }
-        o = fsObj
-    case fs.Object:
-        o = b
+        // 上传中文件：打开文件手动计算哈希
     }
-    hash, _ := o.Hash(context.Background(), hashType)  // ← 统一后端接口
-    return hash
-}
-```
-
-### 6.4 下载流程总结
-
-```
-S3 GetObject 请求 (bucket=b, key=k, Range: bytes=100-199)
-    │
-    ▼
-GetObject(ctx, "b", "k", rangeRequest)
-    │
-    ├─► getVFS(ctx)
-    ├─► VFS.Stat("b")                          校验 bucket
-    ├─► VFS.Stat("b/k")                        获取文件 Node
-    │       └─► fs.Fs.NewObject(ctx, "k")      ← 统一后端接口
-    │
-    ├─► File.Open(os.O_RDONLY)                 打开文件句柄
-    │       └─► ReadFileHandle
-    │               └─► fs.Object.Open(ctx)    ← 统一后端接口
-    │
-    ├─► rangeRequest.Range(size)
-    │       └─► in.Seek(start, io.SeekStart)   定位偏移
-    │       └─► limitReadCloser(in, sz)         包装 LimitReader
-    │
-    ├─► fobj.Hash(ctx, hashType)               计算 ETag
-    │       └─► fs.Object.Hash(ctx, type)      ← 统一后端接口
-    │
-    └─► 返回 gofakes3.Object{Contents: rdr, Range: rnge, ...}
-            │
-            ▼
-    gofakes3 将 Contents 流式写入 HTTP Response Body
-    设置 Content-Range / Accept-Ranges / ETag / Last-Modified 等响应头
-```
-
----
-
-## 七、删除操作接入分析
-
-### 7.1 删除接口映射
-
-| S3 API | gofakes3.Backend 方法 | s3Backend 实现 |
-|--------|----------------------|----------------|
-| DeleteObject | `DeleteObject(ctx, bucket, object)` | VFS.Remove + 清理空目录 |
-| DeleteMultipleObjects | `DeleteMulti(ctx, bucket, objects...)` | 循环调用 DeleteObject |
-| DeleteBucket | `DeleteBucket(ctx, name)` | VFS.Remove 删除空目录 |
-
-### 7.2 DeleteObject 实现
-
-[backend.go:deleteObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L397-L417)
-
-```go
-func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName string) error {
-    _vfs, err := b.s.getVFS(ctx)
-    _, err = _vfs.Stat(bucketName)
-    fp := path.Join(bucketName, objectName)
-
-    // S3 规范：删除不存在的 key 不报错
-    if err := _vfs.Remove(fp); err != nil && !os.IsNotExist(err) {
-        return err
-    }
-
-    // 递归清理父目录（如为空）
-    if !b.s.opt.NoCleanup {
-        rmdirRecursive(fp, _vfs)
-    }
-    return nil
 }
 ```
 
 ---
 
-## 八、s3Backend 关键数据结构
+## 十四、关键数据结构（服务端）
 
-### 8.1 Server 结构体
+### 14.1 Server 结构体
 
 [server.go:Server](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L33-L44)
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
 | `server` | `*httplib.Server` | 底层 HTTP 服务器 |
-| `opt` | `Options` | 服务配置（认证、路径风格、ETag 哈希等） |
+| `opt` | `Options` | 服务配置 |
 | `f` | `fs.Fs` | 底层统一后端（静态模式） |
-| `_vfs` | `*vfs.VFS` | VFS 实例（静态模式，代理模式下为 nil） |
+| `_vfs` | `*vfs.VFS` | VFS 实例（静态模式） |
 | `faker` | `*gofakes3.GoFakeS3` | gofakes3 S3 协议引擎 |
-| `handler` | `http.Handler` | 经过中间件链包装的 HTTP 处理器 |
-| `proxy` | `*proxy.Proxy` | 认证代理（仅代理模式） |
-| `ctx` | `context.Context` | 全局上下文 |
-| `s3Secret` | `string` | S3 签名密钥（静态模式） |
-| `etagHashType` | `hash.Type` | ETag 使用的哈希算法（MD5/SHA1 等） |
+| `proxy` | `*proxy.Proxy` | 认证代理（代理模式） |
+| `s3Secret` | `string` | S3 签名密钥 |
+| `etagHashType` | `hash.Type` | ETag 使用的哈希算法 |
 
-### 8.2 s3Backend 结构体
+### 14.2 s3Backend 结构体
 
 [backend.go:s3Backend](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L29-L40)
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
-| `s` | `*Server` | 回指 Server 实例，用于访问 VFS 和配置 |
-| `meta` | `*sync.Map` | 存储对象自定义元数据（key: 完整路径, value: map[string]string） |
-| `multipartUploads` | `sync.Map` | 跟踪进行中的分片上传（key: UploadID） |
-| `warnInMemoryOnce` | `sync.Once` | 首次回退到内存缓冲模式时打一次 NOTICE 日志 |
+| `s` | `*Server` | 回指 Server 实例 |
+| `meta` | `*sync.Map` | 对象自定义元数据缓存 |
+| `multipartUploads` | `sync.Map` | 进行中的分片上传 |
 
 ---
 
-## 九、统一后端接口调用汇总
+## 十五、关键文件索引
 
-下表列出 s3Backend 各方法最终调用的 `fs.Fs` / `fs.Object` 统一接口：
+### 客户端后端 (backend/s3/)
 
-| s3Backend 方法 | VFS 调用 | 底层统一接口 |
-|---------------|---------|-------------|
-| `ListBuckets` | `Dir.ReadDirAll()` | `fs.Fs.List(ctx, "")` |
-| `ListBucket` | `Dir.ReadDirAll()` | `fs.Fs.List(ctx, dir)` |
-| `HeadObject` | `VFS.Stat()` | `fs.Fs.NewObject(ctx, remote)` |
-| `GetObject` | `File.Open()` | `fs.Object.Open(ctx, options...)` |
-| `GetObject` (ETag) | `node.DirEntry()` → `fs.Object` | `fs.Object.Hash(ctx, hashType)` |
-| `PutObject` | `VFS.Create()` + `io.Copy` | `fs.Fs.Put(ctx, reader, objInfo)` |
-| `PutObject` (mtime) | `VFS.Chtimes()` | `fs.Object.SetModTime(ctx, t)` |
-| `CreateBucket` | `VFS.Mkdir()` | `fs.Fs.Mkdir(ctx, dir)` |
-| `DeleteBucket` | `VFS.Remove()` | `fs.Fs.Rmdir(ctx, dir)` |
-| `DeleteObject` | `VFS.Remove()` | `fs.Object.Remove(ctx)` |
-| `CopyObject` | `GetObject` + `PutObject` | `fs.Object.Open` + `fs.Fs.Put` |
-| `BucketExists` | `VFS.Stat()` | `fs.Fs.List(ctx, "")` 或 `NewObject` |
+| 文件 | 职责 |
+|------|------|
+| [backend/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go) | S3 客户端主文件：Fs/Object 定义、NewFs、List、Put、Open 等 |
+| [backend/s3/providers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/providers.go) | Provider 配置加载与 Quirks 定义 |
+| [backend/s3/v2sign.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go) | S3 v2 签名实现 |
+| [backend/s3/ibm_signer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go) | IBM IAM 签名实现 |
+| [backend/s3/setfrom.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/setfrom.go) | 结构体字段拷贝工具（代码生成） |
 
----
-
-## 十、关键文件索引
+### 服务端 (cmd/serve/s3/)
 
 | 文件 | 职责 |
 |------|------|
@@ -894,12 +1087,13 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 | [cmd/serve/s3/backend.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go) | s3Backend 实现：CRUD、桶操作、Copy |
 | [cmd/serve/s3/list.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/list.go) | 递归对象列表 entryListR |
 | [cmd/serve/s3/pager.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/pager.go) | S3 列表分页逻辑 |
-| [cmd/serve/s3/utils.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go) | 辅助函数：哈希、目录操作、前缀解析、认证解析 |
-| [cmd/serve/s3/ioutils.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/ioutils.go) | IO 工具：空 Reader、带 Closer 的 LimitReader |
-| [cmd/serve/s3/logger.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/logger.go) | gofakes3 日志桥接 |
-| [cmd/serve/proxy/proxy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/proxy/proxy.go) | 动态认证代理：调用外部程序生成后端 |
+| [cmd/serve/s3/utils.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go) | 辅助函数：哈希、目录操作、前缀解析 |
+
+### 统一接口与基础设施
+
+| 文件 | 职责 |
+|------|------|
 | [fs/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/types.go) | 统一后端接口定义 (Fs, Object, Directory) |
+| [fs/pacer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/pacer.go) | Pacer 限流与重试 |
 | [vfs/vfs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/vfs/vfs.go) | VFS 虚拟文件系统核心定义 |
-| [vfs/dir.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/vfs/dir.go) | VFS 目录实现 |
-| [vfs/file.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/vfs/file.go) | VFS 文件实现 |
-| [backend/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go) | S3 客户端后端（rclone 作为客户端连接 S3） |
+| [cmd/serve/proxy/proxy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/proxy/proxy.go) | 动态认证代理 |

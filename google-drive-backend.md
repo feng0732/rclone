@@ -790,20 +790,27 @@ dirCache 中 "docs/"、"docs/subdir/" 等目录条目 → 仍留在缓存中 ★
 
 **后果**：
 - VFS 中 `docs/` 目录本身会被标记为失效
-- 但 `docs/report.docx` 等子项的 dirCache 条目**仍然存在**
-- VFS 可能在一段时间内还能查到这些子项的元数据（读缓存）
-- 直到用户主动再次 list `docs/` → 触发 404 → 才会知道整个目录都没了
+- 但 `docs/sub/` 等子目录的 dirCache 条目**仍然存在**（变更通知不会清理 dirCache）
+- 子文件不在 dirCache 中，所以不存在子文件的 dirCache 残留问题
+- VFS 可能在一段时间内还能查到子文件的元数据（VFS Dir.items 读缓存）
+- 直到用户主动再次 list `docs/` → 父目录重拉后子项自然消失
 
 ### 10.4 回收站 vs 永久删除的行为差异
 
 | 行为 | 移入回收站（trashed=true） | 永久删除（permanent delete） |
 |------|--------------------------|----------------------------|
 | change.File | ✅ 存在，`trashed=true` | ❌ nil |
-| 旧路径通知 | ✅ 有（前提是在缓存） | ✅ 有（前提是在缓存） |
-| 新路径通知 | ❌ 无（parents 不变） | ❌ 无（没 file） |
+| 旧路径通知（GetInv(fileId)） | ✅ 有（前提是该 ID 对应**目录**且在 dirCache 中） | ✅ 同左（前提同左） |
+| 新路径分支是否进入 | ✅ 进入（File != nil） | ❌ 不进入（File == nil） |
+| 新路径计算结果 | 与旧路径相同（parents 未变）→ 相当于重复通知 | 不适用 |
+| 最终效果 | 旧+新路径去重后 = 一次通知 | 仅旧路径通知 = 一次通知 |
 | 子文件变更事件 | ❌ 无（只有目录自身） | ❌ 无（只有目录自身） |
 | TrashedOnly 模式下可见 | ✅ 是 | ❌ 否 |
 | 可恢复 | ✅ untrash | ❌ 不可恢复 |
+
+**关键理解**：移入回收站时 `change.File != nil`，代码会**同时走旧路径和新路径两个分支**。但因为 parents 没变，新路径和旧路径完全相同，经过 `visitedPaths` 去重后只通知一次。这和永久删除（只走旧路径分支）的效果一样——都是一次通知。
+
+> 但有一个微妙差异：移入回收站时 File 里有 `MimeType`，能正确区分 EntryObject/EntryDirectory；永久删除时 File 为 nil，**只能默认按 EntryDirectory 处理**。
 
 ### 10.5 与查询模块的联动：TrashedOnly 模式
 
@@ -816,7 +823,8 @@ dirCache 中 "docs/"、"docs/subdir/" 等目录条目 → 仍留在缓存中 ★
 
 **变更检测侧**：
 - 没有特殊处理
-- 移入回收站的文件 → 旧路径通知（因为在缓存中）→ VFS 失效
+- 目录移入回收站 → change.File != nil 且 trashed=true → 旧路径+新路径分支都走 → 去重后通知一次
+- 文件移入回收站 → 同上，但旧路径分支不命中（文件不在 dirCache）→ 只走新路径分支 → 通知一次
 - 用户下次 list → 会在 TrashedOnly 模式下看到这些文件
 
 ---
@@ -1393,8 +1401,10 @@ changeNotifyRunner 收到 1 条 change（docs/ 本身）
   ① 旧路径: GetInv(docsId) → 命中 → "docs"
      → 加入 pathsToClear (EntryDirectory)
      
-  ② 新路径: change.File == nil（永久删除）或 trashed=true
-     → 跳过（删除不需要新路径）
+  ② 新路径: 
+     永久删除时: change.File == nil → 跳过
+     移入回收站时: change.File != nil, trashed=true → 进入新路径分支
+       但 parents 未变 → 新路径 == 旧路径 → 去重后等效一次通知
 
 → 只通知了 "docs" 一条路径
 ```
@@ -1426,12 +1436,12 @@ VFS 层收到 `changeNotify("docs", EntryDirectory)` 后：
 
 #### 永久删除 vs 移入回收站
 
-| 删除方式 | change.File | 文件是否还在 dirCache 影响中 | 能否通过旧路径发现 |
-|---------|------------|---------------------------|-----------------|
-| 移入回收站 | 非 nil，`trashed=true` | 是，目录路径映射还在 | 能，TrashedOnly 模式下可见 |
-| 永久删除 | nil | 是，目录路径映射还在（脏数据） | 不能，404 或 list 不到 |
+| 删除方式 | change.File | dirCache 中的目录映射 | dirCache 中的文件映射 | 旧路径分支 | 新路径分支 | VFS 通知效果 |
+|---------|------------|---------------------|---------------------|-----------|-----------|------------|
+| 移入回收站 | 非 nil，`trashed=true` | 目录映射残留 | 不存在（文件不进 dirCache） | 目录 ID 命中 | 进入但路径相同 | 去重后 = 一次通知 |
+| 永久删除 | nil | 目录映射残留 | 不存在（文件不进 dirCache） | 目录 ID 命中 | 不进入 | 仅旧路径 = 一次通知 |
 
-两种情况下，dirCache 中的旧映射都不会自动清除。
+两种情况下，dirCache 中的旧目录映射都不会自动清除，但 VFS 层的行为一致：都只失效一次。
 
 ### 13.5 两层缓存的协作全景图
 
@@ -1531,3 +1541,151 @@ A: 正向映射（路径→ID）用于列表查询前的路径翻译。反向映
 ### 13.7 一句话总结
 
 > **dirCache 是翻译官（路径 ↔ ID），只管目录；VFS 是展示层（目录内容），文件目录都管。变更通知只读 dirCache 来翻译路径，翻译完去失效 VFS 缓存，反过来却不会修改 dirCache。两层缓存各活各的，靠列表操作（Put）来同步。**
+
+---
+
+## 十四、文件与目录在变更通知中的失效差异——统一对照表
+
+前文多处分散讨论了文件和目录在变更通知中的不同表现，容易混淆。本节将所有差异汇总为统一对照表，结合代码逐行说明。
+
+### 14.1 核心前提：dirCache 只存目录 ID
+
+[drive.go#L2424-L2426](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2424-L2426)
+
+```go
+case item.MimeType == driveFolderType:
+    // cache the directory ID for later lookups
+    f.dirCache.Put(remote, item.Id)  // ★ 只有目录才 Put
+```
+
+**推论**：`dirCache.invCache` 中只有目录 ID → 路径的映射。文件 ID 从未出现在 `invCache` 中。
+
+### 14.2 changeNotifyRunner 两个分支的精确语义
+
+[drive.go#L3271-L3303](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3271-L3303)
+
+变更处理有两个分支，对文件和目录的效果截然不同：
+
+**分支 ①：找旧路径**（第 3273-3279 行）
+```go
+if path, ok := f.dirCache.GetInv(change.FileId); ok {
+    // 文件: GetInv(文件ID) → 永远 false → 不进入
+    // 目录: GetInv(目录ID) → 可能 true → 进入并通知旧路径
+}
+```
+
+**分支 ②：找新路径**（第 3282-3301 行）
+```go
+if change.File != nil {
+    // 文件和目录都进入此分支（只要 File 不为 nil）
+    // 通过 GetInv(父目录ID) 反查父目录路径 → 拼接文件名/目录名
+}
+```
+
+### 14.3 六种场景的文件 vs 目录差异对照
+
+| 变更场景 | 分支①旧路径（GetInv(fileId)） | 分支②新路径（GetInv(parent)） | 文件最终通知 | 目录最终通知 |
+|---------|---------------------------|---------------------------|------------|------------|
+| **新建** | ❌ 新 ID 不在 dirCache | ✅ 父目录在 dirCache → 拼路径 | `parentPath/name` 一次 | `parentPath/name` 一次 |
+| **内容修改** | ❌ 文件 ID 不在 dirCache | ✅ 父目录在 dirCache → 拼路径 | `parentPath/name` 一次 | `parentPath/name` 一次 |
+| **重命名** | ❌ 文件 ID 不在 dirCache | ✅ 父目录在 dirCache → 拼新名 | 新名一次，旧名**无通知** ★ | 新名一次 + GetInv 命中旧名一次 |
+| **移动** | ❌ 文件 ID 不在 dirCache | ✅ 新父目录若在 dirCache → 拼路径 | 新位置一次，旧位置**无通知** ★ | 新位置一次 + 旧位置一次 |
+| **移入回收站** | ❌ 文件 ID 不在 dirCache | ✅ File!=nil，parents 未变 → 拼路径 | 一次（新路径分支） | 两次去重后 = 一次 |
+| **永久删除** | ❌ 文件 ID 不在 dirCache | ❌ File==nil → 不进入 | **零通知** ★ | 仅分支① → 一次（需 ID 在 dirCache） |
+
+### 14.4 三类盲区的统一说明
+
+#### 盲区 1：文件旧路径永远无法通知
+
+无论什么变更类型（修改、重命名、移动、删除），**文件的旧路径都无法被通知**。因为 `GetInv(文件ID)` 永远返回 false——文件 ID 从未存入 dirCache。
+
+这意味着：
+- 文件重命名 → 旧名不会失效
+- 文件移动 → 旧位置不会失效
+- 文件永久删除 → 如果父目录也在 dirCache 里也查不到旧路径
+
+**唯一的例外**：文件新建和内容修改不需要旧路径，只需新路径。
+
+#### 盲区 2：永久删除的文件完全无通知
+
+文件被永久删除时：
+- 分支①：`GetInv(文件ID)` → 永远 false
+- 分支②：`change.File == nil` → 不进入
+
+两个分支都走不通 → **零通知**。VFS 层不知道文件已删除，直到用户 list 父目录时重拉。
+
+而目录被永久删除时：
+- 分支①：`GetInv(目录ID)` → 如果在 dirCache → 能通知旧路径
+- 分支②：`change.File == nil` → 不进入
+
+至少有一次旧路径通知。
+
+#### 盲区 3：删除目录的子文件无 change 事件
+
+Google API 限制：删除目录只产生目录自身的 1 条 change，子文件/子目录不会各自产生 change。rclone 无法突破此限制。
+
+但 VFS 层的失效机制弥补了一部分：
+- 目录本身的 VFS 缓存被失效 → 下次访问重拉
+- 重拉后子项自然消失
+- 子目录的 VFS 节点虽然还在内存里，但因为必须经过父目录访问，不会再被访问到
+
+### 14.5 fileId 术语澄清
+
+Google Drive API 中的 `fileId` 是**统称**，既指文件 ID 也指目录 ID。在 change 事件中：
+
+- `change.FileId`：变更的项 ID（文件或目录）
+- `change.File`：变更后的完整元数据（文件或目录）；永久删除时为 nil
+- `change.File.MimeType`：区分文件还是目录（`driveFolderType` 为目录）
+
+rclone 代码中 `GetInv(change.FileId)` 不区分文件/目录——统一查 dirCache。但因为只有目录 ID 在 dirCache 里，所以只有目录 ID 能命中。
+
+### 14.6 VFS 层对 EntryType 的处理差异
+
+[vfs/dir.go#L290-L299](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/vfs/dir.go#L290-L299)
+
+```go
+func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
+    absPath := path.Join(d.path, relativePath)
+    d.invalidateDir(vfscommon.FindParent(absPath))  // ★ 总是失效父目录
+    if entryType == fs.EntryDirectory {
+        d.invalidateDir(absPath)                      // ★ 目录额外失效自身
+    }
+}
+```
+
+| 通知的 entryType | VFS 行为 | 失效范围 |
+|----------------|---------|---------|
+| `fs.EntryObject` | 只失效父目录 | `invalidateDir(parentPath)` |
+| `fs.EntryDirectory` | 失效父目录 + 自身 | `invalidateDir(parentPath)` + `invalidateDir(selfPath)` |
+
+**为什么目录要额外失效自身？**
+
+目录的 `read` 时间戳决定其 VFS 缓存是否新鲜。如果只失效父目录，目录自身的 `read` 仍然标记为新鲜，`_readDir()` 会直接返回缓存，不会重新拉取。所以必须也失效目录自身，才能确保下次访问时重新从远端拉取。
+
+**为什么文件不需要失效自身？**
+
+文件在 VFS 中没有独立的 Dir 节点（它只是父目录 `items` 中的一个 File 条目）。失效父目录就够了——父目录重拉后，文件的条目自然会被更新或消失。
+
+### 14.7 永久删除时类型判定的 fallback 问题
+
+[drive.go#L3274-L3278](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3274-L3278)
+
+```go
+if change.File != nil && change.File.MimeType != driveFolderType {
+    pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
+} else {
+    pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryDirectory})
+}
+```
+
+当 `change.File == nil`（永久删除）时，条件短路 → 走 else → **默认按 EntryDirectory 处理**。
+
+影响分析：
+- 如果被删除的是目录 → 判定正确（EntryDirectory）
+- 如果被删除的是文件 → 判定错误（应该是 EntryObject，但被判为 EntryDirectory）
+
+**但实际影响极小**，因为 VFS 层两种类型的处理差异只是"是否额外 invalidateDir(selfPath)"：
+- EntryObject → 只失效父目录
+- EntryDirectory → 失效父目录 + 自身
+
+对于已删除的文件，即使多调了一次 `invalidateDir(selfPath)`，由于文件没有 VFS Dir 节点，`cachedNode` 返回 nil → `invalidateDir` 什么都不做。所以 fallback 到 EntryDirectory 无害。

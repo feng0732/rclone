@@ -70,7 +70,57 @@ dstChan ──┘                    ├── dstOnly()   → Callback.DstOnly(
 2. 若目标 Fs 大小写不敏感 或 `IgnoreCaseSync`，施加 `strings.ToLower`
 3. 最后追加 "D" 或 "F"
 
-#### 2.2.2 matchListings 匹配逻辑（第 348-371 行）
+#### 2.2.2 matchListings 匹配逻辑（第 292-374 行）
+
+matchListings 的主循环每次迭代前，先做**重复条目检测**，再做三路分支比较。
+
+**1. 重复条目检测（第 328-346 行）**
+
+每次循环开始时，如果当前条目和上一条目同名同类型，则判定为重复，直接跳过。
+
+```go
+// 源端重复检测（第 328-336 行）
+if src != nil && srcPrev != nil {
+    if srcName == srcPrevName && fs.DirEntryType(srcPrev) == fs.DirEntryType(src) {
+        fs.Logf(src, "Duplicate %s found in source - ignoring", fs.DirEntryType(src))
+        srcDone() // skip the src and retry the dst
+        continue
+    } else if srcName < srcPrevName {
+        panic("Out of order listing in source")
+    }
+}
+
+// 目标端重复检测（第 338-346 行）
+if dst != nil && dstPrev != nil {
+    if dstName == dstPrevName && fs.DirEntryType(dst) == fs.DirEntryType(dstPrev) {
+        fs.Logf(dst, "Duplicate %s found in destination - ignoring", fs.DirEntryType(dst))
+        dstDone() // skip the dst and retry the src
+        continue
+    } else if dstName < dstPrevName {
+        panic("Out of order listing in destination")
+    }
+}
+```
+
+**重复判定条件**：`srcName == srcPrevName && 类型相同`
+- 由于 `srcKey` 已包含 D/F 类型后缀，`srcName` 相同即意味着基础名和类型后缀都相同
+- `DirEntryType` 比较是一个冗余的安全检查
+
+**跳过方式**：
+- 调用 `srcDone()` 或 `dstDone()`：将当前条目保存为 prev，当前条目置为 nil
+- 直接 `continue`，进入下一轮循环
+- 下一轮循环会从 channel 读取下一条目填充当前位置
+- **对端不前进**：源端重复时 dst 保持不变（"retry the dst"），目标端重复时 src 保持不变（"retry the src"）
+
+**对差异报告的影响**：
+- 重复条目被**静默跳过**，不会进入 srcOnly/dstOnly/match 任何分支
+- 只有第一个出现的条目参与后续匹配和报告
+- 不增加 differences 计数，不增加 missing 计数，不增加 errors 计数
+- 仅输出一条 Info 级别的日志 "Duplicate ... found in ... - ignoring"
+
+**2. 三路比较分支（第 348-371 行）**
+
+经过重复检测后，执行主比较逻辑：
 
 ```go
 srcType := fs.DirEntryType(src)   // "object" 或 "directory"
@@ -392,7 +442,35 @@ fs/operations/check.go `checkMarch.report()` 定义了统一的符号标记：
 
 ### 4.2 完整比对分支树
 
-综合 matchListings 调度 + checkMarch 回调，文件 "foo" 的完整判定路径：
+综合 matchListings 调度 + checkMarch 回调，文件 "foo" 的完整判定路径。matchListings 主循环每次先做**重复条目检测**，再执行三路比较。
+
+#### 4.2.1 重复条目检测（前置过滤）
+
+```
+matchListings 主循环
+│
+├── src 重复检测（srcName == srcPrevName && 类型相同）
+│   ├── 是 → fs.Logf "Duplicate ... found in source - ignoring"
+│   │       srcDone() → continue → 下一轮循环（dst 不前进）
+│   └── 否 → 继续
+│
+├── dst 重复检测（dstName == dstPrevName && 类型相同）
+│   ├── 是 → fs.Logf "Duplicate ... found in destination - ignoring"
+│   │       dstDone() → continue → 下一轮循环（src 不前进）
+│   └── 否 → 继续
+│
+└── 三路比较（见 4.2.2）
+```
+
+**重复检测要点**：
+- 仅比较相邻条目，依赖列表已排序
+- 同名同类型才判定重复（D/F 后缀保证了排序键相同即是同类型）
+- 重复条目直接跳过，不进入任何回调，**不影响差异计数**
+- 只输出 Info 级别日志，不算错误
+
+#### 4.2.2 三路比较主分支
+
+经过重复检测后，执行主比较逻辑：
 
 ```
 matchListings 比较 srcKey 与 dstKey
@@ -538,6 +616,16 @@ matchSum(sumHash, objHash, obj, err, hashType)
 
 **sumHash == ""** 意味着该条目已被另一个同名文件消费过（例如经过规范化后文件名相同的两个文件），此时报告为重复文件错误。
 
+**CheckSum 重复 vs March 重复的区别**：
+
+| 维度 | March 重复（matchListings 中） | CheckSum 重复（matchSum 中） |
+|------|------------------------------|----------------------------|
+| 触发位置 | fs/march/march.go 第 328-346 行 | fs/operations/check.go 第 540-544 行 |
+| 判定方式 | 相邻条目同名同类型 | 清单中同一文件名被多个系统文件消费 |
+| 处理方式 | 跳过重复项，仅输出 Info 日志 | 报告 Error 级错误 '!'，计入差异 |
+| 对计数影响 | 不影响 differences/errors | 增加 CountError 计数 |
+| 符号 | 无（不报告） | `!` |
+
 #### 4.4.5 未消费清单兜底（第 449-467 行）
 
 遍历完文件系统后，对 `hashes` map 中仍未消费的条目进行兜底报告：
@@ -644,9 +732,13 @@ CheckFn() ── march.Run() ── matchListings（排序键含 D/F 后缀）
     │     '-'    递归    '+'    递归  check   递归
     │    diff++  (静默)  diff++ (静默)  identical
     │
+    ▲ 前置：重复条目检测（src/dst 各自的相邻同名同类型条目 → 跳过，仅日志）
+    │
     ▼
 reportResults() → 退出码
 ```
+
+**重复检测前置**：matchListings 每次循环先检查 src/dst 各自的上一条目，同名同类型则跳过，不进入三路比较。
 
 ### 6.2 NoTraverse 模式（不遍历目标定位对象）
 

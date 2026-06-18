@@ -559,6 +559,93 @@ func (o *Object) CreateUploader(ctx context.Context, u *Upload, options ...fs.Op
 - 同名冲突发生在 OCIS 服务端**将上传会话组装为最终文件**时，具体策略（覆盖 / 拒绝 / 版本化）由 OCIS 实现，rclone 代码无法观测
 - 目前社区经验表明 OCIS 默认为覆盖写入，但这是**服务端行为推断**，不是 rclone 代码保证的语义
 
+#### 4.5.2.1 请求头两套来源：Upload-Metadata vs X-OC-Mtime / OC-Checksum
+
+TUS 创建会话的 POST 请求中存在**两套来源不同的元数据头**，容易混淆。以下逐行拆解：
+
+**来源一：TUS Upload-Metadata（来自源对象 `src`）**
+
+在 [updateViaTus()](backend/webdav/tus.go#L20-L43) 中由上层 `Update()` 传入的 `src fs.ObjectInfo` 组装：
+
+```go
+// updateViaTus 内：
+fn := filepath.Base(src.Remote())
+metadata := map[string]string{
+    "filename": fn,                        // 源文件名
+    "mtime":    strconv.FormatInt(src.ModTime(ctx).Unix(), 10),  // 源文件 mtime
+    "filetype": contentType,               // 源文件 MIME 类型（上层传入）
+}
+upload := NewUpload(in, src.Size(), metadata, fingerprint)
+// 之后在 CreateUploader 中编码为：
+opts.ExtraHeaders["Upload-Metadata"] = u.EncodedMetadata()
+```
+
+| Metadata 键 | 值来源 | 正确性 |
+|------------|--------|--------|
+| `filename` | `src.Remote()` 的 basename | ✅ 源文件，正确 |
+| `mtime` | `src.ModTime(ctx).Unix()` | ✅ 源文件，正确 |
+| `filetype` | 上层 `Update()` 传入的 `contentType` 参数 | ✅ 源文件，正确 |
+| size（Upload-Length） | `src.Size()` | ✅ 源文件，正确 |
+
+**来源二：extraHeaders（X-OC-Mtime / OC-Checksum，来自目标对象 `o`）**
+
+在 [CreateUploader()](backend/webdav/tus.go#L79-L86) 中通过 `o.extraHeaders(ctx, o)` 生成：
+
+```go
+// CreateUploader 内：
+opts := rest.Opts{
+    // ...
+    ExtraHeaders: o.extraHeaders(ctx, o),  // ⚠️ 传参是 o（目标对象），不是 src
+}
+```
+
+对比 [extraHeaders()](backend/webdav/webdav.go#L1593-L1614) 的函数签名和标准用法：
+
+```go
+// 函数签名参数名就叫 src，预期传入源对象
+func (o *Object) extraHeaders(ctx context.Context, src fs.ObjectInfo) map[string]string {
+    if o.fs.useOCMtime {
+        extraHeaders["X-OC-Mtime"] = fmt.Sprintf("%d", src.ModTime(ctx).Unix())
+    }
+    if o.fs.hasOCSHA1 {
+        if sha1, _ := src.Hash(ctx, hash.SHA1); sha1 != "" {
+            extraHeaders["OC-Checksum"] = "SHA1:" + sha1
+        }
+    }
+    // ...
+}
+```
+
+**标准上传路径（updateSimple）的调用方式**：
+```go
+// Update() 内——传 src（源对象），正确
+extraHeaders := o.extraHeaders(ctx, src)
+```
+
+**TUS 路径的调用方式**：
+```go
+// CreateUploader() 内——传 o（目标对象），错误
+ExtraHeaders: o.extraHeaders(ctx, o),
+```
+
+**两套头的实际效果差异**：
+
+| Header | 预期来源 | 实际来源 | 实际行为 |
+|--------|----------|----------|----------|
+| `X-OC-Mtime` | 源文件 mtime | 目标对象 `o` 的 mtime | `o.ModTime()` 会触发 `readMetaData()` 发起 PROPFIND；若目标不存在返回错误，则**回落到 `time.Now()`**（当前时间） |
+| `OC-Checksum` | 源文件 SHA1/MD5 | 目标对象 `o` 的哈希 | `o.Hash()` **不触发**元数据读取，直接返回空字符串，因此 **OC-Checksum 头实际上不会被设置** |
+| `Upload-Metadata: mtime` | 源文件 mtime | 源文件 mtime | ✅ 正确 |
+| `Upload-Metadata: filename` | 源文件名 | 源文件名 | ✅ 正确 |
+
+**根因分析**：
+`CreateUploader` 是 `Object` 的方法，签名是 `(o *Object) CreateUploader(ctx, u *Upload, ...)`，它的参数列表中**没有 `src fs.ObjectInfo`**——调用者 `updateViaTus` 也没把 `src` 传下去。因此 `CreateUploader` 只能复用接收者 `o` 来生成 extraHeaders，导致了这个参数错位。
+
+**潜在影响**：
+- 上传完成后文件的 mtime 可能是上传时的当前时间（而非源文件 mtime），取决于 OCIS 以哪套头为准
+- OC-Checksum 头缺失，服务端可能不校验上传完整性，或使用 Upload-Metadata 中的信息
+
+> 代码注释中留有痕迹：[tus.go#L91](backend/webdav/tus.go#L91) 有一行被注释掉的 `// opts.ExtraHeaders["mtime"] = ...`，暗示开发者曾意识到 mtime 头的问题但未完整修复。
+
 #### 4.5.3 步骤 2：数据上传主循环 — Uploader.Upload()
 
 [Upload()](backend/webdav/tus-uploader.go#L107-L122) + [UploadChunk()](backend/webdav/tus-uploader.go#L124-L162)：
@@ -742,6 +829,7 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 |------|------|
 | **无断点续传** | 大文件上传中断后必须从头开始 |
 | **无失败清理** | OCIS 服务端产生孤儿会话（依赖其自身 GC） |
-| PATCH 未设置 OC-Checksum | [backend/webdav/tus-uploader.go#L66](backend/webdav/tus-uploader.go#L66) 有 FIXME；OC-Checksum 只在 POST 创建时设置，PATCH 数据块无法被校验 |
+| **创建会话 extraHeaders 传参错位** | `CreateUploader` 调用 `o.extraHeaders(ctx, o)` 时传了目标对象 `o` 而非源对象 `src`，导致 `X-OC-Mtime` 可能是当前时间、`OC-Checksum` 实际未设置（见 4.5.2.1 节） |
+| PATCH 未设置 OC-Checksum | [backend/webdav/tus-uploader.go#L66](backend/webdav/tus-uploader.go#L66) 有 FIXME；PATCH 数据块无法被校验 |
 | `GetBody` 未实现 | [backend/webdav/tus-uploader.go#L79](backend/webdav/tus-uploader.go#L79) 有 FIXME；HTTP/2 GOAWAY 时无法重试 PATCH |
 | offset 读取用 `strconv.ParseInt` 无错误处理 | 204 响应无 `Upload-Offset` 头时 newOffset 保持 0，可能导致下一轮循环写 0 |

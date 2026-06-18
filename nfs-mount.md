@@ -139,14 +139,14 @@ Handler.FSStat(ctx, billyFS, &s)         ← nfs.Handler 可选接口回调
 
 | # | 位置 | 代码 | 所属 billy 方法 | 特殊之处 | 直接的 vfs 对应方法为什么不用 |
 |---|------|------|----------------|---------|---------------------------|
-| II-1 | `cmd/serve/nfs/filesystem.go#L148` | `f.vfs.Stat(current)` | `FS.MkdirAll` | 循环逐级检查每个路径组件是否存在，而不是一次性调用 | `vfs.MkdirAll(path)` 存在，但**不接受 perm 参数**；NFS MKDIR 携带权限信息，必须透传 |
+| II-1 | `cmd/serve/nfs/filesystem.go#L148` | `f.vfs.Stat(current)` | `FS.MkdirAll` | 循环逐级检查每个路径组件是否存在，而不是调用对应方法 | 存在 `vfs.MkdirAll(name, perm)`，但代码注释声称其"doesn't honor the permissions"（不遵循权限）；详见本节附录的代码事实核查 |
 | II-2 | `cmd/serve/nfs/filesystem.go#L150` | `f.vfs.Mkdir(current, perm)` | `FS.MkdirAll` | 循环逐级创建，每次传递相同 perm | 同上 |
 | II-3 | `cmd/serve/nfs/filesystem.go#L189` | `f.vfs.Open(name)` → `file.Chmod()` | `FS.Chmod` | 先 Open 拿到 vfs.Handle，再通过 Handle 调用 Chmod | VFS 顶层没有 `vfs.Chmod(path, mode)` 方法；只有 Handle 级别的 `file.Chmod()` |
 | II-4 | `cmd/serve/nfs/filesystem.go#L216` | `f.vfs.Open(name)` → `file.Chown()` | `FS.Chown` | 先 Open 拿到 vfs.Handle，再通过 Handle 调用 Chown | VFS 顶层没有 `vfs.Chown(path, uid, gid)` 方法；只有 Handle 级别的 `file.Chown()` |
 | II-5 | `cmd/serve/nfs/filesystem.go#L34` | `node.VFS()` | `setSys`（被 Stat/Lstat/ReadDir 间接调用） | 通过类型断言 `fi.(vfs.Node)` 从 FileInfo 反查 VFS 引用 | billy 接口没有办法把 VFS 引用作为参数传入；只能利用 vfs.Node 同时实现了 os.FileInfo 的特性做反查 |
 | II-6 | `cmd/serve/nfs/filesystem.go#L40` | `node.Inode()` | `setSys` | 从 Node 获取 inode 号作为 NFS fileid | fileid 是 NFS 属性的必填字段，Linux 客户端依赖它判断文件同一性；billy 接口没有单独暴露 inode |
 
-### II-1 / II-2 详细分析：MkdirAll 递归建目录的特殊处理
+### II-1 / II-2 详细分析：MkdirAll 递归建目录的特殊处理（含代码事实核查）
 
 **代码片段**（`cmd/serve/nfs/filesystem.go#L139-L157`）：
 
@@ -161,7 +161,7 @@ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
         current := strings.Join(parts[:i+1], "/")
         _, err := f.vfs.Stat(current)                 // ② ⚡ II-1: 逐级检查
         if err == vfs.ENOENT {
-            err = f.vfs.Mkdir(current, perm)          // ③ ⚡ II-2: 逐级创建（perm 被正确传递）
+            err = f.vfs.Mkdir(current, perm)          // ③ ⚡ II-2: 逐级创建
             ...
         }
     }
@@ -169,11 +169,29 @@ func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
 }
 ```
 
-**为什么属于"billy适配层内部特殊调用"而不是"NFS层直接调用"：**
+#### 附录：MkdirAll 代码事实核查
+
+以下是对注释和代码的层层核对，纠正了之前版本文档中的事实错误。
+
+| 核查项 | VFS 代码事实 | 结论 |
+|--------|-------------|------|
+| **VFS.MkdirAll 是否接受 perm 参数？** | `vfs/vfs.go#L790`：<br>`func (vfs *VFS) MkdirAll(name string, perm os.FileMode) error` | ✅ **接受 perm**。之前文档中"不接受 perm 参数"的说法**错误**。 |
+| **VFS.Mkdir 是否接受 perm 参数？** | `vfs/vfs.go#L757`：<br>`func (vfs *VFS) Mkdir(name string, perm os.FileMode) error` | ✅ **接受 perm**。 |
+| **perm 参数实际在哪里被丢弃？** | `vfs/vfs.go#L747-L753` 中 `vfs.mkdir(name, perm)` 内部调用 `dir.Mkdir(leaf)`；<br>`vfs/dir.go#L1066` 中 `Dir.Mkdir(name)` **签名没有 perm**，<br>最终调用 `d.f.Mkdir(ctx, path)`（fs.Fs 后端接口也无 perm） | ❌ perm 在 `Dir.Mkdir` 处被**静默丢弃**。注释 "doesn't honor the permissions" 在这个意义上**属实**——VFS 接口有 perm 参数但**实际不生效**。 |
+| **NFS 手动循环能让 perm 生效吗？** | NFS 循环调用的是 `f.vfs.Mkdir(current, perm)`，<br>最终同样走到 `Dir.Mkdir(leaf)`，同样丢弃 perm | ❌ **同样无法让 perm 生效**。注释给出的理由在逻辑上是**自相矛盾**的——两种方式 perm 都会被丢弃。 |
+| **两种实现的路径处理有差异吗？** | NFS 版：`strings.Split → strings.Join`，**不做** `strings.Trim`，<br>对 `"/a/b/c"` 生成 `""`、`"/a"`、`"/a/b"`、`"/a/b/c"`<br><br>VFS 版：`mkdirAll` 第一句 `strings.Trim(name, "/")`，<br>递归时 `path.Split(parent)`，只处理无前后斜杠的路径 | ⚠️ 两者对路径规范化的处理有**微妙差异**。VFS.Stat 入口也会做 `Trim("/")`（`vfs/vfs.go#L484`），<br>所以行为在功能上等价，但代码路径不同。 |
+
+#### 真实结论（基于代码）
+
+- 注释 "doesn't honor the permissions" 描述的客观现象正确（perm 不生效），但**不能作为手动循环的正当理由**——循环方式同样无法让 perm 生效。
+- 手动循环的**真正原因无法从代码中直接确认**。可能原因：① 历史遗留（早期 VFS.MkdirAll 没有 perm，后来 VFS 接口扩展了但 NFS 适配层没跟进，注释没改）；② 为了与 billy 层的路径语义完全一致（不依赖 VFS 内部的 Trim 行为）。
+- 但无论原因是什么，**调用位置和层归属是明确的**：`f.vfs.Stat` 和 `f.vfs.Mkdir` 在 `FS.MkdirAll` 方法体内，执行了 billy 层标准的 `fullPath()` 路径重写，调用者是 billy 接口方法的实现——因此分类为**类别二：billy 适配层内部特殊调用**（非常规同名映射）。
+
+#### 为什么属于"billy适配层内部特殊调用"而不是"NFS层直接调用"
 
 - 调用点**在** `FS.MkdirAll` 方法体内，它本身就是 `billy.Filesystem` 接口的实现。
 - 执行了 `fullPath()` 重写（subFS 时会拼接 root 前缀），这是 billy 适配层的标准职责。
-- 只是因为 VFS 接口签名不完整（`vfs.MkdirAll` 缺 perm 参数），不得不在 billy 层内用低级方法（`Stat`+`Mkdir`）**组合**出高级语义。
+- 只是因为"实际行为上未调用对应的 `vfs.MkdirAll`"（而用低级 Stat+Mkdir 组合），才被标记为"特殊"而非"常规 R 类"。
 - 相比之下，类别一（I-1, I-2）根本不进入 billy 适配层。
 
 ### II-3 / II-4 详细分析：Chmod/Chown 先 Open 再操作
@@ -291,7 +309,7 @@ func setSys(fi os.FileInfo) {
 │  │  统一：fullPath() 重写 + f.vfs.同名方法 + 按需 setSys               │  │
 │  │                                                                     │  │
 │  │  【⭐ 类别二：特殊调用 II-1 ~ II-6】                                 │  │
-│  │  II-1,2 MkdirAll: 循环 f.vfs.Stat + f.vfs.Mkdir (perm 透传)        │  │
+│  │  II-1,2 MkdirAll: 循环 f.vfs.Stat + f.vfs.Mkdir (注释称 perm 不生效)│  │
 │  │  II-3,4 Chmod/Chown: f.vfs.Open → file.Chmod/Chown → Close         │  │
 │  │  II-5,6 setSys:   node.VFS() (反查) + node.Inode() (inode)         │  │
 │  │                                                                     │  │
@@ -334,7 +352,7 @@ func setSys(fi os.FileInfo) {
 
 | # | 合理性 | 说明 |
 |---|--------|------|
-| II-1/II-2 MkdirAll 循环 Stat+Mkdir | ⚠️ 接口妥协 | `vfs.MkdirAll(path string, perm os.FileMode)` 应该存在但不存在。理想的修复是扩展 VFS 接口而非在适配层手动循环。 |
+| II-1/II-2 MkdirAll 循环 Stat+Mkdir | ⚠️ 注释与代码不一致 | `vfs.MkdirAll(name, perm)` **存在且接受 perm**（`vfs/vfs.go#L790`），但 perm 实际在 `Dir.Mkdir`（`vfs/dir.go#L1066`）处被静默丢弃。注释 "doesn't honor the permissions" 客观现象正确，但循环方式同样无法让 perm 生效。真正的循环原因无法从代码直接确认（可能是历史遗留）。层归属明确：在 billy 方法内，经 fullPath 重写 → 类别二。 |
 | II-3/II-4 Chmod/Chown 先 Open 再操作 | ✅ 设计匹配 | VFS 选择了"Handle 级 Chmod/Chown"而非"路径级"，是后端兼容性考量（有些后端只能对打开的文件改权限）。 |
 | II-5 `node.VFS()` 反查 VFS | ✅ 巧妙依赖 | billy 接口参数链限制导致只能利用 Node 反向引用。虽然间接，但依赖的是 VFS 内部稳定的关联。 |
 | II-6 `node.Inode()` | ✅ 必要 | Linux NFS 客户端必填。属于文件自身属性，不是配置。 |
@@ -360,7 +378,7 @@ func setSys(fi os.FileInfo) {
 | READ | FromHandle → billy | **R**（常规） | `Open()` → file.Read() | `vfs.Open()` → `Handle.ReadAt()` |
 | WRITE | FromHandle → billy | **R**（常规） | `OpenFile()` → file.Write() | `vfs.OpenFile()` → `Handle.WriteAt()` |
 | CREATE | FromHandle → billy | **R**（常规） | `Create()` | `vfs.Create()` |
-| MKDIR | FromHandle → billy | **⭐ 类别二** | `MkdirAll()` | ⚠️ 循环 `vfs.Stat()` + `vfs.Mkdir()` (II-1,II-2) |
+| MKDIR | FromHandle → billy | **⭐ 类别二** | `MkdirAll()` | ⚠️ 循环 `vfs.Stat()` + `vfs.Mkdir()` (II-1,II-2)；注意：注释声称 `vfs.MkdirAll` 不 honor perm，但实际签名接受 perm，只是两种方式 perm 都在 Dir.Mkdir 处被丢弃 |
 | REMOVE | FromHandle → billy | **R**（常规） | `Remove()` | `vfs.Remove()` |
 | RMDIR | FromHandle → billy | **R**（常规） | `Remove()` | `vfs.Remove()` |
 | RENAME | FromHandle → billy | **R**（常规） | `Rename()` | `vfs.Rename()` |
@@ -492,6 +510,12 @@ FUSE 前端（mount2）用 `cmd/mount2/fs.go#L69-L105` 的 `setAttr/setAttrOut` 
 >
 > **常规 billy 映射（11处）**：ReadDir/Create/Open/Stat/Rename/Remove/Lstat/Symlink/Readlink/Chtimes 对应 VFS 同名方法，模式统一，属于 billy 适配层的正常职责。
 
-### MkdirAll 定位结论
+### MkdirAll 定位结论（代码事实版）
 
-MkdirAll 中 `f.vfs.Stat` + `f.vfs.Mkdir`（原来的 A3/A4）**不在 NFS 层，而在 billy 适配层内部**（`FS.MkdirAll` 方法体）。它执行了 billy 层标准的 `fullPath()` 路径重写，只是因为 VFS 的 `MkdirAll` 接口缺少 perm 参数而不得不用低级方法组合实现。因此正确分类为**"类别二：billy 适配层内部特殊调用"**，而非"NFS 层绕过 billy 直接访问"。
+MkdirAll 中 `f.vfs.Stat` + `f.vfs.Mkdir`（原来文档中的 A3/A4）**不在 NFS 层，而在 billy 适配层内部**（`FS.MkdirAll` 方法体，`cmd/serve/nfs/filesystem.go#L139-L157`）。它执行了 billy 层标准的 `fullPath()` 路径重写，调用者是 billy 接口方法的实现。因此正确分类为**"类别二：billy 适配层内部特殊调用"**，而非"NFS 层绕过 billy 直接访问"。
+
+**代码事实澄清**：
+- VFS.MkdirAll 的真实签名是 `func (vfs *VFS) MkdirAll(name string, perm os.FileMode) error`（`vfs/vfs.go#L790`），**接受 perm 参数**。之前版本"不接受 perm"的描述是错误的。
+- 注释 "doesn't honor the permissions" 的真实含义是：**虽然 VFS 接口有 perm，但内部 `Dir.Mkdir(leaf)`（`vfs/dir.go#L1066`）签名无 perm，参数在传递过程中被静默丢弃**。
+- 然而 NFS 手动循环调用的也是 `f.vfs.Mkdir(current, perm)`，**同样会走到 Dir.Mkdir，同样丢弃 perm**。注释给出的理由与代码行为是**自相矛盾**的。
+- 无论循环的真实历史原因是什么，**层归属的判定只看调用位置和代码职责**，不看作者意图——调用点在 billy 方法内，经 fullPath 重写 → 类别二。

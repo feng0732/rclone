@@ -232,10 +232,10 @@ m.Set("mode", fmt.Sprintf("%0o", stat.Mode))  // 完整 16 位 mode
 
 | 平台 | 实现文件 | mode 信息完整度 | 说明 |
 |------|----------|----------------|------|
-| Windows | `backend/local/metadata_windows.go` | 中 | 文件类型位完整；权限位仅保留「是否可写」（映射自 `FILE_ATTRIBUTE_READONLY`）；SUID/SGID/Sticky 全部丢失 |
+| Windows | `backend/local/metadata_windows.go` | 中 | 文件类型位完整；权限位仅保留 owner writable 位（`0200`）映射自 `FILE_ATTRIBUTE_READONLY`，组/其他的读写执行位全部由 Go 按 owner 位镜像（即组和其他的 rwx 永远与 owner 相同）；SUID/SGID/Sticky 全部丢失 |
 | DragonFly BSD | `backend/local/metadata_other.go` | 低（本应更高） | 归入 `other` 属于实现上的降级——DragonFly 作为 BSD 分支理论上具备完整 stat 能力，但 rclone 未做专门适配。在 `read_device_unix.go` 和 `about_unix.go` 中它是按 Unix 处理的，唯独元数据读取缺失 |
 | AIX | `backend/local/metadata_other.go` | 低（本应更高） | 同上，AIX 作为 System V Unix 有完整 uid/gid/mode 模型，但 rclone 未适配 |
-| Plan 9 | `backend/local/metadata_other.go` | 低 | Plan 9 权限模型与 Unix 形似（rwx 三组）但语义不同（如「组」和「其他」的定义有别），Go 做了跨平台模拟 |
+| Plan 9 | `backend/local/metadata_other.go` | 低 | Plan 9 权限模型与 Unix 形似（rwx 三组）但语义不同（如「组」和「其他」的定义有别），Go 做了跨平台模拟；此外 Plan 9 有 `ModeAppend`、`ModeExclusive`、`ModeTemporary` 三个专有标志，但 rclone 的 `metadata_other.go` 未单独处理，由 `info.Mode()` 统一返回 |
 | js/wasm | `backend/local/metadata_other.go` | 极低 | WebAssembly 环境下文件系统能力完全取决于宿主，mode 信息不可靠 |
 
 **关键代码对比**：
@@ -259,7 +259,7 @@ Windows 的 `syscall.Win32FileAttributeData.FileAttributes` 包含大量有价�
 
 | 属性标志 | 值 | rclone 是否处理 |
 |---------|----|----------------|
-| `FILE_ATTRIBUTE_READONLY` | 0x00000001 | ✅ 间接通过 `os.Chmod` 处理（见下文） |
+| `FILE_ATTRIBUTE_READONLY` | 0x00000001 | ✅ 间接通过 `os.Chmod` 处理，仅由 `0200`（owner writable）位控制 |
 | `FILE_ATTRIBUTE_HIDDEN` | 0x00000002 | ❌ 未处理 |
 | `FILE_ATTRIBUTE_SYSTEM` | 0x00000004 | ❌ 未处理 |
 | `FILE_ATTRIBUTE_DIRECTORY` | 0x00000010 | ✅ 通过 `info.Mode().IsDir()` 间接处理 |
@@ -306,32 +306,43 @@ if hasMode && mode >= 0 && uint(mode) <= math.MaxUint32 {
 }
 ```
 
-#### 2.2 os.Chmod 在 Windows 上的实际效果
+#### 2.2 os.Chmod 按平台的实际效果
 
-Windows 上调用 `os.Chmod(path, mode)` 时，Go 运行时只将 Unix 权限位映射到 `FILE_ATTRIBUTE_READONLY` 这一个文件属性上。
+Go 官方文档对 `os.Chmod` 各平台行为有明确说明，可分为三组：
 
-判断逻辑：以三组写权限位的整体（掩码 `0222` = 所有者写 + 组写 + 其他写）作为「是否可写」的判据。
+**Windows：仅使用 0200 位（owner writable）**
+
+Windows 上调用 `os.Chmod(path, mode)` 时，Go 运行时只检查 **owner writable 位**（掩码 `0200`），控制 `FILE_ATTRIBUTE_READONLY` 标志的设置和清除。其他位全部忽略。
 
 | mode 条件 | 对 Windows 文件的影响 |
 |----------|---------------------|
-| `mode & 0222 == 0`（三组写位全部清零） | **设置** `FILE_ATTRIBUTE_READONLY` 标志 |
-| `mode & 0222 != 0`（至少有一组写位存在） | **清除** `FILE_ATTRIBUTE_READONLY` 标志 |
+| `mode & 0200 == 0`（owner 写位清零） | **设置** `FILE_ATTRIBUTE_READONLY` 标志 |
+| `mode & 0200 != 0`（owner 写位存在） | **清除** `FILE_ATTRIBUTE_READONLY` 标志 |
+| 组/其他写位（`0020`、`0002`） | 完全忽略 |
 | 读权限位（`0444`） | 完全忽略 |
 | 执行权限位（`0111`） | 完全忽略 |
 | SUID/SGID/Sticky 位（`07000`） | 完全忽略 |
 | 文件类型位（高 4 位） | 完全忽略 |
 
-换句话说，Windows 上 `os.Chmod` 是一个「**只有写位集合有效，且仅映射到只读属性**」的降级实现。它不区分三组权限的差异，也不支持读/执行权限的独立控制。
+> 官方文档还指出：为了与 Go 1.12 及更早版本兼容，应使用非零 mode。对于只读文件建议使用 `0400`，对于可读可写文件建议使用 `0600`。
 
-> 注意：与 Unix 的「三组权限独立控制」模型不同，Windows 的只读属性是一个整体开关。无论是清除所有者写、组写还是其他写位，只要三组写位全部为 0，就会触发只读属性的设置。
+**Unix 系列（Linux/macOS/BSD/Solaris/DragonFly/AIX）：完整使用 mode 位**
 
-#### 2.3 os.Chmod 在 Unix 上的实际效果
-
-Unix 上 `os.Chmod` 会完整设置权限，但需注意：
+使用完整的权限位集合 + SUID/SGID/Sticky 位。需注意：
 
 - 只有文件所有者或 root 才能修改权限
 - SUID/SGID 位在某些文件系统上可能被内核清除
 - Sticky 位仅对目录有意义
+
+**Plan 9：使用 permission bits 加三个专有标志**
+
+Plan 9 的 `os.Chmod` 使用 permission bits（rwx 三组）以及 Go 的 `os.ModeAppend`、`os.ModeExclusive`、`os.ModeTemporary` 三个特殊标志。这与 Windows 和 Unix 都不同：
+
+- `ModeAppend`（Plan 9 的 DMDAPPEND）：只允许追加写入
+- `ModeExclusive`（Plan 9 的 DMDEXCL）：独占打开
+- `ModeTemporary`（Plan 9 的 DMTMP）：临时文件提示
+
+> 注意：rclone 本地后端在 `metadata_other.go` 中对 Plan 9 采用了 Go 标准库的 `info.Mode()`，并未专门处理 Plan 9 的三个专有标志。实际上 `writeMetadataToFile` 也没有区分 Plan 9 和其他平台的 mode 设置，所以通过 rclone 在 Plan 9 上同步文件时，`ModeAppend`、`ModeExclusive`、`ModeTemporary` 三个标志会丢失。
 
 ### 3. 符号链接权限修改（lChmod）
 
@@ -384,10 +395,10 @@ func lChmod(name string, mode os.FileMode) error {
 
 | 平台组 | 权限参数的实际效果 | 说明 |
 |--------|-------------------|------|
-| **Linux/macOS/BSD/Solaris/DragonFly/AIX**（真实 Unix） | 受内核 umask 修正：实际权限 = mode & ~umask | 常见 umask 为 022 时，文件实际为 0644，目录实际为 0755 |
-| **Windows** | 权限参数基本被忽略 | 安全描述符由父目录 ACL 继承决定；仅 `FILE_ATTRIBUTE_READONLY` 可通过后续 `os.Chmod` 控制 |
-| **Plan 9** | 有独立的权限语义 | Plan 9 使用「owner/group/other」但组定义与 Unix 不同，由 Go 运行时做兼容转换 |
-| **js/wasm** | 不确定 | 取决于宿主环境的文件系统实现 |
+| **Linux/macOS/BSD/Solaris/DragonFly/AIX**（真实 Unix） | 受内核 umask 修正：实际权限 = mode & ~umask | 常见 umask 为 022 时，文件实际为 0644，目录实际为 0755。rclone 传入的 0666/0777 是 Unix 惯例——给 umask 留出修正空间 |
+| **Windows** | 权限参数基本被忽略 | 创建时 Go 传入的 0666/0777 对 Windows 内核无直接影响，安全描述符由父目录 ACL 继承决定。文件创建后如需设只读，必须通过后续 `os.Chmod` 且仅看 `0200`（owner writable）位 |
+| **Plan 9** | permission bits + 三个专有标志 | Plan 9 使用「owner/group/other」但组定义与 Unix 不同（Plan 9 的「group」是文件所有者的组成员，「other」是所有其他用户）。由 Go 运行时做兼容转换；`ModeAppend`、`ModeExclusive`、`ModeTemporary` 在创建时可通过 perm 参数传递，但 rclone 未设置这些位 |
+| **js/wasm** | 不确定 | 取决于宿主环境的文件系统实现，通常被完全忽略 |
 
 ### 5. 所有权处理（Chown）
 
@@ -502,10 +513,12 @@ err = fs.NoRetryError(err)  // 标记为不可重试，避免反复尝试
 ```
 尝试 os.Remove 删除目录
     ↓ 失败且错误为 ErrPermission
-os.Chmod(path, 0o600)  // 先尝试清除只读属性
+os.Chmod(path, 0o600)  // 设置 owner 写位（0200）以清除 FILE_ATTRIBUTE_READONLY
     ↓
 再次尝试 os.Remove
 ```
+
+> 说明：`0o600` 中的关键是 `0200`（owner writable 位）。根据 Go 官方文档，Windows 的 `os.Chmod` 仅使用 `0200` 位。由于 `0o600 & 0200 != 0`，这会清除 `FILE_ATTRIBUTE_READONLY` 标志，使目录可被删除。
 
 对应 Go issue #26295：即使微软文档声称 `FILE_ATTRIBUTE_READONLY` 对目录无效，但在某些情况下仍会干扰删除操作。此 workaround 先强制设置写权限再删除。
 

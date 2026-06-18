@@ -44,15 +44,19 @@
 | `backend/local/about_unix.go` | 磁盘空间查询（Unix） |
 | `backend/local/clone_darwin.go` | Reflink 克隆（macOS） |
 
-平台特定元数据文件：
+平台特定元数据文件（按信息完整度排序）：
 
-| 文件 | 平台 (build tag) | 说明 |
-|------|-----------------|------|
-| `backend/local/metadata_windows.go` | windows | Windows 平台元数据 |
-| `backend/local/metadata_linux.go` | linux | Linux 平台元数据（含 statx/fstatat 双路径） |
-| `backend/local/metadata_bsd.go` | darwin \|\| freebsd \|\| netbsd | macOS/FreeBSD/NetBSD 元数据 |
-| `backend/local/metadata_unix.go` | openbsd \|\| solaris | OpenBSD/Solaris 元数据 |
-| `backend/local/metadata_other.go` | dragonfly \|\| plan9 \|\| js \|\| aix | 其他平台桩 |
+| 文件 | 平台 (build tag) | 信息完整度 | 说明 |
+|------|-----------------|-----------|------|
+| `backend/local/metadata_windows.go` | windows | 中高 | Windows 平台，支持 atime/mtime/btime，mode 由 Go 模拟 |
+| `backend/local/metadata_linux.go` | linux | 高（statx路径）/ 中（fstatat路径） | Linux 平台，含 statx/fstatat 双路径，statx 支持 btime |
+| `backend/local/metadata_bsd.go` | darwin \|\| freebsd \|\| netbsd | 高 | macOS/FreeBSD/NetBSD，完整 Unix 语义 + btime |
+| `backend/local/metadata_unix.go` | openbsd \|\| solaris | 高 | OpenBSD/Solaris，完整 Unix 语义，无 btime |
+| `backend/local/metadata_other.go` | dragonfly \|\| plan9 \|\| js \|\| aix | 低 | 降级实现，仅 mode + mtime。其中 DragonFly/AIX 属实现缺失，Plan 9/js 属平台能力限制 |
+
+> 注意：`metadata_other.go` 是一个「大杂烩」文件，混合了两种不同情况：
+> - **能力缺失型**：DragonFly BSD、AIX 本质是 Unix 系统，有完整 stat 能力，但 rclone 未适配
+> - **平台限制型**：Plan 9（权限模型不同）、js/wasm（运行环境受限）能力本就有限
 
 辅助库：
 
@@ -204,23 +208,42 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 1.2 Mode 读取的跨平台差异
 
-各平台元数据读取时，mode 的来源不同：
+各平台元数据读取时，mode 的来源和信息量差异很大。按信息完整度分级：
 
-| 平台组 | mode 来源 | 实现文件 | 说明 |
-|--------|----------|----------|------|
-| **真实 Unix**（Linux/macOS/FreeBSD/NetBSD/OpenBSD/Solaris） | `stat.Mode`（`syscall.Stat_t` 原生 mode 字段） | `backend/local/metadata_linux.go` / `metadata_bsd.go` / `metadata_unix.go` | 包含完整的文件类型位 + 12 位权限位（含 SUID/SGID/Sticky） |
-| **Windows** | `info.Mode()`（Go 标准库模拟） | `backend/local/metadata_windows.go` | 仅保留文件类型位 + 简化权限（写位 = 非只读），SUID/SGID/Sticky 全部丢失 |
-| **其他**（Dragonfly/plan9/js/aix） | `info.Mode()`（Go 标准库模拟） | `backend/local/metadata_other.go` | 同上，简化权限 |
+**第一级：完整 Unix 语义（原生 stat.Mode）**
+
+| 平台 | 实现文件 | 说明 |
+|------|----------|------|
+| Linux | `backend/local/metadata_linux.go` | 完整文件类型 + 12 位权限（SUID/SGID/Sticky + rwx×3） |
+| macOS/FreeBSD/NetBSD | `backend/local/metadata_bsd.go` | 同上，且支持 btime |
+| OpenBSD/Solaris | `backend/local/metadata_unix.go` | 同上，但无 btime |
+
+代码模式：直接从 `syscall.Stat_t.Mode` 读取，信息无损。
+
+```go
+// 真实 Unix 平台
+stat, ok := info.Sys().(*syscall.Stat_t)
+m.Set("mode", fmt.Sprintf("%0o", stat.Mode))  // 完整 16 位 mode
+```
+
+**第二级：降级模拟（Go 标准库 info.Mode()）**
+
+这些平台在 rclone 中没有原生 stat 实现，回退到 Go 标准库的 `os.FileInfo.Mode()`，信息有不同程度的丢失。
+
+| 平台 | 实现文件 | mode 信息完整度 | 说明 |
+|------|----------|----------------|------|
+| Windows | `backend/local/metadata_windows.go` | 中 | 文件类型位完整；权限位仅保留「是否可写」（映射自 `FILE_ATTRIBUTE_READONLY`）；SUID/SGID/Sticky 全部丢失 |
+| DragonFly BSD | `backend/local/metadata_other.go` | 低（本应更高） | 归入 `other` 属于实现上的降级——DragonFly 作为 BSD 分支理论上具备完整 stat 能力，但 rclone 未做专门适配。在 `read_device_unix.go` 和 `about_unix.go` 中它是按 Unix 处理的，唯独元数据读取缺失 |
+| AIX | `backend/local/metadata_other.go` | 低（本应更高） | 同上，AIX 作为 System V Unix 有完整 uid/gid/mode 模型，但 rclone 未适配 |
+| Plan 9 | `backend/local/metadata_other.go` | 低 | Plan 9 权限模型与 Unix 形似（rwx 三组）但语义不同（如「组」和「其他」的定义有别），Go 做了跨平台模拟 |
+| js/wasm | `backend/local/metadata_other.go` | 极低 | WebAssembly 环境下文件系统能力完全取决于宿主，mode 信息不可靠 |
 
 **关键代码对比**：
 
 ```go
-// Unix: 使用 syscall 原生 stat.Mode（完整信息）
-// metadata_linux.go / metadata_bsd.go / metadata_unix.go
-m.Set("mode", fmt.Sprintf("%0o", stat.Mode))
-
-// Windows/Other: 使用 Go 模拟的 info.Mode()（信息丢失）
-// metadata_windows.go / metadata_other.go
+// 完整 Unix: stat.Mode（原生, 信息无损）
+// vs
+// 降级平台: info.Mode()（Go 模拟, 信息丢失）
 m.Set("mode", fmt.Sprintf("%0o", info.Mode()))
 ```
 
@@ -285,17 +308,22 @@ if hasMode && mode >= 0 && uint(mode) <= math.MaxUint32 {
 
 #### 2.2 os.Chmod 在 Windows 上的实际效果
 
-Windows 上调用 `os.Chmod(path, mode)` 时，Go 运行时仅处理**只读位**：
+Windows 上调用 `os.Chmod(path, mode)` 时，Go 运行时只将 Unix 权限位映射到 `FILE_ATTRIBUTE_READONLY` 这一个文件属性上。
 
-| mode 值 | 对 Windows 文件的影响 |
-|---------|---------------------|
-| 任意位包含「写权限」被清除（mode & 0222 == 0） | 设置 `FILE_ATTRIBUTE_READONLY` 标志 |
-| 任意位包含「写权限」（mode & 0222 != 0） | 清除 `FILE_ATTRIBUTE_READONLY` 标志 |
-| 读/执行权限位 | 完全忽略 |
-| SUID/SGID/Sticky 位 | 完全忽略 |
+判断逻辑：以三组写权限位的整体（掩码 `0222` = 所有者写 + 组写 + 其他写）作为「是否可写」的判据。
+
+| mode 条件 | 对 Windows 文件的影响 |
+|----------|---------------------|
+| `mode & 0222 == 0`（三组写位全部清零） | **设置** `FILE_ATTRIBUTE_READONLY` 标志 |
+| `mode & 0222 != 0`（至少有一组写位存在） | **清除** `FILE_ATTRIBUTE_READONLY` 标志 |
+| 读权限位（`0444`） | 完全忽略 |
+| 执行权限位（`0111`） | 完全忽略 |
+| SUID/SGID/Sticky 位（`07000`） | 完全忽略 |
 | 文件类型位（高 4 位） | 完全忽略 |
 
-换句话说，Windows 上 `os.Chmod` 是一个「**只有写位有效**」的降级实现。
+换句话说，Windows 上 `os.Chmod` 是一个「**只有写位集合有效，且仅映射到只读属性**」的降级实现。它不区分三组权限的差异，也不支持读/执行权限的独立控制。
+
+> 注意：与 Unix 的「三组权限独立控制」模型不同，Windows 的只读属性是一个整体开关。无论是清除所有者写、组写还是其他写位，只要三组写位全部为 0，就会触发只读属性的设置。
 
 #### 2.3 os.Chmod 在 Unix 上的实际效果
 
@@ -309,14 +337,18 @@ Unix 上 `os.Chmod` 会完整设置权限，但需注意：
 
 核心函数：`lChmod` — 修改符号链接本身的权限而非其指向的目标。
 
-| 平台 | 支持情况 | 实现文件 | build tag |
-|------|----------|----------|-----------|
-| Linux | ❌ 不支持 | `backend/local/lchmod.go` | `linux` |
-| Windows | ❌ 不支持 | `backend/local/lchmod.go` | `windows` |
-| macOS/FreeBSD/NetBSD/OpenBSD/Solaris 等 | ✅ 支持 | `backend/local/lchmod_unix.go` | 非 linux 的 Unix |
-| plan9/js | ❌ 不支持 | `backend/local/lchmod.go` | `plan9 \|\| js` |
+按支持度分类：
+
+| 支持度 | 平台 | 实现文件 | 不支持原因 |
+|--------|------|----------|------------|
+| ✅ 原生支持 | macOS, FreeBSD, NetBSD, OpenBSD, Solaris, DragonFly, AIX | `backend/local/lchmod_unix.go` | 内核支持 `fchmodat` + `AT_SYMLINK_NOFOLLOW` |
+| ❌ 内核限制 | Linux | `backend/local/lchmod.go` | Linux 内核不支持对符号链接使用 `AT_SYMLINK_NOFOLLOW`，返回 `ENOTSUP` |
+| ❌ 语义不匹配 | Windows | `backend/local/lchmod.go` | Windows 符号链接无独立权限模型，chmod 会跟随链接 |
+| ❌ 不适用 | Plan 9, js/wasm | `backend/local/lchmod.go` | Plan 9 权限模型不同；js 无真实文件系统 |
 
 不支持的平台上 `haveLChmod = false`，调用时仅打 debug 日志，不报错。
+
+> 注意：DragonFly BSD 和 AIX 虽然在元数据读取上被降级，但在 lChmod 上是按「非 Linux 的 Unix」处理的，属于支持范畴。
 
 **Linux 不支持原因**：Linux 的 `fchmodat` 系统调用不接受 `AT_SYMLINK_NOFOLLOW` 标志，传入时返回 `ENOTSUP`。Linux 内核从设计上就不允许修改符号链接的权限位（符号链接始终为 0777）。
 
@@ -343,15 +375,19 @@ func lChmod(name string, mode os.FileMode) error {
 
 本地后端创建文件/目录时传入的权限位：
 
-| 操作 | 请求权限 | 代码位置 | 说明 |
-|------|---------|----------|------|
-| 创建普通文件 | `0666` (rw-rw-rw-) | `Update` / `PartialUploads` 方法 (`backend/local/local.go`) | 受 umask 修正 |
-| 创建目录 | `0777` (rwxrwxrwx) | `Mkdir` / `MkdirAll` / `serverSideMove` (`backend/local/local.go`) | 受 umask 修正 |
+| 操作 | 请求权限 | 代码位置 |
+|------|---------|----------|
+| 创建普通文件 | `0666` (rw-rw-rw-) | `Update` / `PartialUploads` 方法 (`backend/local/local.go`) |
+| 创建目录 | `0777` (rwxrwxrwx) | `Mkdir` / `MkdirAll` / `serverSideMove` (`backend/local/local.go`) |
 
-**跨平台差异**：
+各平台实际效果差异很大：
 
-- **Unix**：内核会执行 `mode & ~umask`，常见 umask 为 022 时文件实际为 0644，目录实际为 0755
-- **Windows**：传入的权限位参数基本被忽略，安全描述符由父目录 ACL 继承决定，仅 `FILE_ATTRIBUTE_READONLY` 可能受后续 `os.Chmod` 影响
+| 平台组 | 权限参数的实际效果 | 说明 |
+|--------|-------------------|------|
+| **Linux/macOS/BSD/Solaris/DragonFly/AIX**（真实 Unix） | 受内核 umask 修正：实际权限 = mode & ~umask | 常见 umask 为 022 时，文件实际为 0644，目录实际为 0755 |
+| **Windows** | 权限参数基本被忽略 | 安全描述符由父目录 ACL 继承决定；仅 `FILE_ATTRIBUTE_READONLY` 可通过后续 `os.Chmod` 控制 |
+| **Plan 9** | 有独立的权限语义 | Plan 9 使用「owner/group/other」但组定义与 Unix 不同，由 Go 运行时做兼容转换 |
+| **js/wasm** | 不确定 | 取决于宿主环境的文件系统实现 |
 
 ### 5. 所有权处理（Chown）
 
@@ -384,9 +420,11 @@ if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
 
 | 平台 | 支持情况 | 说明 |
 |------|----------|------|
-| Windows | ❌ 静默忽略 | 仅 debug 日志，Windows 使用 ACL 模型 |
-| plan9 | ❌ 静默忽略 | 仅 debug 日志 |
-| Unix 系列 | ✅ 支持 | 需要 root 或 CAP_CHOWN 能力才能修改为非当前用户 |
+| Windows | ❌ 静默忽略 | Windows 使用 ACL（访问控制列表）模型而非 Unix 式的 uid/gid，不适用 Chown 语义 |
+| Plan 9 | ❌ 静默忽略 | Plan 9 使用用户名而非数字 UID/GID，权限模型与 Unix 不同，直接忽略 |
+| Unix 系列（Linux/macOS/BSD/Solaris 等） | ✅ 支持 | 需要 root 或 CAP_CHOWN 能力才能修改为非当前用户 |
+| DragonFly BSD / AIX | ✅ 应支持 | 虽归入 `metadata_other` 但本质是 Unix 系统，Go 标准库的 `os.Chown` 可用 |
+| js/wasm | ❌ 静默忽略 | 无真实文件系统权限模型 |
 
 **已知设计缺陷**（代码中标注 FIXME）：
 
@@ -497,12 +535,16 @@ os.Chmod(path, 0o600)  // 先尝试清除只读属性
 
 #### 单文件系统边界（one_file_system）
 
-`readDevice` 函数：
+`readDevice` 函数用于读取文件所在设备号，判断是否跨文件系统。
 
-- Unix 系列（darwin/dragonfly/freebsd/linux/netbsd/openbsd/solaris）：从 `syscall.Stat_t.Dev` 读取设备号
-- 其他平台：始终返回 `devUnset`
+| 支持情况 | 平台 | 实现文件 |
+|---------|------|----------|
+| ✅ 支持 | darwin, dragonfly, freebsd, linux, netbsd, openbsd, solaris | `backend/local/read_device_unix.go` |
+| ❌ 不支持（返回 devUnset） | windows, plan9, js, aix 及其他 | `backend/local/read_device_other.go` |
 
-启用 `--one-file-system` 时，跨设备的目录被跳过。
+> 注意：AIX 在此处也被归入「不支持」，尽管它是 Unix 系统。DragonFly BSD 则在此处被正确支持。可见不同功能模块的平台覆盖范围并不一致。
+
+启用 `--one-file-system` 时，跨设备的目录会被跳过。
 
 ### 2. 时间类型支持
 
@@ -513,66 +555,83 @@ os.Chmod(path, 0o600)  // 先尝试清除只读属性
 
 #### 2.1 time_type 选项（readTime 函数）
 
-`readTime` 函数各平台实现：
+`readTime` 函数按平台能力分为四级：
 
-| 时间类型 | Windows | Linux | macOS/FreeBSD/NetBSD | OpenBSD/Solaris | Dragonfly/plan9/js/aix |
-|---------|---------|-------|----------------------|-----------------|------------------------|
-| mtime | ✅ | ✅ | ✅ | ✅ | ✅ |
-| atime | ✅ | ✅ | ✅ | ✅ | ❌ |
-| btime (创建/出生) | ✅ (CreationTime) | ❌ | ✅ (Birthtimespec) | ❌ | ❌ |
-| ctime (状态变更) | ❌ | ✅ | ✅ | ✅ | ❌ |
+| 时间类型 | Windows | Linux | macOS/FreeBSD/NetBSD（BSD组） | OpenBSD/Solaris（Unix组） | DragonFly/AIX（降级组） | Plan 9 / js |
+|---------|---------|-------|------------------------------|-------------------------|------------------------|-------------|
+| mtime | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| atime | ✅ (LastAccessTime) | ✅ | ✅ | ✅ | ⚠️ 本应支持 | ❌ |
+| btime | ✅ (CreationTime) | ❌ | ✅ (Birthtimespec) | ❌ | ⚠️ DragonFly 本应支持 | ❌ |
+| ctime | ❌ | ✅ | ✅ | ✅ | ⚠️ 本应支持 | ❌ |
 
 实现文件：
 - Windows: `backend/local/metadata_windows.go`
 - Linux: `backend/local/metadata_linux.go`
 - macOS/FreeBSD/NetBSD: `backend/local/metadata_bsd.go`
 - OpenBSD/Solaris: `backend/local/metadata_unix.go`
-- 其他: `backend/local/metadata_other.go`
+- DragonFly / AIX / Plan 9 / js: `backend/local/metadata_other.go`（统一回退到 `fi.ModTime()`）
 
-**关键修正**：Linux 的 `readTime` 函数**不支持 btime**。因为标准 `syscall.Stat_t` 在 Linux 上没有 birth time 字段，只有通过 `statx()` 系统调用（用于 Metadata API）才能获取 btime。
+**关键说明**：
+
+1. **Linux readTime 不支持 btime**：标准 `syscall.Stat_t` 在 Linux 上没有 birth time 字段，只有通过 `statx()` 系统调用（用于 Metadata API）才能获取 btime。
+2. **DragonFly / AIX 的降级是实现缺失**：这两个平台本质是 Unix，内核具备 atime/ctime 甚至 btime 能力，但 rclone 未为其编写原生 stat 读取代码，统一回退到 `info.ModTime()`，仅支持 mtime。
+3. **Plan 9 / js**：Plan 9 的文件时间模型与 Unix 不同；js 环境文件系统能力不确定，均只支持 mtime。
 
 #### 2.2 Metadata API（readMetadataFromFile）
 
-| 字段 | Windows | Linux (statx) | Linux (fstatat) | macOS/BSD | OpenBSD/Solaris | 其他 |
-|------|---------|--------------|-----------------|-----------|-----------------|------|
-| mode | ✅ (简化) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| uid | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| gid | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| rdev | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| atime | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| mtime | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| btime | ✅ | ✅ (内核 4.11+) | ❌ | ✅ | ❌ | ❌ |
-| ctime | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| 字段 | Windows | Linux (statx) | Linux (fstatat) | macOS/BSD（bsd组） | OpenBSD/Solaris（unix组） | DragonFly/AIX（降级组） | Plan 9 / js |
+|------|---------|--------------|-----------------|--------------------|-------------------------|------------------------|-------------|
+| mode | ✅ (简化) | ✅ | ✅ | ✅ | ✅ | ✅ (Go 模拟) | ✅ (Go 模拟) |
+| uid | ❌ | ✅ | ✅ | ✅ | ✅ | ⚠️ 本应支持 | ❌ |
+| gid | ❌ | ✅ | ✅ | ✅ | ✅ | ⚠️ 本应支持 | ❌ |
+| rdev | ❌ | ✅ | ✅ | ✅ | ✅ | ⚠️ 本应支持 | ❌ |
+| atime | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ 本应支持 | ❌ |
+| mtime | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| btime | ✅ | ✅ (内核 4.11+) | ❌ | ✅ | ❌ | ⚠️ DragonFly 本应支持 | ❌ |
+| ctime | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+> 记号说明：✅ = rclone 已实现支持；⚠️ = 平台有能力但 rclone 未实现；❌ = 平台或 rclone 均不支持
 
 **说明**：
 
-- **Linux btime**：通过 `statx()` 系统调用获取（内核 4.11+），旧内核回退到 `fstatat()` 则不支持 btime
-- **ctime 在 Metadata API 中普遍缺失**：虽然很多平台的 stat 结构有 ctime，但 `readMetadataFromFile` 未将其写入元数据 map
-- **Android 特殊处理**：Linux 代码中排除了 Android 平台（`runtime.GOOS != "android"`），Android 始终走 fstatat 路径
+1. **Linux btime**：通过 `statx()` 系统调用获取（内核 4.11+），旧内核回退到 `fstatat()` 则不支持 btime
+2. **ctime 在 Metadata API 中普遍缺失**：虽然很多平台的 stat 结构有 ctime 字段，但 `readMetadataFromFile` 未将其写入元数据 map（注意与 `readTime` 函数不同，`readTime` 在 Unix 上是支持 ctime 的）
+3. **Android 特殊处理**：Linux 代码中排除了 Android 平台（`runtime.GOOS != "android"`），Android 始终走 fstatat 路径
+4. **DragonFly / AIX 降级**：这两个 Unix 平台在 `metadata_other.go` 中被统一降级，仅返回 mode 和 mtime。但它们在 `read_device_unix.go` 和 `about_unix.go` 等其他模块中是按完整 Unix 处理的，属于元数据模块的实现缺失
+5. **Plan 9 / js**：这两个平台权限模型不同（Plan 9）或运行环境受限（js），能力有限是合理的
 
 #### 2.3 时间设置（写入）
 
-| 操作 | Windows | Unix (非 Windows) |
-|------|---------|------------------|
-| 设置 mtime/atime | ✅ | ✅ |
-| 设置 btime | ✅ | ❌ |
-| 符号链接设置 mtime/atime | ✅ | ✅ |
-| 符号链接设置 btime | ✅ | ❌ |
+| 操作 | Windows | 大部分 Unix | Plan 9 / js |
+|------|---------|------------|-------------|
+| 设置 mtime/atime | ✅ | ✅ | ❌ |
+| 设置 btime | ✅ | ❌ | ❌ |
+| 符号链接设置 mtime/atime | ✅ | ✅ (非 linux 全部支持) | ❌ |
+| 符号链接设置 btime | ✅ | ❌ | ❌ |
 
-实现：
-- btime 设置：`backend/local/setbtime_windows.go`（Windows 支持）、`backend/local/setbtime.go`（其他平台空实现）
-- 符号链接时间设置：`backend/local/lchtimes_windows.go`、`backend/local/lchtimes_unix.go`
+实现文件：
+- btime 设置：`backend/local/setbtime_windows.go`（Windows 支持）、`backend/local/setbtime.go`（非 Windows 空实现）
+- 符号链接时间设置：
+  - Windows: `backend/local/lchtimes_windows.go`
+  - 大部分 Unix: `backend/local/lchtimes_unix.go`
+  - Plan 9 / js: `backend/local/lchtimes.go`（空实现，`haveLChtimes = false`）
+
+> 注意：大部分 Unix 支持符号链接时间设置，但 Linux 不支持符号链接权限设置（lChmod）。时间设置和权限设置是两条独立的功能路径。
 
 ### 3. 符号链接差异
 
-| 特性 | Unix | Windows |
-|------|------|---------|
-| 符号链接类型标志 | `os.ModeSymlink` | `os.ModeSymlink \| os.ModeIrregular` |
-| Junction Points | N/A | 视为符号链接处理 |
-| 循环检测 | `ELOOP` 错误 (syscall) | 无专门检测 |
-| lchmod | 部分支持 (Linux 除外) | 不支持 |
-| lchown | 支持 | 不支持 |
-| lchtimes | 支持 (非 plan9/js) | 支持 |
+按平台能力分级：
+
+| 特性 | 大部分 Unix (macOS/BSD/Solaris) | Linux | Windows | Plan 9 / js |
+|------|--------------------------------|-------|---------|-------------|
+| 符号链接类型标志 | `os.ModeSymlink` | `os.ModeSymlink` | `os.ModeSymlink \| os.ModeIrregular` | 视平台而定 |
+| Junction Points / 重解析点 | N/A | N/A | 视为符号链接处理 | N/A |
+| 循环检测 | `ELOOP` (syscall) | `ELOOP` (syscall) | 错误字符串匹配 | 不支持 |
+| lchmod | ✅ 支持 | ❌ 不支持（内核限制） | ❌ 不支持（语义不匹配） | ❌ 不适用 |
+| lchown | ✅ 支持 | ✅ 支持 | ❌ 不支持 | ❌ 不适用 |
+| lchtimes | ✅ 支持 | ✅ 支持 | ✅ 支持 | ❌ 不支持 |
+
+> 注意：Linux 在符号链接处理上处于「中间状态」——支持 lchown 和 lchtimes，但不支持 lchmod。这是因为 Linux 内核允许修改符号链接的所有者和时间，但不允许修改其权限位。
 
 Windows 特殊处理：
 
@@ -583,7 +642,9 @@ if runtime.GOOS == "windows" {
 }
 ```
 
-循环符号链接检测（Unix only）：通过 `syscall.ELOOP` 判断（`backend/local/symlink.go`）。
+循环符号链接检测：
+- **Unix 系列**（非 Windows、非 plan9、非 js）：通过 `syscall.ELOOP` 错误码判断（`backend/local/symlink.go`）
+- **Windows / Plan 9 / js**：通过错误字符串匹配判断（`backend/local/symlink_other.go`），可靠性较低
 
 ### 4. 元数据（Metadata）
 

@@ -60,320 +60,350 @@ rclone 的 NFS 功能有两种使用模式，共享同一套核心代码：
 
 ---
 
-## 2. VFS 访问的三类边界：彻底厘清
+## 2. VFS 访问边界的三类划分（核准版）
 
-Handler（NFS 层）持有 `*vfs.VFS` 和 `*FS`（billy 适配器）两个引用。所有对 VFS 的访问可以严格分为 **三大类**：
+Handler 结构体同时持有 `*vfs.VFS` 和 `*FS`（billy 适配器）两个引用，但 VFS 的访问在代码中实际上分布在三个**严格不同的层级和语义**中：
 
-| 类别 | 定义 | 数量 | 典型场景 |
-|------|------|------|---------|
-| **A 类：绕过 billy 直接访问** | NFS 层/Handler 层/Server 层直接调用 `vfs.XXX()` 方法，不经过 billy.Filesystem 接口 | 7 处 | Mount 路径验证、FSSTAT 空间统计、MkdirAll 权限透传 |
-| **B 类：经 billy 适配后访问** | go-nfs 调用 `billy.Filesystem.XXX()`，FS 适配层做 `fullPath()` 重写后调用 `f.vfs.XXX()`，并在需要时调用 `setSys()` 属性注入 | 18 处 | 所有文件系统操作：Stat/ReadDir/Open/Create/Remove 等 |
-| **C 类：仅读取配置** | 读取 `vfs.Opt.*` 或 `vfs.Fs()` 获取配置元数据，不发起任何文件系统操作 | 8 处 | 判断 CacheMode、构造缓存目录名、读取 UID/GID、填充属性 |
+| 类别 | 定义 | 判定依据 | 代表 |
+|------|------|---------|------|
+| **类别一：NFS 层直接调用 VFS** | 调用点**不在** `billy.Filesystem` 接口方法内部，直接由 NFS 服务层（Handler / Server / nfsmount）触发 | 代码在 `Handler.Mount`、`Handler.FSStat`、`nfsmount` 中，不进入 FS 结构体的 billy 方法 | Mount 路径验证、FSSTAT 空间统计、VFS 生命周期关闭 |
+| **类别二：billy 适配层内部特殊调用** | 调用点在 billy 接口方法实现内部，但**不是简单的同名方法一一映射**，在适配层内部做了组合、循环、间接反查等特殊处理 | 虽然被 FS.XXX() 包裹，但实际调用的 VFS 方法不是直接对应（如 MkdirAll 用循环而非 `vfs.MkdirAll`；Chmod 先 Open 再 Chmod；setSys 从 Node 反查 VFS） | MkdirAll 递归建目录、Chmod/Chown 先 Open 再操作、setSys 中 node.VFS()/node.Inode() |
+| **类别三：仅读取配置** | 只读取 `vfs.Opt.*` 字段或 `vfs.Fs()`（后端 fs 对象），不触发任何文件系统 I/O 操作 | 访问路径为 `vfs.Opt.XXX` 或 `vfs.Fs()`，没有方法调用语义（`Stat`/`Read`/`Mkdir` 等） | CacheMode 判断、UID/GID 注入、构造缓存目录名、Root() 返回后端路径 |
 
----
-
-## 3. A 类：绕过 billy 直接访问 VFS（7处）
-
-这类访问发生在 billy 适配层之外，由 NFS 层（Handler / Server / FS.MkdirAll 内部）直接调用 VFS 方法。
-
-| # | 位置 | 代码 | 所属方法 | 绕过原因 |
-|---|------|------|---------|---------|
-| A1 | `cmd/serve/nfs/handler.go#L72` | `h.vfs.Stat(cleaned)` | `Handler.Mount` | Mount 的职责是决定返回哪个 billy FS。在决定之前 billy FS 尚未确定，无法通过 billy 接口验证路径。**架构上的必然**。 |
-| A2 | `cmd/serve/nfs/handler.go#L95` | `h.vfs.Statfs()` | `Handler.FSStat` | `billy.Filesystem` 接口没有空间统计方法，但 NFS FSSTAT 过程必须返回 total/free/available。**billy 接口的局限**。 |
-| A3 | `cmd/serve/nfs/filesystem.go#L148` | `f.vfs.Stat(current)` | `FS.MkdirAll` 内部 | VFS 的 `MkdirAll` 不接受权限参数（perm），而 billy 的 `MkdirAll` 带 perm。必须手动逐级 `Stat + Mkdir` 来保证权限被正确传递。**VFS 接口不完整的妥协**。 |
-| A4 | `cmd/serve/nfs/filesystem.go#L150` | `f.vfs.Mkdir(current, perm)` | `FS.MkdirAll` 内部 | 同上。 |
-| A5 | `cmd/serve/nfs/server.go#L28` | `vfs.Opt.CacheMode` 读取 | `NewServer` | 创建服务器前判断是否需要警告 NFS 只读。虽然在 `server.go` 中读取，但 VFS 仍未通过 billy。**启动时的前置检查**。 |
-| A6 | `cmd/nfsmount/nfsmount.go#L101` | `VFS.Shutdown()` | `unmount` 闭包 | VFS 生命周期管理，unmount 时关闭 VFS。不属于文件系统操作。 |
-| A7 | `cmd/nfsmount/nfsmount.go#L114` | `VFS.Shutdown()` | `OnUnmountFunc` | 同上，外部卸载事件触发。 |
-
-**A 类调用的完整链路（以 A1 Mount 为例）：**
-
-```
-NFS Client 发送 MOUNT 请求
-    │
-    ▼
-go-nfs 协议层 (MOUNTPROC3_MNT)
-    │
-    ▼
-Handler.Mount()                       ← nfs.Handler 接口
-    │
-    ├─ path.Clean("/" + req.Dirpath)
-    │
-    ├─ h.vfs.Stat(cleaned)             ← ⚡ A1 直接访问 VFS，不经过 billy
-    │   └─ 验证路径存在且是目录
-    │
-    └─ 返回 h.billyFS / h.billyFS.subFS()
-```
-
-**A 类调用的完整链路（以 A2 FSStat 为例）：**
-
-```
-NFS Client 发送 FSSTAT 请求
-    │
-    ▼
-go-nfs 协议层 (NFSPROC3_FSSTAT)
-    │
-    ▼
-Handler.FSStat()                      ← nfs.Handler 可选接口
-    │
-    └─ h.vfs.Statfs()                  ← ⚡ A2 直接访问 VFS，billy 接口无此方法
-        └─ 返回 total/used/free
-```
+**另：billy 常规一一映射**（非特殊、非本类重点，但作为参照列）：
+FS.ReadDir → vfs.ReadDir, FS.Create → vfs.Create, FS.Open → vfs.Open, FS.OpenFile → vfs.OpenFile, FS.Stat → vfs.Stat, FS.Rename → vfs.Rename, FS.Remove → vfs.Remove, FS.Lstat → vfs.Stat, FS.Symlink → vfs.Symlink, FS.Readlink → vfs.Readlink, FS.Chtimes → vfs.Chtimes。这些属于最简单的"billy 方法名 → VFS 同名方法"直接对应。
 
 ---
 
-## 4. B 类：经 billy 适配后访问 VFS（18处）
+## 3. 类别一：NFS 层直接调用 VFS（4处）
 
-这是 NFS 文件系统操作的主干路径。所有调用通过 `cmd/serve/nfs/filesystem.go` 中 `FS` 结构体（实现 `billy.Filesystem` 接口）进入。
+**分类判定标准：调用函数不在 `FS` 结构体（billy 适配层）的任何方法内部。**
 
-**统一的处理模式：**
+这些访问由 go-nfs 通过 `nfs.Handler` 接口直接回调到 Handler 层，Handler 层无法也不应该通过 billy 接口完成使命。
 
-```
-go-nfs 调用 billy.Filesystem.XXX()
-    │
-    ▼
-FS.XXX(name, ...)                    ← billy 接口实现
-    │
-    ├─ fullPath(name)                 ← [如果 subFS] 追加 root 前缀
-    │   └─ path.Join(f.root, name)
-    │
-    ├─ f.vfs.XXX(fullName, ...)       ← ⚡ B 类：通过 billy 适配后调用 VFS
-    │
-    ├─ setSys(returnedFileInfo)       ← [如果返回 FileInfo] 注入 uid/gid/inode
-    │
-    └─ 返回给 go-nfs
-```
+| # | 位置 | 代码 | 所在方法 / 层 | 分类理由 |
+|---|------|------|-------------|---------|
+| I-1 | `cmd/serve/nfs/handler.go#L72` | `h.vfs.Stat(cleaned)` | `Handler.Mount`（nfs.Handler 接口） | Mount 的职责是**决定**返回哪个 billy FS（rootFS 还是 subFS）。在决策之前 billy FS 身份尚未确定，无法通过 billy 接口验证路径。这是**架构层面的必然穿越**。 |
+| I-2 | `cmd/serve/nfs/handler.go#L95` | `h.vfs.Statfs()` | `Handler.FSStat`（nfs.Handler 可选接口） | `billy.Filesystem` 接口**根本没有**空间统计方法，但 NFSv3 的 `NFSPROC3_FSSTAT` 过程必须响应 total/free/available。**billy 接口设计的缺口**。 |
+| I-3 | `cmd/nfsmount/nfsmount.go#L101` | `VFS.Shutdown()` | `unmount` 闭包（nfsmount 层） | VFS 生命周期管理。在 unmount 时连同 NFS Server 一起关闭，不属于文件系统操作。 |
+| I-4 | `cmd/nfsmount/nfsmount.go#L114` | `VFS.Shutdown()` | `OnUnmountFunc` 回调（nfsmount 层） | 同上，当 NFS 客户端主动 umount 时，触发回调关闭 VFS。 |
 
-### 4.1 B 类详细分类表
-
-| # | 位置 | billy 方法 | 最终 VFS 方法 | fullPath 重写 | setSys | 备注 |
-|---|------|-----------|-------------|---------------|--------|------|
-| B1 | `filesystem.go#L70` | `ReadDir(p)` | `vfs.ReadDir(fullP)` | ✅ | ✅ 循环注入 | 列目录 |
-| B2 | `filesystem.go#L84` | `Create(filename)` | `vfs.Create(fullName)` | ✅ | ❌ | 创建文件，返回 billy.File |
-| B3 | `filesystem.go#L91` | `Open(filename)` | `vfs.Open(fullName)` | ✅ | ❌ | 打开文件，返回 billy.File |
-| B4 | `filesystem.go#L98` | `OpenFile(filename,flag,perm)` | `vfs.OpenFile(fullName,...)` | ✅ | ❌ | 以 flag 打开文件 |
-| B5 | `filesystem.go#L105` | `Stat(filename)` | `vfs.Stat(fullName)` | ✅ | ✅ | 获取属性 |
-| B6 | `filesystem.go#L118` | `Rename(old, new)` | `vfs.Rename(fullOld, fullNew)` | ✅✅ 两个路径 | ❌ | 重命名 |
-| B7 | `filesystem.go#L125` | `Remove(filename)` | `vfs.Remove(fullName)` | ✅ | ❌ | 删除文件 |
-| B8 | `filesystem.go#L163` | `Lstat(filename)` | `vfs.Stat(fullName)` | ✅ | ✅ | 不跟踪符号链接 |
-| B9 | `filesystem.go#L175` | `Symlink(target, link)` | `vfs.Symlink(target, fullLink)` | ✅ 仅 link | ❌ | target 不转换（可能是相对路径） |
-| B10 | `filesystem.go#L182` | `Readlink(link)` | `vfs.Readlink(fullLink)` | ✅ | ❌ | 读符号链接 |
-| B11 | `filesystem.go#L189` | `Chmod(name, mode)` | `vfs.Open(fullName)` → `file.Chmod()` | ✅ | ❌ | 先 Open 再 Chmod；ENOSYS 静默忽略 |
-| B12 | `filesystem.go#L216` | `Chown(name, uid, gid)` | `vfs.Open(fullName)` → `file.Chown()` | ✅ | ❌ | 先 Open 再 Chown |
-| B13 | `filesystem.go#L232` | `Chtimes(name, atime, mtime)` | `vfs.Chtimes(fullName, ...)` | ✅ | ❌ | 修改时间戳 |
-| B14 | `filesystem.go#L148` | `MkdirAll(name, perm)` | 循环调用 `vfs.Stat(current)` | ✅ | ❌ | **注意：MkdirAll 内部实际是 A 类语义** — 绕过了 `vfs.MkdirAll`（不接受 perm） |
-| B15 | `filesystem.go#L150` | `MkdirAll(name, perm)` | 循环调用 `vfs.Mkdir(current, perm)` | ✅ | ❌ | 同上 |
-| B16 | `filesystem.go#L34` | `setSys(fi)` 内部 | `node.VFS()` — 获取 VFS 引用 | N/A | ✅ 本方法就是注入 | 读取 UID/GID 配置（见 C 类） |
-| B17 | `filesystem.go#L40` | `setSys(fi)` 内部 | `node.Inode()` — 获取 inode 号 | N/A | ✅ 本方法就是注入 | 注入 fileid（Linux 客户端必填） |
-| B18 | `filesystem.go#L245,L247` | `Root()` | `f.vfs.Fs().Root()` | N/A | ❌ | 返回后端根路径，bililly 接口要求 |
-
-### 4.2 B 类典型调用链（以 GETATTR/LOOKUP 为例）
+### I-1 调用链（Mount 路径验证）
 
 ```
-NFS Client: NFSPROC3_GETATTR(fh)
+NFS Client 发送 MOUNTPROC3_MNT(Dirpath = "/photos/2024")
     │
     ▼
-go-nfs: FromHandle(fh) → (billyFS, splitPath)
+go-nfs 协议层 (MOUNT 服务端)
     │
     ▼
-go-nfs: billyFS.Stat(path.Join(splitPath...))
+Handler.Mount()                          ← nfs.Handler 接口回调
+    │
+    ├─ path.Clean("/" + req.Dirpath)     ← 规范化，消除 ".."
+    │
+    ├─ h.vfs.Stat(cleaned)                ← ⚡ I-1 类别一：NFS层直接调VFS
+    │   └─ 不存在 → MountStatusErrNoEnt
+    │   └─ 非目录 → MountStatusErrNotDir
+    │
+    └─ cleaned == "/" ?
+        ├─ 是 → 返回 h.billyFS (rootFS)
+        └─ 否 → 返回 h.billyFS.subFS(cleaned)
+```
+
+### I-2 调用链（FSSTAT）
+
+```
+NFS Client 发送 NFSPROC3_FSSTAT
     │
     ▼
-FS.Stat(filename)
-    ├─ fullPath(filename)         ← subFS.root != "" 时追加前缀
-    │   └─ fullName = path.Join(f.root, filename)
-    │
-    ├─ f.vfs.Stat(fullName)       ← ⚡ B5 通过 billy 适配访问 VFS
-    │   └─ 返回 vfs.Node（实现 os.FileInfo）
-    │
-    └─ setSys(fi)                 ← 注入属性
-        ├─ node.VFS().Opt.UID     ← C6（见下节）
-        ├─ node.VFS().Opt.GID     ← C7（见下节）
-        ├─ node.Inode()           ← B17
-        └─ node.SetSys(&stat)
+go-nfs 协议层
     │
     ▼
-go-nfs: fi.Sys() → *file.FileInfo → 提取 uid/gid/fileid → NFS fattr3
+Handler.FSStat(ctx, billyFS, &s)         ← nfs.Handler 可选接口回调
     │
-    ▼
-NFS Client: GETATTR 响应
+    ├─ 注意：参数 billyFS 被**完全忽略**
+    │
+    └─ total, _, free := h.vfs.Statfs()   ← ⚡ I-2 类别一：NFS层直接调VFS
+        ├─ s.TotalSize = uint64(total)
+        ├─ s.FreeSize = uint64(free)
+        └─ s.AvailableSize = uint64(free)
 ```
 
 ---
 
-## 5. C 类：仅读取 VFS 配置（8处）
+## 4. 类别二：billy 适配层内部特殊调用（6处）
 
-这类访问只读取 `vfs.Opt.*` 字段或 `vfs.Fs()`（后端 fs 对象），不触发任何文件系统 I/O 操作。虽然"触碰了 VFS 对象"，但本质是读取配置元数据。
+**分类判定标准：调用点在 `FS` 结构体的 billy 接口方法内部，但不是 "FS.XXX → f.vfs.XXX" 的简单同名映射。**
 
-| # | 位置 | 代码 | 所属方法 | 用途 |
-|---|------|------|---------|------|
-| C1 | `cmd/serve/nfs/server.go#L28` | `vfs.Opt.CacheMode` | `NewServer` | 判断是否 `CacheModeOff`，若是则发出 NFS 只读警告 |
-| C2 | `cmd/serve/nfs/filesystem.go#L253` | `f.vfs.Opt.CacheMode` | `FS.Capabilities` | 决定 billy 暴露的能力：只读 vs 可读写 |
-| C3 | `cmd/serve/nfs/cache.go#L156` | `h.vfs.Fs()` → `fs.ConfigString()` | `newDiskHandler` | 构造磁盘缓存目录名（使用 remote 配置字符串） |
-| C4 | `cmd/serve/nfs/cache.go#L173` | `h.vfs.Opt.MetadataExtension` | `newDiskHandler` | 读取元数据扩展名，用于 metadataSuffix 处理 |
-| C5 | `cmd/serve/nfs/filesystem.go#L245` | `f.vfs.Fs().Root()` | `FS.Root` | 返回后端 fs 的 root 作为 billy Root 路径 |
-| C6 | `cmd/serve/nfs/filesystem.go#L38` | `vfs.Opt.UID` | `setSys` | 注入 UID 到 FileInfo.Sys() |
-| C7 | `cmd/serve/nfs/filesystem.go#L39` | `vfs.Opt.GID` | `setSys` | 注入 GID 到 FileInfo.Sys() |
-| C8 | `cmd/serve/nfs/filesystem.go#L247` | `f.vfs.Fs().Root()` | `FS.Root` | subFS 时拼接 root 前缀后的后端路径 |
+常规 billy 适配是 `FS.Stat(filename)` → `f.vfs.Stat(filename)`，方法名、参数签名几乎一一对应。而"特殊调用"在适配层内部做了额外的组合逻辑。
 
----
+| # | 位置 | 代码 | 所属 billy 方法 | 特殊之处 | 直接的 vfs 对应方法为什么不用 |
+|---|------|------|----------------|---------|---------------------------|
+| II-1 | `cmd/serve/nfs/filesystem.go#L148` | `f.vfs.Stat(current)` | `FS.MkdirAll` | 循环逐级检查每个路径组件是否存在，而不是一次性调用 | `vfs.MkdirAll(path)` 存在，但**不接受 perm 参数**；NFS MKDIR 携带权限信息，必须透传 |
+| II-2 | `cmd/serve/nfs/filesystem.go#L150` | `f.vfs.Mkdir(current, perm)` | `FS.MkdirAll` | 循环逐级创建，每次传递相同 perm | 同上 |
+| II-3 | `cmd/serve/nfs/filesystem.go#L189` | `f.vfs.Open(name)` → `file.Chmod()` | `FS.Chmod` | 先 Open 拿到 vfs.Handle，再通过 Handle 调用 Chmod | VFS 顶层没有 `vfs.Chmod(path, mode)` 方法；只有 Handle 级别的 `file.Chmod()` |
+| II-4 | `cmd/serve/nfs/filesystem.go#L216` | `f.vfs.Open(name)` → `file.Chown()` | `FS.Chown` | 先 Open 拿到 vfs.Handle，再通过 Handle 调用 Chown | VFS 顶层没有 `vfs.Chown(path, uid, gid)` 方法；只有 Handle 级别的 `file.Chown()` |
+| II-5 | `cmd/serve/nfs/filesystem.go#L34` | `node.VFS()` | `setSys`（被 Stat/Lstat/ReadDir 间接调用） | 通过类型断言 `fi.(vfs.Node)` 从 FileInfo 反查 VFS 引用 | billy 接口没有办法把 VFS 引用作为参数传入；只能利用 vfs.Node 同时实现了 os.FileInfo 的特性做反查 |
+| II-6 | `cmd/serve/nfs/filesystem.go#L40` | `node.Inode()` | `setSys` | 从 Node 获取 inode 号作为 NFS fileid | fileid 是 NFS 属性的必填字段，Linux 客户端依赖它判断文件同一性；billy 接口没有单独暴露 inode |
 
-## 6. 三类访问的可视化边界图
+### II-1 / II-2 详细分析：MkdirAll 递归建目录的特殊处理
 
-```
-                    ┌──────────────────────────────────────┐
-                    │        go-nfs 协议库                  │
-                    │  NFSv3 RPC 解码/编码/分发             │
-                    └──────┬──────────────┬────────────────┘
-                           │              │
-              billy.Filesystem 接口   nfs.Handler 接口
-                           │              │
-┌──────────────────────────▼──────────────▼──────────────────────────────────┐
-│                          NFS 层（Handler + billy FS + Cache）               │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  nfs.Handler 接口实现 (handler.go)                                   │   │
-│  │                                                                      │   │
-│  │  Mount() ────────────────────── h.vfs.Stat(cleaned)    ⚡ A1 绕过    │   │
-│  │  FSStat() ───────────────────── h.vfs.Statfs()          ⚡ A2 绕过    │   │
-│  │  ToHandle()   → Cache (pathRewriter → memory/disk/symlink)           │   │
-│  │  FromHandle() → Cache                                               │   │
-│  │  InvalidateHandle() → Cache                                         │   │
-│  │  Change() → billy.Change (FS)                                       │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  billy 适配层 (filesystem.go: FS 实现 billy.Filesystem)              │   │
-│  │                                                                      │   │
-│  │  ⚙ C1~C8  仅读取 VFS 配置：                                           │   │
-│  │     C1,C2: vfs.Opt.CacheMode     → 警告 / Capabilities               │   │
-│  │     C6,C7: vfs.Opt.UID,GID       → setSys 属性注入                    │   │
-│  │     C3:    vfs.Fs()              → 缓存目录名                          │   │
-│  │     C5,C8: vfs.Fs().Root()       → billy Root                         │   │
-│  │                                                                      │   │
-│  │  ⚡ B 类 通过 billy 适配（+ fullPath 重写 + setSys）：                  │   │
-│  │     B1: ReadDir   → f.vfs.ReadDir       + setSys(循环)               │   │
-│  │     B2: Create    → f.vfs.Create                                     │   │
-│  │     B3: Open      → f.vfs.Open                                       │   │
-│  │     B4: OpenFile  → f.vfs.OpenFile                                   │   │
-│  │     B5: Stat      → f.vfs.Stat         + setSys                      │   │
-│  │     B6: Rename    → f.vfs.Rename                                     │   │
-│  │     B7: Remove    → f.vfs.Remove                                     │   │
-│  │     B8: Lstat     → f.vfs.Stat         + setSys                      │   │
-│  │     B9: Symlink   → f.vfs.Symlink                                    │   │
-│  │     B10: Readlink → f.vfs.Readlink                                   │   │
-│  │     B11: Chmod    → f.vfs.Open → Chmod                               │   │
-│  │     B12: Chown    → f.vfs.Open → Chown                               │   │
-│  │     B13: Chtimes  → f.vfs.Chtimes                                    │   │
-│  │     B18: Root     → f.vfs.Fs().Root()                                │   │
-│  │                                                                      │   │
-│  │  ⚡ A3/A4  MkdirAll 绕过 vfs.MkdirAll（不接受 perm）：                │   │
-│  │     循环 B14: vfs.Stat(current)    A3                                │   │
-│  │     循环 B15: vfs.Mkdir(current,p)  A4                                │   │
-│  │                                                                      │   │
-│  │  🔧 属性注入层（setSys）：                                              │   │
-│  │     B16: node.VFS()       → 获取 VFS 引用 (用于 C6,C7)                │   │
-│  │     B17: node.Inode()     → 填入 fileid (Linux 必填)                  │   │
-│  │     C6,C7 注入 UID/GID                                               │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  句柄缓存层 (cache.go)                                                │   │
-│  │     C3,C4  读取配置 (仅构造时)                                         │   │
-│  │     不直接操作 VFS 对象                                                │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ⚡ A5  NewServer: vfs.Opt.CacheMode 读取（启动前置警告）                     │
-│  ⚡ A6,A7  VFS.Shutdown（nfsmount 生命周期管理）                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-                           │
-                           │  ⚡ A/B/C 三类都最终调用 VFS 方法
-                           ▼
-                    ┌──────────────────────────────────────┐
-                    │            vfs.VFS                    │
-                    │  虚拟文件系统核心                       │
-                    │  读写缓存 / 目录树 / Handle 生命周期    │
-                    │  不感知 NFS / billy / 句柄缓存          │
-                    └──────────────────────────────────────┘
-                           │
-                           ▼
-                    ┌──────────────────────────────────────┐
-                    │            fs.Fs 后端                  │
-                    │  (S3 / Google Drive / local / ...)    │
-                    └──────────────────────────────────────┘
-```
-
----
-
-## 7. 各类访问的合理性评估
-
-### A 类（绕过 billy 直接访问 VFS）合理性
-
-| # | 绕过点 | 是否合理 | 详细理由 |
-|---|--------|---------|---------|
-| A1 | `Handler.Mount` → `h.vfs.Stat` | ✅ 合理 | Mount 的职责就是**决定**返回哪个 billy FS。在决策之前 billy FS 尚未确定，无法通过 billy 接口。 |
-| A2 | `Handler.FSStat` → `h.vfs.Statfs` | ✅ 合理 | billy 接口未提供 FSStat 方法，但 NFS 协议必须响应。这是接口设计的缺口。 |
-| A3/A4 | `FS.MkdirAll` → 手动 Stat+Mkdir | ⚠️ 妥协 | `vfs.MkdirAll(path, perm)` 不存在，只有 `vfs.MkdirAll(path string)`。但 NFS MKDIR 携带权限信息。理想的修复是扩展 VFS 接口。 |
-| A5 | `NewServer` → `vfs.Opt.CacheMode` | ✅ 合理 | 服务器启动前的前置检查，不属于文件系统操作。 |
-| A6/A7 | `VFS.Shutdown()` | ✅ 合理 | VFS 生命周期管理，unmount 时关闭。 |
-
-### B 类（经 billy 适配）合理性
-
-B 类全部合理：18 个调用全部在 billy 接口语义的范围内，billy 适配层正确地承担了路径重写和属性注入的职责。
-
-### C 类（仅读取配置）合理性
-
-C 类全部合理：虽然读取的是 VFS 对象的字段，但完全没有文件系统语义，属于配置层。setSys 中的 C6/C7 是 billy 接口不暴露 uid/gid 的必要补偿。
-
----
-
-## 8. 请求映射的边界
-
-### 8.1 go-nfs 库的角色
-
-go-nfs（第三方库）**拥有**：XDR 编解码、RPC 分帧、MOUNT 协议处理、NFS 过程分发、错误码映射；**不拥有**：文件系统逻辑、句柄存储、属性数据。
-
-它通过 `nfs.Handler` 接口向 rclone 回调：
+**代码片段**（`cmd/serve/nfs/filesystem.go#L139-L157`）：
 
 ```go
-// go-nfs 定义的 Handler 接口
-type Handler interface {
-    Mount(ctx, conn, req) (MountStatus, billy.Filesystem, []AuthFlavor)
-    ToHandle(billy.Filesystem, []string) []byte
-    FromHandle([]byte) (billy.Filesystem, []string, error)
-    HandleLimit() int
-    InvalidateHandle(billy.Filesystem, []byte) error  // 可选
-    Change(billy.Filesystem) billy.Change             // 可选
-    FSStat(ctx, billy.Filesystem, *FSStat) error      // 可选
+// MkdirAll creates a directory and all the ones above it
+// it does not redirect to VFS.MkDirAll because that one doesn't
+// honor the permissions
+func (f *FS) MkdirAll(filename string, perm os.FileMode) (err error) {
+    filename = f.fullPath(filename)                   // ① 统一先 fullPath 重写
+    parts := strings.Split(filename, "/")
+    for i := range parts {
+        current := strings.Join(parts[:i+1], "/")
+        _, err := f.vfs.Stat(current)                 // ② ⚡ II-1: 逐级检查
+        if err == vfs.ENOENT {
+            err = f.vfs.Mkdir(current, perm)          // ③ ⚡ II-2: 逐级创建（perm 被正确传递）
+            ...
+        }
+    }
+    return nil
 }
 ```
 
-### 8.2 NFS 过程到方法的完整映射
+**为什么属于"billy适配层内部特殊调用"而不是"NFS层直接调用"：**
 
-| NFSv3 过程 | 入口接口 | 类别 | billy 方法 | VFS 最终方法 |
-|-----------|---------|------|-----------|-------------|
-| GETATTR | FromHandle → billy | B | `Stat()` | `vfs.Stat()` + setSys |
-| LOOKUP | FromHandle → billy | B | `Stat()` | `vfs.Stat()` + setSys |
-| READDIR | FromHandle → billy | B | `ReadDir()` | `vfs.ReadDir()` + setSys |
-| READDIRPLUS | FromHandle → billy | B | `ReadDir()` + `Stat()` | `vfs.ReadDir()` + `vfs.Stat()` |
-| READ | FromHandle → billy | B | `Open()` → file.Read() | `vfs.Open()` → `Handle.ReadAt()` |
-| WRITE | FromHandle → billy | B | `OpenFile()` → file.Write() | `vfs.OpenFile()` → `Handle.WriteAt()` |
-| CREATE | FromHandle → billy | B | `Create()` | `vfs.Create()` |
-| MKDIR | FromHandle → billy | B (A) | `MkdirAll()` | ⚠️ 手动 `vfs.Stat()` + `vfs.Mkdir()`（A 类内部） |
-| REMOVE | FromHandle → billy | B | `Remove()` | `vfs.Remove()` |
-| RMDIR | FromHandle → billy | B | `Remove()` | `vfs.Remove()` |
-| RENAME | FromHandle → billy | B | `Rename()` | `vfs.Rename()` |
-| READLINK | FromHandle → billy | B | `Readlink()` | `vfs.Readlink()` |
-| SYMLINK | FromHandle → billy | B | `Symlink()` | `vfs.Symlink()` |
-| SETATTR | FromHandle → billy | B | `Chmod/Chtimes/Truncate` | `vfs.Open()`→Chmod / `vfs.Chtimes()` |
-| FSSTAT | Handler.FSStat | **A** | — | ⚡ 直接 `h.vfs.Statfs()` |
-| MOUNT | Handler.Mount | **A** | — | ⚡ 直接 `h.vfs.Stat()` + `subFS()` |
+- 调用点**在** `FS.MkdirAll` 方法体内，它本身就是 `billy.Filesystem` 接口的实现。
+- 执行了 `fullPath()` 重写（subFS 时会拼接 root 前缀），这是 billy 适配层的标准职责。
+- 只是因为 VFS 接口签名不完整（`vfs.MkdirAll` 缺 perm 参数），不得不在 billy 层内用低级方法（`Stat`+`Mkdir`）**组合**出高级语义。
+- 相比之下，类别一（I-1, I-2）根本不进入 billy 适配层。
+
+### II-3 / II-4 详细分析：Chmod/Chown 先 Open 再操作
+
+**代码片段**（`cmd/serve/nfs/filesystem.go#L185-L226`）：
+
+```go
+func (f *FS) Chmod(name string, mode os.FileMode) error {
+    name = f.fullPath(name)
+    file, err := f.vfs.Open(name)            // ⚡ II-3: 先 Open 拿 Handle
+    defer file.Close()
+    err = file.Chmod(mode)                   // 再调用 Handle.Chmod
+    if err == vfs.ENOSYS { err = nil }       // 后端不支持则静默
+    return err
+}
+```
+
+同理，Chown 也是 `f.vfs.Open(name)` → `file.Chown(uid, gid)`。
+
+这里的"特殊"体现在：VFS 的接口设计中，Chmod/Chown 是**Handle 级**操作（不是 VFS 级），而 billy 将它们暴露为**路径级**方法。适配层必须多做一步 Open→Chmod→Close 的流程转换。
+
+### II-5 / II-6 详细分析：setSys 的反查模式
+
+**代码片段**（`cmd/serve/nfs/filesystem.go#L28-L43`）：
+
+```go
+func setSys(fi os.FileInfo) {
+    node, ok := fi.(vfs.Node)              // 类型断言：FileInfo 其实就是 vfs.Node
+    vfs := node.VFS()                      // ⚡ II-5: 从 Node 反查 VFS
+    stat := file.FileInfo{
+        Nlink:  1,
+        UID:    vfs.Opt.UID,               // ← 属于 III-5：只读取配置
+        GID:    vfs.Opt.GID,               // ← 属于 III-6：只读取配置
+        Fileid: node.Inode(),              // ⚡ II-6: 从 Node 获取 inode
+    }
+    node.SetSys(&stat)                     // 注入到 Node.Sys()
+}
+```
+
+- II-5 `node.VFS()`：**VFS 内部的反向关联**。billy 调用链只传 `os.FileInfo`，不传 `*vfs.VFS` 参数。由于 `vfs.Node` 恰好持有对 VFS 的反向引用，适配层才能从 Node 反查到 VFS 配置。这是架构层的"特殊"模式。
+- II-6 `node.Inode()`：inode 属于**文件自身的属性数据**（不是配置），必须从具体 Node 获取，且 Linux NFS 客户端强依赖此值。
 
 ---
 
-## 9. 句柄管理的边界
+## 5. 类别三：仅读取配置（8处）
 
-### 9.1 两种"句柄"的严格区分
+**分类判定标准：访问的是 `vfs.Opt.*` 字段或 `vfs.Fs()` 对象，没有任何文件系统 I/O 方法调用。**
+
+这些访问虽然"触碰了 VFS 对象"，但本质是读取元数据配置。在概念上，它们也可以被理解为"NFS 层从 VFS 读取配置"，而非"调用 VFS 文件系统操作"。
+
+| # | 位置 | 代码 | 所属方法 | 用途 |
+|---|------|------|---------|------|
+| III-1 | `cmd/serve/nfs/server.go#L28` | `vfs.Opt.CacheMode` | `NewServer` | Server 创建时判断是否 `CacheModeOff`，若是发出"NFS 只读"警告 |
+| III-2 | `cmd/serve/nfs/filesystem.go#L253` | `f.vfs.Opt.CacheMode` | `FS.Capabilities` | 决定 billy 暴露的能力：只读 vs 可读写 |
+| III-3 | `cmd/serve/nfs/cache.go#L156` | `h.vfs.Fs()` → `fs.ConfigString()` | `newDiskHandler` | 构造磁盘缓存目录名：用 remote 的配置字符串做哈希名，保证不同 remote 有独立缓存 |
+| III-4 | `cmd/serve/nfs/cache.go#L173` | `h.vfs.Opt.MetadataExtension` | `newDiskHandler` | 读取元数据扩展名，用于 metadataSuffix 的合成/剥离句柄逻辑 |
+| III-5 | `cmd/serve/nfs/filesystem.go#L38` | `vfs.Opt.UID` | `setSys`（通过 II-5 的 `node.VFS()`） | 注入 UID 到 FileInfo.Sys()，NFS 属性响应的 fattr3.uid |
+| III-6 | `cmd/serve/nfs/filesystem.go#L39` | `vfs.Opt.GID` | `setSys`（通过 II-5 的 `node.VFS()`） | 注入 GID 到 FileInfo.Sys()，NFS 属性响应的 fattr3.gid |
+| III-7 | `cmd/serve/nfs/filesystem.go#L245` | `f.vfs.Fs().Root()` | `FS.Root()`（rootFS 分支） | 返回后端 fs 的 root 路径，满足 billy `Root()` 接口要求 |
+| III-8 | `cmd/serve/nfs/filesystem.go#L247` | `f.vfs.Fs().Root()` | `FS.Root()`（subFS 分支） | subFS 时拼接 `f.root` 前缀后返回 |
+
+**交叉引用**：III-5 和 III-6 在调用链上依赖 II-5（`node.VFS()`）先拿到 VFS 引用——分类的不同点在于：II-5 是"从 Node 反查 VFS"的**机制动作**；III-5/III-6 是在拿到 VFS 引用后读取其**配置字段**。两者在同一函数内，但语义不同。
+
+---
+
+## 6. 对照：billy 适配层常规调用（非特殊）
+
+作为对比，下面这些调用是 billy → VFS 的**同名直接映射**，模式统一，不需要列为"特殊调用"：
+
+| # | 位置 | billy 方法 → VFS 方法 | fullPath 重写 | setSys 属性注入 |
+|---|------|---------------------|--------------|---------------|
+| R-1 | `filesystem.go#L70` | `ReadDir(p)` → `vfs.ReadDir(fullP)` | ✅ | ✅ 循环 |
+| R-2 | `filesystem.go#L84` | `Create(f)` → `vfs.Create(fullF)` | ✅ | ❌ |
+| R-3 | `filesystem.go#L91` | `Open(f)` → `vfs.Open(fullF)` | ✅ | ❌ |
+| R-4 | `filesystem.go#L98` | `OpenFile(f,flag,perm)` → `vfs.OpenFile(fullF,...)` | ✅ | ❌ |
+| R-5 | `filesystem.go#L105` | `Stat(f)` → `vfs.Stat(fullF)` | ✅ | ✅ |
+| R-6 | `filesystem.go#L118` | `Rename(o,n)` → `vfs.Rename(fullO,fullN)` | ✅✅ | ❌ |
+| R-7 | `filesystem.go#L125` | `Remove(f)` → `vfs.Remove(fullF)` | ✅ | ❌ |
+| R-8 | `filesystem.go#L163` | `Lstat(f)` → `vfs.Stat(fullF)` | ✅ | ✅ |
+| R-9 | `filesystem.go#L175` | `Symlink(target, link)` → `vfs.Symlink(target, fullLink)` | ✅ 仅 link | ❌ |
+| R-10 | `filesystem.go#L182` | `Readlink(link)` → `vfs.Readlink(fullLink)` | ✅ | ❌ |
+| R-11 | `filesystem.go#L232` | `Chtimes(n,atime,mtime)` → `vfs.Chtimes(fullN,...)` | ✅ | ❌ |
+
+这些常规调用 + 类别二的特殊调用（II-1~II-6）共同构成 billy 适配层与 VFS 的全部交互。
+
+---
+
+## 7. 三类访问的可视化边界图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        go-nfs 协议库                                  │
+│            NFSv3 RPC 解码/编码 / MOUNT / 过程分发                     │
+└────────────┬──────────────────────────────┬───────────────────────────┘
+             │                              │
+   billy.Filesystem 接口            nfs.Handler 接口
+             │                              │
+┌────────────▼──────────────────────────────▼───────────────────────────────┐
+│                           NFS 层整体（Handler + billy FS + Cache）         │
+│                                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  nfs.Handler 接口层 (handler.go)                                    │  │
+│  │                                                                     │  │
+│  │  ⚡ I-1  Mount() ──────── h.vfs.Stat(cleaned)                       │  │
+│  │  ⚡ I-2  FSStat() ─────── h.vfs.Statfs()                            │  │
+│  │                                                                     │  │
+│  │  ToHandle / FromHandle / InvalidateHandle ──► Cache                 │  │
+│  │  Change() ──► billy.Change (FS)                                     │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  billy 适配层 (filesystem.go: FS 实现 billy.Filesystem)             │  │
+│  │                                                                     │  │
+│  │  【常规一一映射 R-1 ~ R-11】ReadDir/Create/Open/Stat/...            │  │
+│  │  统一：fullPath() 重写 + f.vfs.同名方法 + 按需 setSys               │  │
+│  │                                                                     │  │
+│  │  【⭐ 类别二：特殊调用 II-1 ~ II-6】                                 │  │
+│  │  II-1,2 MkdirAll: 循环 f.vfs.Stat + f.vfs.Mkdir (perm 透传)        │  │
+│  │  II-3,4 Chmod/Chown: f.vfs.Open → file.Chmod/Chown → Close         │  │
+│  │  II-5,6 setSys:   node.VFS() (反查) + node.Inode() (inode)         │  │
+│  │                                                                     │  │
+│  │  【⚙ 类别三：仅读取配置 III-1~III-8】                                │  │
+│  │  III-1,2  vfs.Opt.CacheMode       → 警告 / Capabilities            │  │
+│  │  III-3,4  h.vfs.Fs() / Opt         → 缓存目录 / metadata 扩展名    │  │
+│  │  III-5,6  vfs.Opt.UID/GID          → setSys 注入属性               │  │
+│  │  III-7,8  f.vfs.Fs().Root()        → billy Root() 返回             │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  句柄缓存层 (cache.go) — III-3, III-4 也在这里执行                 │  │
+│  │  pathRewriter (外层) + 3种 inner Cache (memory/disk/symlink)       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                            │
+│  ⚡ I-3  nfsmount unmount 闭包: VFS.Shutdown()                             │
+│  ⚡ I-4  nfsmount OnUnmountFunc: VFS.Shutdown()                            │
+└────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+                          ┌─────────────────────────┐
+                          │        vfs.VFS           │
+                          │  不感知 NFS / billy      │
+                          └─────────────────────────┘
+```
+
+---
+
+## 8. 各类访问的合理性评估
+
+### 类别一（NFS 层直接调用 VFS）
+
+| # | 合理性 | 说明 |
+|---|--------|------|
+| I-1 `Handler.Mount` → `h.vfs.Stat` | ✅ 必然 | Mount 的职责就是决策 billy FS，决策前 billy FS 不存在。架构上无法通过 billy 接口。 |
+| I-2 `Handler.FSStat` → `h.vfs.Statfs` | ✅ 合理 | billy.Filesystem 接口根本没有 FSStat 方法。 |
+| I-3/I-4 `VFS.Shutdown()` | ✅ 合理 | VFS 生命周期管理，不属于文件系统操作。 |
+
+### 类别二（billy 适配层内部特殊调用）
+
+| # | 合理性 | 说明 |
+|---|--------|------|
+| II-1/II-2 MkdirAll 循环 Stat+Mkdir | ⚠️ 接口妥协 | `vfs.MkdirAll(path string, perm os.FileMode)` 应该存在但不存在。理想的修复是扩展 VFS 接口而非在适配层手动循环。 |
+| II-3/II-4 Chmod/Chown 先 Open 再操作 | ✅ 设计匹配 | VFS 选择了"Handle 级 Chmod/Chown"而非"路径级"，是后端兼容性考量（有些后端只能对打开的文件改权限）。 |
+| II-5 `node.VFS()` 反查 VFS | ✅ 巧妙依赖 | billy 接口参数链限制导致只能利用 Node 反向引用。虽然间接，但依赖的是 VFS 内部稳定的关联。 |
+| II-6 `node.Inode()` | ✅ 必要 | Linux NFS 客户端必填。属于文件自身属性，不是配置。 |
+
+### 类别三（仅读取配置）
+
+| # | 合理性 | 说明 |
+|---|--------|------|
+| III-1 ~ III-8 | ✅ 全部合理 | 纯配置读取，没有文件系统语义。 |
+
+---
+
+## 9. 请求映射与子路径挂载边界
+
+### 9.1 NFS 过程 → 调用类别完整映射表
+
+| NFSv3 过程 | 入口接口 | VFS 访问类别 | billy 方法 | VFS 最终方法 |
+|-----------|---------|-------------|-----------|-------------|
+| GETATTR | FromHandle → billy | **R**（常规） | `Stat()` | `vfs.Stat()` + setSys |
+| LOOKUP | FromHandle → billy | **R**（常规） | `Stat()` | `vfs.Stat()` + setSys |
+| READDIR | FromHandle → billy | **R**（常规） | `ReadDir()` | `vfs.ReadDir()` + setSys |
+| READDIRPLUS | FromHandle → billy | **R**（常规） | `ReadDir()` + `Stat()` | `vfs.ReadDir()` + `vfs.Stat()` |
+| READ | FromHandle → billy | **R**（常规） | `Open()` → file.Read() | `vfs.Open()` → `Handle.ReadAt()` |
+| WRITE | FromHandle → billy | **R**（常规） | `OpenFile()` → file.Write() | `vfs.OpenFile()` → `Handle.WriteAt()` |
+| CREATE | FromHandle → billy | **R**（常规） | `Create()` | `vfs.Create()` |
+| MKDIR | FromHandle → billy | **⭐ 类别二** | `MkdirAll()` | ⚠️ 循环 `vfs.Stat()` + `vfs.Mkdir()` (II-1,II-2) |
+| REMOVE | FromHandle → billy | **R**（常规） | `Remove()` | `vfs.Remove()` |
+| RMDIR | FromHandle → billy | **R**（常规） | `Remove()` | `vfs.Remove()` |
+| RENAME | FromHandle → billy | **R**（常规） | `Rename()` | `vfs.Rename()` |
+| READLINK | FromHandle → billy | **R**（常规） | `Readlink()` | `vfs.Readlink()` |
+| SYMLINK | FromHandle → billy | **R**（常规） | `Symlink()` | `vfs.Symlink()` |
+| SETATTR (chmod) | FromHandle → billy | **⭐ 类别二** | `Chmod()` | ⚠️ `vfs.Open()` → `Chmod()` (II-3) |
+| SETATTR (chown) | FromHandle → billy | **⭐ 类别二** | `Chown()` | ⚠️ `vfs.Open()` → `Chown()` (II-4) |
+| SETATTR (truncate) | FromHandle → billy | **R**（常规） | OpenFile→Truncate | `vfs.OpenFile()` → Handle.Truncate |
+| FSSTAT | Handler.FSStat | **⚡ 类别一** | — | ⚡ 直接 `h.vfs.Statfs()` (I-2) |
+| MOUNT | Handler.Mount | **⚡ 类别一** | — | ⚡ 直接 `h.vfs.Stat()` + `subFS()` (I-1) |
+
+### 9.2 子路径挂载的完整流程
+
+```
+1. NFS Client: MOUNTPROC3_MNT(Dirpath = "/photos/2024")
+                     │
+2. Handler.Mount()  ← 类别一 (I-1)
+   ├─ path.Clean("/" + "/photos/2024") = "/photos/2024"
+   │
+   ├─ h.vfs.Stat("/photos/2024")        ← ⚡ I-1 NFS层直接调VFS
+   │   ├─ 不存在 → MountStatusErrNoEnt
+   │   └─ 非目录 → MountStatusErrNotDir
+   │
+   └─ 返回 subFS = h.billyFS.subFS("/photos/2024")
+                     │
+3. go-nfs: ToHandle(subFS, [])
+   └─ pathRewriter.translate(subFS, [])
+       └─ (rootFS, ["photos", "2024"])   ← 归一化
+   → 根句柄返回给客户端
+                     │
+4. 后续操作: FromHandle(fh)
+   → 总是返回 (rootFS, absoluteSplitPath)
+   → rootFS.fullPath(name) 因 root=="" 直接返回 name
+   → billy 方法 → 类别二 或 常规 R 调用 VFS
+```
+
+安全保证（`cmd/serve/nfs/handler.go#L68`）：`cleaned := path.Clean("/" + string(req.Dirpath))` 前置 `/` 保证绝对路径，`path.Clean` 消除 `..`。测试：`cmd/serve/nfs/handler_test.go#L84-L108` traversal 用例。
+
+---
+
+## 10. 句柄管理的边界
+
+### 10.1 两种"句柄"的严格区分
 
 | | NFS 文件句柄 | VFS Handle |
 |--|-------------|------------|
@@ -384,7 +414,7 @@ type Handler interface {
 | **作用域** | 跨请求持久（客户端持有） | 单次 Open-Close 间 |
 | **所在层** | Handler / Cache | VFS |
 
-### 9.2 句柄缓存的分层结构
+### 10.2 句柄缓存分层结构
 
 ```
 Handler.ToHandle(f, path) / Handler.FromHandle(fh)
@@ -394,132 +424,42 @@ pathRewriter  ← 外层：统一子路径到根路径
     │  translate(f, splitPath) → (rootFS, absoluteSplitPath)
     │
     ▼
-inner Cache  ← 内层：实际存储策略（三选一）
+inner Cache  ← 内层：三种策略（构造时读取 III-3, III-4 配置）
     │
-    ├── CachingHandler (memory)   ← go-nfs/helpers 内置
-    │   map[autoIncrementID] → (billyFS, splitPath)
-    │
-    ├── diskHandler (disk)        ← cache.go 实现
-    │   磁盘文件 MD5(path) → path字符串
-    │
-    └── diskHandler (symlink)     ← symlink_cache_linux.go 实现
-        磁盘符号链接 MD5(path) → path
-        句柄 = name_to_handle_at() 内核文件句柄
+    ├── CachingHandler (memory)   ← map[ID] → (billyFS, splitPath)
+    ├── diskHandler (disk)        ← 文件 MD5(path) → path 字符串
+    └── diskHandler (symlink)     ← 符号链接 + name_to_handle_at()
 ```
 
-### 9.3 pathRewriter 与子路径挂载的交互
+`cmd/serve/nfs/cache.go#L85-L135` 中 `pathRewriter` 保证同一文件经不同子路径 mount 获得**完全相同的句柄字节**（测试：`cmd/serve/nfs/handler_test.go#L135-L143`、`cmd/serve/nfs/cache_test.go#L176-L220`）。
 
-`cmd/serve/nfs/cache.go#L85-L135` 中 `pathRewriter` 保证：
-
-- 客户端 A 通过 `mount :/sub` 访问 `hello.txt` → `ToHandle(subFS, ["hello.txt"])` → translate 为 `(rootFS, ["sub","hello.txt"])`
-- 客户端 B 通过 `mount :/` 访问 `sub/hello.txt` → `ToHandle(rootFS, ["sub","hello.txt"])` → translate 不变
-- 两者得到**完全相同的句柄字节**（测试见 `cmd/serve/nfs/handler_test.go#L135-L143`、`cmd/serve/nfs/cache_test.go#L176-L220`）
-
-**关键：** `FromHandle` 总是返回 rootFS，因为 ToHandle 时已归一化。后续所有 billy 调用都通过 rootFS 进行——rootFS 的 `fullPath()` 因 `root == ""` 而不做任何前缀拼接。
+**关键点**：`FromHandle` 总是返回 rootFS（ToHandle 时已归一化），因此后续所有 billy 调用都通过 rootFS 进行，rootFS 的 `fullPath()` 因 `root == ""` 而不做前缀拼接。
 
 ---
 
-## 10. 子路径挂载的边界
+## 11. 属性注入的边界（setSys 与 II-5/II-6）
 
-### 10.1 完整流程
+### 11.1 层间协议
 
 ```
-1. NFS Client: MOUNTPROC3_MNT(Dirpath = "/photos/2024")
-                    │
-2. Handler.Mount()
-   ├─ path.Clean("/photos/2024") = "/photos/2024"
-   │
-   ├─ h.vfs.Stat("/photos/2024")    ← ⚡ A1 绕过 billy
-   │   ├─ 不存在 → MountStatusErrNoEnt
-   │   └─ 非目录 → MountStatusErrNotDir
-   │
-   └─ 返回 subFS = h.billyFS.subFS("/photos/2024")
-                    │
-3. go-nfs: ToHandle(subFS, [])
-   └─ pathRewriter.translate(subFS, [])
-       └─ (rootFS, ["photos", "2024"])
-   → 根句柄返回给客户端
-                    │
-4. 后续操作: FromHandle(fh)
-   → 总是返回 (rootFS, absoluteSplitPath)
-   → rootFS.fullPath(name) 因 root=="" 直接返回 name
-   → billy 方法调用 VFS
+VFS 层                         billy 适配层                        go-nfs 层
+  │                                │                                  │
+  │ vfs.Stat() 返回 vfs.Node       │                                  │
+  │ (同时实现 os.FileInfo)         │                                  │
+  │◄──────────────────────────────│                                  │
+  │                                │ setSys(fi)                       │
+  │                                │ ├─ node.VFS()         ⚡ II-5    │
+  │                                │ ├─ vfs.Opt.UID/GID   ⚙ III-5/6  │
+  │ node.SetSys(&file.FileInfo)   │ └─ node.Inode()      ⚡ II-6    │
+  │◄──────────────────────────────│                                  │
+  │                                │ 返回 fi 给 go-nfs                │
+  │                                │─────────────────────────────────►│
+  │                                │                          fi.Sys()│
+  │                                │                     → *file.FileInfo│
+  │                                │                     提取 uid/gid/fileid │
 ```
 
-### 10.2 安全保证
-
-`cmd/serve/nfs/handler.go#L68`：`cleaned := path.Clean("/" + string(req.Dirpath))`
-
-- 前置 `/` 保证绝对路径
-- `path.Clean` 消除 `..`：`"/../../etc"` → `"/etc"`（无法穿越 VFS 根）
-- 测试：`cmd/serve/nfs/handler_test.go#L84-L108` 的 traversal 用例
-
-### 10.3 fullPath 路径重写
-
-`cmd/serve/nfs/filesystem.go#L53-L58`：
-
-```go
-func (f *FS) fullPath(name string) string {
-    if f.root == "" { return name }                   // rootFS：直通
-    return path.Join(f.root, name)                    // subFS：前缀拼接
-}
-```
-
-但注意：子路径挂载**不提供安全隔离**，只是便捷功能。文档明确说明等价于 mount `/` 然后 cd 进子目录，句柄全局共享。
-
----
-
-## 11. 属性注入的边界
-
-### 11.1 问题
-
-billy 接口的 `os.FileInfo` 不暴露 uid/gid/inode，但 NFS GETATTR/LOOKUP 响应必须包含这些字段。
-
-### 11.2 setSys 机制
-
-`cmd/serve/nfs/filesystem.go#L28-L43`：
-
-```go
-func setSys(fi os.FileInfo) {
-    node, ok := fi.(vfs.Node)    // FileInfo 实质就是 vfs.Node
-    vfs := node.VFS()
-    stat := file.FileInfo{
-        Nlink:  1,
-        UID:    vfs.Opt.UID,     // ← C6 读取配置
-        GID:    vfs.Opt.GID,     // ← C7 读取配置
-        Fileid: node.Inode(),    // ← B17 读取 inode (Linux 必填)
-    }
-    node.SetSys(&stat)           // 注入到 vfs.Node.Sys()
-}
-```
-
-### 11.3 setSys 调用时机矩阵
-
-| billy 方法 | setSys | fullPath | 类别 | 原因 |
-|-----------|--------|----------|------|------|
-| `Stat()` | ✅ | ✅ | B5 | 返回单个 FileInfo |
-| `Lstat()` | ✅ | ✅ | B8 | 返回单个 FileInfo |
-| `ReadDir()` | ✅ 循环 | ✅ | B1 | 返回 FileInfo 列表 |
-| `Create()` | ❌ | ✅ | B2 | 返回 billy.File |
-| `Open()` | ❌ | ✅ | B3 | 返回 billy.File |
-| `OpenFile()` | ❌ | ✅ | B4 | 返回 billy.File |
-| `Rename()` | ❌ | ✅✅ | B6 | 无返回值 |
-| `Remove()` | ❌ | ✅ | B7 | 无返回值 |
-| `MkdirAll()` | ❌ | ✅ | B14/B15 | 无 FileInfo |
-| `Symlink()` | ❌ | ✅ (仅 link) | B9 | 无返回值 |
-| `Readlink()` | ❌ | ✅ | B10 | 返回字符串 |
-| `Chmod()` | ❌ | ✅ | B11 | 无返回值 |
-| `Chown()` | ❌ | ✅ | B12 | 无返回值 |
-| `Chtimes()` | ❌ | ✅ | B13 | 无返回值 |
-
-### 11.4 层间协议：VFS 同时服务 FUSE 和 NFS
-
-这种设计使得 VFS 层可以同时为两个前端服务，各自有独立的属性填充机制：
-
-- **FUSE 前端**（mount2）：`cmd/mount2/fs.go#L69-L105` 的 `setAttr`/`setAttrOut` 直接写 `fuse.Attr` 结构体
-- **NFS 前端**（serve nfs）：`setSys` 将属性注入 `vfs.Node.Sys()`，由 go-nfs 通过 `Sys()` 提取
-
-VFS 层对两者完全无知，是干净的关注点分离。
+FUSE 前端（mount2）用 `cmd/mount2/fs.go#L69-L105` 的 `setAttr/setAttrOut` 直接写 `fuse.Attr`；NFS 前端用 `setSys` 注入 vfs.Node.Sys()。**VFS 层对两者完全无知**，是干净的关注点分离。
 
 ---
 
@@ -531,19 +471,27 @@ VFS 层对两者完全无知，是干净的关注点分离。
 | 依赖库 | hanwen/go-fuse/v2 | willscott/go-nfs |
 | 适配接口 | `fusefs.InodeEmbedder` | `billy.Filesystem` |
 | 文件标识 | `Node` (嵌入 `fusefs.Inode`) | `[]byte` 句柄 (Cache 管理) |
-| 文件句柄 | `FileHandle` (显式包装 `vfs.Handle`) | 无独立句柄对象，每次 `FromHandle`→`billy.Open` |
-| 路径查找 | `Node.Lookup` → `vfs.Dir.Stat` | `FromHandle` → `billyFS.Stat` |
-| 目录读取 | `dirStream` + `vfs.Handle.Readdir` | `billyFS.ReadDir` |
-| 属性填充 | `setAttr/setAttrOut` 直接写 fuse.Attr | `setSys` 注入 vfs.Node.Sys() |
-| VFS A 类访问 | `FS.Root()` → `vfs.Root()` | `Mount()`→`vfs.Stat()`, `FSStat()`→`vfs.Statfs()`, `MkdirAll`→手动 |
-| VFS B 类访问 | Node/FileHandle 方法全部通过 | billy FS 全部方法 |
-| VFS C 类访问 | AttrTimeout、UID、GID | CacheMode、UID/GID、MetadataExtension |
+| 文件句柄 | `FileHandle`（显式包装 `vfs.Handle`） | 每次 `FromHandle` → billy.Open → 拿新 Handle |
+| **类别一（层直接调用 VFS）** | `FS.Root()` → `vfs.Root()` | I-1: `Mount()`→`h.vfs.Stat()`, I-2: `FSStat()`→`h.vfs.Statfs()`, I-3/4: Shutdown |
+| **类别二（适配层特殊调用）** | 目录流 dirStream、属性合并 AttrOut | II-1/2: `MkdirAll` 循环, II-3/4: Chmod/Chown 先 Open, II-5/6: setSys 反查 |
+| **类别三（仅读配置）** | AttrTimeout、UID、GID、MaxReadAhead | III-1~8: CacheMode、UID、GID、MetadataExtension、Fs().Root() |
 | 子路径 | 不支持 | `Mount()` 支持 subFS |
-| 错误映射 | `translateError()` → syscall.Errno | billy/go-nfs 内部处理 |
 | 平台 | Linux / macOS (amd64) | 所有 Unix |
 
 ---
 
-## 13. 结论：边界规则的一句话总结
+## 13. 结论
 
-> **绝大多数 VFS 调用走 B 类（经 billy 适配）；只有 Mount 路径验证（A1）、FSSTAT 空间统计（A2）、MkdirAll 权限透传（A3/A4）四处需要绕过 billy 直接访问 VFS；其余涉及 VFS 的读取均为 C 类（只读配置），不具文件系统语义。**
+### 三类访问的精确定位
+
+> **类别一（4处）**：**不经过 billy**，发生在 `nfs.Handler` 接口回调（Mount/FSStat）或 VFS 生命周期管理中，由 NFS 服务层直接调用。
+>
+> **类别二（6处）**：**在 billy 适配层内部**，但不是简单的同名映射——MkdirAll 循环建目录、Chmod/Chown 先 Open 再操作、setSys 从 Node 反查 VFS/inode。
+>
+> **类别三（8处）**：**仅读取配置字段**，没有文件系统 I/O，分布在 Server 创建、billy Capabilities、Cache 构造、setSys 属性注入等位置。
+>
+> **常规 billy 映射（11处）**：ReadDir/Create/Open/Stat/Rename/Remove/Lstat/Symlink/Readlink/Chtimes 对应 VFS 同名方法，模式统一，属于 billy 适配层的正常职责。
+
+### MkdirAll 定位结论
+
+MkdirAll 中 `f.vfs.Stat` + `f.vfs.Mkdir`（原来的 A3/A4）**不在 NFS 层，而在 billy 适配层内部**（`FS.MkdirAll` 方法体）。它执行了 billy 层标准的 `fullPath()` 路径重写，只是因为 VFS 的 `MkdirAll` 接口缺少 perm 参数而不得不用低级方法组合实现。因此正确分类为**"类别二：billy 适配层内部特殊调用"**，而非"NFS 层绕过 billy 直接访问"。

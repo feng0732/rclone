@@ -4,9 +4,9 @@
 
 | 文件 | 职责 |
 |---|---|
-| [onedrive.go](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go) | OneDrive 后端主文件，包含 Fs / Object 结构体、URL 构建函数、上传逻辑 |
-| [api/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/api/types.go) | Microsoft Graph API 的请求/响应数据类型定义 |
-| [dircache.go](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/lib/dircache/dircache.go) | 通用目录缓存库，维护 path ↔ directoryID 的双向映射 |
+| [onedrive.go](./backend/onedrive/onedrive.go) | OneDrive 后端主文件，包含 Fs / Object 结构体、URL 构建函数、上传逻辑 |
+| [api/types.go](./backend/onedrive/api/types.go) | Microsoft Graph API 的请求/响应数据类型定义 |
+| [dircache.go](./lib/dircache/dircache.go) | 通用目录缓存库，维护 path ↔ directoryID 的双向映射 |
 
 ---
 
@@ -16,8 +16,8 @@
 
 OneDrive API 中每个 drive item 拥有唯一 ID，但该 ID 仅在所属 Drive 内唯一。rclone 采用 **`driveID#itemID`** 格式作为标准化 ID，确保跨 Drive 场景（如"共享给我的"文件夹）下 ID 的全局唯一性。
 
-- [Item.GetID()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/api/types.go#L436-L443)：若 item 含 RemoteItem，则从 `RemoteItem.ParentReference.DriveID + "#" + RemoteItem.ID` 拼接；否则从 `ParentReference.DriveID + "#" + ID` 拼接。
-- [Fs.parseNormalizedID()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2768-L2781)：将 `driveID#itemID` 拆解为 `itemID`、`driveID`、`rootURL`，用于后续 URL 构建。
+- [Item.GetID()](./backend/onedrive/api/types.go#L436-L443)：若 item 含 RemoteItem，则从 `RemoteItem.ParentReference.DriveID + "#" + RemoteItem.ID` 拼接；否则从 `ParentReference.DriveID + "#" + ID` 拼接。
+- [Fs.parseNormalizedID()](./backend/onedrive/onedrive.go#L2768-L2781)：将 `driveID#itemID` 拆解为 `itemID`、`driveID`、`rootURL`，用于后续 URL 构建。
 
 ### 1.2 URL 构建体系（四层）
 
@@ -33,7 +33,7 @@ newOptsCall (最底层，基于 normalizedID 直接定位)
 
 #### 1.2.1 `newOptsCall` — 基于 normalizedID 直接定位
 
-[Fs.newOptsCall()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2785-L2799)
+[Fs.newOptsCall()](./backend/onedrive/onedrive.go#L2785-L2799)
 
 ```
 URL 模板: https://{Endpoint}/drives/{driveID}/items/{itemID}/{route}
@@ -45,7 +45,7 @@ URL 模板: https://{Endpoint}/drives/{driveID}/items/{itemID}/{route}
 
 #### 1.2.2 `newOptsCallWithIDPath` — 基于 ID + 子路径定位
 
-[Fs.newOptsCallWithIDPath()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2811-L2843)
+[Fs.newOptsCallWithIDPath()](./backend/onedrive/onedrive.go#L2811-L2843)
 
 ```
 URL 模板 (国际版): https://{Endpoint}/drives/{driveID}/items/{parentID}:/{leaf}/{route}
@@ -60,7 +60,7 @@ URL 模板 (中国版): https://{Endpoint}/drives/{driveID}/items/{parentID}/chi
 
 #### 1.2.3 `newOptsCallWithRootPath` — 基于绝对路径定位
 
-[Fs.newOptsCallWithRootPath()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2848-L2858)
+[Fs.newOptsCallWithRootPath()](./backend/onedrive/onedrive.go#L2848-L2858)
 
 ```
 URL 模板 (国际版): https://{Endpoint}/drives/{driveID}/root:/{path}/{route}
@@ -72,7 +72,7 @@ URL 模板 (中国版): https://{Endpoint}/drives/{driveID}/root/children('@a1')
 
 #### 1.2.4 `newOptsCallWithPath` — 智能选路（dircache 驱动）
 
-[Fs.newOptsCallWithPath()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2863-L2880)
+[Fs.newOptsCallWithPath()](./backend/onedrive/onedrive.go#L2863-L2880)
 
 这是最上层的 URL 构建函数，**目录缓存与 item 定位的交汇点**：
 
@@ -85,7 +85,7 @@ URL 模板 (中国版): https://{Endpoint}/drives/{driveID}/root/children('@a1')
 
 ### 1.3 readMetaDataForPath — 元数据读取中的定位策略
 
-[Fs.readMetaDataForPath()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L967-L1030)
+[Fs.readMetaDataForPath()](./backend/onedrive/onedrive.go#L967-L1030)
 
 此方法体现了 OneDrive Personal vs Business 的定位差异：
 
@@ -101,7 +101,7 @@ URL 模板 (中国版): https://{Endpoint}/drives/{driveID}/root/children('@a1')
 
 ### 2.1 上传策略选择
 
-[Object.Update()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2694-L2728) 根据文件大小与 `UploadCutoff` 配置选择上传方式：
+[Object.Update()](./backend/onedrive/onedrive.go#L2694-L2728) 根据文件大小与 `UploadCutoff` 配置选择上传方式：
 
 ```go
 // 核心判断逻辑（第 2708-2713 行）
@@ -114,20 +114,20 @@ if size > 0 && size >= int64(o.fs.opt.UploadCutoff) {
 }
 ```
 
-相关常量与配置（均在 [onedrive.go](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L46-L65) 顶部声明）：
+相关常量与配置（均在 [onedrive.go](./backend/onedrive/onedrive.go#L46-L65) 顶部声明）：
 
 | 名称 | 值 | 说明 |
 |---|---|---|
 | `maxSinglePartSize` | 4 MiB | 单次上传的硬上限，`uploadSinglepart` 内部校验 size ≤ 4 MiB |
 | `defaultChunkSize` | 10 MiB | 分片上传的默认片大小 |
 | `chunkSizeMultiple` | 320 KiB | 分片大小必须是此值的整数倍 |
-| `UploadCutoff` | **默认 -1（禁用）** | 分片上传触发阈值，配置定义见[第 143-155 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L143-L155)，`Default: fs.SizeSuffix(-1)` |
+| `UploadCutoff` | **默认 -1（禁用）** | 分片上传触发阈值，配置定义见[第 143-155 行](./backend/onedrive/onedrive.go#L143-L155)，`Default: fs.SizeSuffix(-1)` |
 
 **UploadCutoff 默认值的含义**：
 
-`UploadCutoff` 默认为 `fs.SizeSuffix(-1)`，即 -1 字节。[checkUploadCutoff()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1066-L1071) 仅校验 `cs > maxSinglePartSize` 时报错，-1 通过校验。由于判断条件为 `size > 0 && size >= int64(UploadCutoff)`，当 UploadCutoff = -1 时，任何正数 size 都满足 `size >= -1`，因此**默认配置下所有 size > 0 的文件都走分片上传**，只有 size == 0（空文件）才走单次上传。
+`UploadCutoff` 默认为 `fs.SizeSuffix(-1)`，即 -1 字节。[checkUploadCutoff()](./backend/onedrive/onedrive.go#L1066-L1071) 仅校验 `cs > maxSinglePartSize` 时报错，-1 通过校验。由于判断条件为 `size > 0 && size >= int64(UploadCutoff)`，当 UploadCutoff = -1 时，任何正数 size 都满足 `size >= -1`，因此**默认配置下所有 size > 0 的文件都走分片上传**，只有 size == 0（空文件）才走单次上传。
 
-源码注释也印证了这一点（[第 2646-2647 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2646-L2647)）：
+源码注释也印证了这一点（[第 2646-2648 行](./backend/onedrive/onedrive.go#L2646-L2648)）：
 
 ```
 // Update the content of a remote file within 4 MiB size in one single request
@@ -136,13 +136,13 @@ if size > 0 && size >= int64(o.fs.opt.UploadCutoff) {
 
 **禁用 UploadCutoff 的原因**：OneDrive for Business 上，单次上传后设置 modTime 会创建新版本，导致存储空间翻倍。详见 [GitHub #1716](https://github.com/rclone/rclone/issues/1716)。
 
-**用户自定义 UploadCutoff 时**：若用户设置了正值（如 4 MiB），则 `size < UploadCutoff` 的小文件走 singlepart，`size >= UploadCutoff` 的大文件走 multipart。但 UploadCutoff 不能超过 `maxSinglePartSize`（4 MiB），否则 [checkUploadCutoff()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1066-L1071) 会报错。
+**用户自定义 UploadCutoff 时**：若用户设置了正值（如 4 MiB），则 `size < UploadCutoff` 的小文件走 singlepart，`size >= UploadCutoff` 的大文件走 multipart。但 UploadCutoff 不能超过 `maxSinglePartSize`（4 MiB），否则 [checkUploadCutoff()](./backend/onedrive/onedrive.go#L1066-L1071) 会报错。
 
 ### 2.2 分片上传流程
 
-[Object.uploadMultipart()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2591-L2644)
+[Object.uploadMultipart()](./backend/onedrive/onedrive.go#L2593-L2644)
 
-前置检查：`size <= 0` 直接报错（[第 2596-2597 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2596-L2597)），multipart 不支持未知大小和空文件。
+前置检查：`size <= 0` 直接报错（[第 2596-2597 行](./backend/onedrive/onedrive.go#L2596-L2597)），multipart 不支持未知大小和空文件。
 
 ```
 1. createUploadSession  →  获取 uploadURL
@@ -154,16 +154,16 @@ if size > 0 && size >= int64(o.fs.opt.UploadCutoff) {
 
 #### 2.2.1 创建上传会话
 
-[Object.createUploadSession()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2465-L2483)
+[Object.createUploadSession()](./backend/onedrive/onedrive.go#L2465-L2483)
 
 - 调用 `o.fs.newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")` 构建请求 URL
 - **注意**：这里 `newOptsCallWithPath` 依赖 dircache 查找目标文件所在目录的 ID，然后基于该 ID 构建创建上传会话的 URL
-- 请求体为 [api.CreateUploadRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/api/types.go#L359-L361)，内含 `item` 字段（如 FileSystemInfo），在会话创建时一并设置元数据
-- 返回 [api.CreateUploadResponse](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/api/types.go#L364-L368)，核心字段是 `UploadURL`（后续分片上传的目标地址）和 `NextExpectedRanges`
+- 请求体为 [api.CreateUploadRequest](./backend/onedrive/api/types.go#L359-L361)，内含 `item` 字段（如 FileSystemInfo），在会话创建时一并设置元数据
+- 返回 [api.CreateUploadResponse](./backend/onedrive/api/types.go#L364-L368)，核心字段是 `UploadURL`（后续分片上传的目标地址）和 `NextExpectedRanges`
 
 #### 2.2.2 分片上传
 
-[Object.uploadFragment()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2517-L2574)
+[Object.uploadFragment()](./backend/onedrive/onedrive.go#L2517-L2574)
 
 每个分片的上传直接使用 uploadURL（不再经过 dircache 或 URL 构建函数），按以下格式发 PUT 请求：
 
@@ -174,23 +174,23 @@ Body: chunk data
 ```
 
 - 使用 `o.fs.unAuth`（无认证客户端）发送，因为 uploadURL 自带临时认证
-- **416 错误恢复**：收到 `416 Range Not Satisfiable` 时，调用 [getPosition()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2486-L2514) 查询服务端期望的偏移量（GET uploadURL，解析 `NextExpectedRanges`），计算 skip 值后重试当前分片
+- **416 错误恢复**：收到 `416 Range Not Satisfiable` 时，调用 [getPosition()](./backend/onedrive/onedrive.go#L2486-L2514) 查询服务端期望的偏移量（GET uploadURL，解析 `NextExpectedRanges`），计算 skip 值后重试当前分片
 - **404 错误恢复**：上传会话可能存在最终一致性延迟，等待 5 秒后重试
 - 上传完成时服务端返回 `200` 或 `201`，响应体为完整的 `api.Item`
 
 #### 2.2.3 取消上传会话
 
-[Object.cancelUploadSession()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2577-L2589)
+[Object.cancelUploadSession()](./backend/onedrive/onedrive.go#L2577-L2589)
 
-- 通过 `atexit.OnError` 注册（[第 2609-2615 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2609-L2615)），上传失败时自动 DELETE uploadURL
+- 通过 `atexit.OnError` 注册（[第 2609-2615 行](./backend/onedrive/onedrive.go#L2609-L2615)），上传失败时自动 DELETE uploadURL
 - 防止孤立的上传会话占用资源
 
 ### 2.3 单次上传
 
-[Object.uploadSinglepart()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2646-L2689)
+[Object.uploadSinglepart()](./backend/onedrive/onedrive.go#L2649-L2689)
 
 - 默认配置下仅用于 **size == 0 的空文件**（源码注释明确说明 "currently only used when size is exactly 0"）
-- 内部硬校验：`size < 0 || size > int64(maxSinglePartSize)` 时直接报错（[第 2651-2652 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2651-L2652)），即单次上传上限为 4 MiB
+- 内部硬校验：`size < 0 || size > int64(maxSinglePartSize)` 时直接报错（[第 2651-2652 行](./backend/onedrive/onedrive.go#L2651-L2652)），即单次上传上限为 4 MiB
 - 调用 `o.fs.newOptsCallWithPath(ctx, o.remote, "PUT", "/content")` 构建请求
 - 上传完成后需要额外调用 `fetchAndUpdateMetadata` 设置 modTime（因为单次上传不会自动携带修改时间，设置 modTime 会创建新版本）
 
@@ -200,7 +200,7 @@ Body: chunk data
 
 ### 3.1 数据结构
 
-[DirCache](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/lib/dircache/dircache.go#L20-L32)
+[DirCache](./lib/dircache/dircache.go#L20-L32)
 
 ```go
 type DirCache struct {
@@ -222,12 +222,12 @@ type DirCache struct {
 
 ### 3.2 DirCacher 接口
 
-[DirCacher](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/lib/dircache/dircache.go#L38-L41)
+[DirCacher](./lib/dircache/dircache.go#L38-L41)
 
 OneDrive 后端实现了两个方法：
 
-- [Fs.FindLeaf()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1254-L1274)：在 pathID 对应的目录下查找名为 leaf 的子目录。调用 `readMetaDataForPathRelativeToID` 按 ID + leaf 查询 API。
-- [Fs.CreateDir()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1277-L1297)：在 dirID 下创建名为 leaf 的子目录。调用 `newOptsCall(dirID, "POST", "/children")` 发 POST 请求。
+- [Fs.FindLeaf()](./backend/onedrive/onedrive.go#L1254-L1274)：在 pathID 对应的目录下查找名为 leaf 的子目录。调用 `readMetaDataForPathRelativeToID` 按 ID + leaf 查询 API。
+- [Fs.CreateDir()](./backend/onedrive/onedrive.go#L1277-L1297)：在 dirID 下创建名为 leaf 的子目录。调用 `newOptsCall(dirID, "POST", "/children")` 发 POST 请求。
 
 ### 3.3 核心操作
 
@@ -246,8 +246,8 @@ OneDrive 后端实现了两个方法：
 
 目录缓存的填充发生在以下时机：
 
-1. **NewFs 初始化**：[NewFs()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1074-L1215) 调用 `dirCache.FindRoot()`，递归查找根路径过程中逐步填充中间目录
-2. **目录列表**：[Fs.itemToDirEntry()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1373-L1396) 遍历子项时，遇到文件夹自动调用 `f.dirCache.Put(remote, id)` 写入缓存
+1. **NewFs 初始化**：[NewFs()](./backend/onedrive/onedrive.go#L1074-L1215) 调用 `dirCache.FindRoot()`，递归查找根路径过程中逐步填充中间目录
+2. **目录列表**：[Fs.itemToDirEntry()](./backend/onedrive/onedrive.go#L1373-L1396) 遍历子项时，遇到文件夹自动调用 `f.dirCache.Put(remote, id)` 写入缓存
 3. **创建目录**：`_findDir` 中 `CreateDir` 返回新目录 ID 后自动 `dc.Put(path, pathID)`
 4. **查找路径**：`FindLeaf` 成功后自动 `dc.Put(path, pathID)`
 
@@ -322,15 +322,15 @@ OneDrive 后端实现了两个方法：
     │       │   （默认 UploadCutoff=-1，即所有 size>0 都走此路径）
     │       │       │
     │       │       ├─ createUploadSession
-    │               │       └─ newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")
-    │               │           │
-    │               │           ├─ dirCache.FindPath(ctx, remote, false)  ← 再次依赖缓存
-    │               │           ├─ 命中 → newOptsCallWithIDPath(directoryID, leaf)
-    │               │           └─ 未命中 → newOptsCallWithRootPath(path)
-    │               │
-    │               ├─ uploadFragment 循环（直接用 uploadURL，不再查询缓存）
-    │               │
-    │               └─ setMetaData → 更新 Object 的 id/size/hash/modTime
+    │       │       │   └─ newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")
+    │       │       │       │
+    │       │       │       ├─ dirCache.FindPath(ctx, remote, false)  ← 再次依赖缓存
+    │       │       │       ├─ 命中 → newOptsCallWithIDPath(directoryID, leaf)
+    │       │       │       └─ 未命中 → newOptsCallWithRootPath(path)
+    │       │       │
+    │       │       ├─ uploadFragment 循环（直接用 uploadURL，不再查询缓存）
+    │       │       │
+    │       │       └─ setMetaData → 更新 Object 的 id/size/hash/modTime
     │
     └─ 返回上传结果
 ```
@@ -364,7 +364,7 @@ Object.readMetaData(ctx)
 
 ### 4.5 缓存失效与一致性
 
-- [Fs.DirCacheFlush()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1988-L1992)：对外暴露的缓存清除接口
+- [Fs.DirCacheFlush()](./backend/onedrive/onedrive.go#L1988-L1992)：对外暴露的缓存清除接口
 - `FlushDir(dir)`：删除/移动目录后清除受影响的缓存区域
 - **ChangeNotify**：通过 delta API 轮询变更，检测到变化时通知上层，但不会主动更新缓存；上层收到通知后通常会触发 `DirCacheFlush` 清除过期数据
 

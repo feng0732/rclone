@@ -327,7 +327,10 @@ March.Run() 结束
 stopTrackRenames() 关闭 trackRenamesCh
     │
     ▼
-makeRenameMap() 为 dstFiles 中 size 匹配的对象计算 hash
+makeRenameMap()
+    │  先构建 possibleSizes: 源端文件的 size 集合
+    │  遍历 dstFiles，仅对 size 在 possibleSizes 中的对象计算 renameID
+    │  以 renameID 为 key 推入 renameMap: map[string][]fs.Object
     │                      ([sync.go#L855-L892](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L855-L892)
     │
     ▼
@@ -344,54 +347,162 @@ pairRenamer 消费 toBeRenamed
                               ([sync.go#L491](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L491)
 ```
 
-### 3.4 tryRename 内部逻辑
+### 3.4 匹配 key 构造、候选筛选与重命名的完整链路
 
-[tryRename](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L896-L927)：
+track-renames 的匹配过程分三个阶段，由三个函数各司其职：
+
+#### 阶段一：renameID——构造匹配 key（[sync.go#L775-L804](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L775-L804)）
+
+`renameID` 为源端和目的端对象生成相同的 key 体系，用于 map 精确查找。
+
+**核心规则：size 总是参与，hash 和 leaf 按策略写入 key 字符串，modtime 永远不写入 key——它在候选弹出时按时间窗口比较。**
+
+代码中的关键注释（[sync.go#L795-L796](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L795-L796)）：
+
+```go
+// for renamesStrategy.modTime() we don't add to the hash but we check the times in
+// popRenameMap
+```
+
+各策略下 renameID 的实际输出：
+
+| --track-renames-strategy | renameID 输出 | 说明 |
+|--------------------------|--------------|------|
+| `hash` | `"12345,SHA256:abc..."` | size + 逗号 + hash 值 |
+| `modtime` | `"12345"` | **仅有 size**，modtime 在 popRenameMap 中按 modifyWindow 比较 |
+| `leaf` | `"12345,photo.jpg"` | size + 逗号 + 文件名 |
+| `hash,leaf` | `"12345,SHA256:abc...,photo.jpg"` | size + hash + leaf 顺序拼接 |
+| `hash,modtime` | `"12345,SHA256:abc..."` | hash 写入 key，modtime 在弹出时二次筛选 |
+| `modtime,leaf` | `"12345,photo.jpg"` | leaf 写入 key，modtime 在弹出时二次筛选 |
+| `hash,modtime,leaf` | `"12345,SHA256:abc...,photo.jpg"` | hash+leaf 写入 key，modtime 在弹出时二次筛选 |
+
+**为什么 modtime 不写入 key？** 因为 modtime 是连续值，文件重命名后 modtime 可能因精度/时区差异而不完全相同，无法做精确的字符串匹配。按 modifyWindow 容差比较才能正确匹配。
+
+**renameID 返回空字符串的两种情况**：
+1. hash 策略下，对象的 hash 计算失败或返回空
+2. 此时该对象无法参与重命名匹配，`tryRename` 直接返回 false
+
+#### 阶段二：makeRenameMap——构建目的端索引（[sync.go#L855-L892](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L855-L892)）
+
+March 遍历结束后，为 dstFiles 中可能与源端重命名的对象建立索引：
+
+```
+1. 构建 possibleSizes := 源端 renameCheck 中所有对象的 size 集合
+2. 遍历 dstFiles:
+     if obj.Size() in possibleSizes:       // size 预筛，跳过不可能匹配的对象
+       id := renameID(obj)                  // 与源端用同一个 key 构造函数
+       if id != "":
+         renameMap[id] = append(renameMap[id], obj)
+```
+
+**关键**：目的端和源端用**完全相同的 renameID 函数**构造 key，因此：
+- 同一文件无论在源端还是目的端，renameID 输出相同（前提是两端使用同一种 hash）
+- modtime 策略下 key 仅含 size，多个同 size 的目的端对象会共享一个 key，形成候选列表
+
+#### 阶段三：tryRename → popRenameMap——查找、筛选、弹出（[sync.go#L896-L927](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L896-L927) + [sync.go#L815-L851](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L815-L851)）
+
+`tryRename` 不直接操作 renameMap，而是调用 `popRenameMap` 一站式完成"查找 → modtime 筛选 → 弹出"：
 
 ```go
 func (s *syncCopyMove) tryRename(src fs.Object) bool {
-    // 1. 计算 renameID：size + [hash] + [modtime] + [leaf]
-    id := s.renameID(src, s.trackRenamesStrategy, s.modifyWindow)
-    if id == "" {
-        return false
+    // 1. 计算源端的 renameID（与目的端用同一个函数）
+    hash := s.renameID(src, s.trackRenamesStrategy, ...)
+    if hash == "" {
+        return false   // 无法生成 key，直接放弃
     }
-    // 2. 从 renameMap 中查找匹配
-    s.renameMapMu.Lock()
-    candidates := s.renameMap[id]
-    if len(candidates) == 0 {
-        s.renameMapMu.Unlock()
-        return false
+
+    // 2. 调用 popRenameMap：按 key 查找 + modtime 筛选 + 弹出
+    dst := s.popRenameMap(hash, src)
+    if dst == nil {
+        return false   // 无匹配候选，放弃
     }
-    dst := candidates[0]
-    s.renameMap[id] = candidates[1:]
-    s.renameMapMu.Unlock()
-    // 3. 如果有 modtime 策略，检查 modtime 是否在 modifyWindow 内
-    if s.trackRenamesStrategy.modTime() {
-        if !fs.ModTimeEqual(src.ModTime(s.ctx), dst.ModTime(s.ctx), s.modifyWindow) {
-            return false
-        }
-    }
-    // 4. 服务端 Move 重命名
-    _, err := operations.Move(s.ctx, s.fdst, nil, src.Remote(), dst)
+
+    // 3. 检查目标路径是否已有同名文件
+    dstOverwritten, _ := s.fdst.NewObject(s.ctx, src.Remote())
+
+    // 4. 服务端 Move：将 dst 从旧路径移到 src.Remote() 路径
+    _, err := operations.Move(s.ctx, s.fdst, dstOverwritten, src.Remote(), dst)
     if err != nil {
-        return false
+        return false   // Move 失败，放弃
     }
-    // 5. 从 dstFiles 中移除，避免被删除
+
+    // 5. 从 dstFiles 中移除，避免被 DeleteModeAfter 删除
     delete(s.dstFiles, dst.Remote())
     return true
 }
 ```
 
-### 3.5 renameID 构造
+`popRenameMap` 的内部逻辑（[sync.go#L815-L851](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L815-L851)）：
 
-[renameID](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L775-L804) 根据 `--track-renames-strategy` 构造唯一标识：
+```go
+func (s *syncCopyMove) popRenameMap(hash string, src fs.Object) (dst fs.Object) {
+    s.renameMapMu.Lock()
+    defer s.renameMapMu.Unlock()
+    dsts, ok := s.renameMap[hash]
+    if ok && len(dsts) > 0 {
+        i := 0  // 默认取第一个候选
+
+        // modtime 策略：遍历候选列表，找到第一个 modtime 在 modifyWindow 内的
+        if s.trackRenamesStrategy.modTime() {
+            i = -1
+            srcModTime := src.ModTime(s.ctx)
+            for j, dst := range dsts {
+                dt := dst.ModTime(s.ctx).Sub(srcModTime)
+                if dt < s.modifyWindow && dt > -s.modifyWindow {
+                    i = j
+                    break      // 找到第一个匹配即停止
+                }
+            }
+            if i < 0 {
+                return nil   // 所有候选的 modtime 都不匹配
+            }
+        }
+
+        // 从候选列表中弹出匹配项
+        dst = dsts[i]
+        dsts = slices.Delete(dsts, i, i+1)
+        if len(dsts) > 0 {
+            s.renameMap[hash] = dsts
+        } else {
+            delete(s.renameMap, hash)
+        }
+    }
+    return dst
+}
+```
+
+**匹配流程总结**：
 
 ```
-size,hash                // hash 策略
-size,modtime          // modtime 策略（modtime 在 popRenameMap 中检查
-size,leaf              // leaf 策略
-size,hash,leaf         // hash+leaf 组合策略
+源端 src 对象
+    │
+    ▼
+renameID(src) → key 字符串（size + [hash] + [leaf]，modtime 不写入）
+    │
+    ▼
+renameMap[key] → 候选列表 []fs.Object（可能是多个同 size/同 hash 的目的端对象）
+    │
+    ├─ 候选列表为空 → tryRename 返回 false → pairRenamer 送入 toBeUploaded
+    │
+    └─ 候选列表非空
+         │
+         ├─ modtime 策略关闭 → 弹出第一个候选，直接使用
+         │
+         └─ modtime 策略开启 → 遍历候选，找第一个 |dst.mtime - src.mtime| < modifyWindow 的
+              │
+              ├─ 找到 → 弹出该候选，继续 Move
+              │
+              └─ 未找到 → popRenameMap 返回 nil → tryRename 返回 false
+                                                         → pairRenamer 送入 toBeUploaded
 ```
+
+**tryRename 失败的三种情况**：
+
+| 失败原因 | 后续动作 | 对 dstFiles 的影响 |
+|---------|---------|-------------------|
+| `renameID` 返回空（hash 不可用） | 送入 toBeUploaded 正常传输 | 该对象仍在 dstFiles 中，最终被 DeleteModeAfter 删除 |
+| `popRenameMap` 返回 nil（无 key 匹配或 modtime 不满足） | 送入 toBeUploaded 正常传输 | 同上 |
+| `operations.Move` 失败（服务端 Move 出错） | 送入 toBeUploaded 正常传输 | 同上 |
 
 ---
 

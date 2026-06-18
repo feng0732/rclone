@@ -1066,3 +1066,422 @@ Changes.List 返回:
 ```
 
 **一句话总结**：变更通知的可靠性上限 = dirCache 的覆盖范围。dirCache 覆盖到哪里，变更通知就能精确到哪里；没覆盖到的地方，就是盲区。
+
+---
+
+## 十三、dirCache 与 VFS 双层缓存的文件-目录关系详解
+
+理解变更通知的核心困惑往往来自：**有两层不同的缓存，各存各的东西，失效机制也不一样**。本章把这两层缓存拆透，把文件和目录在变更通知里的行为边界讲清楚。
+
+### 13.1 两层缓存的定位与分工
+
+系统中存在两级完全独立的目录缓存，职责不同，存储内容也不同：
+
+| 缓存层 | 所在模块 | 存储内容 | 只存目录？ | 双向映射？ | 主要用途 |
+|--------|---------|---------|-----------|-----------|----------|
+| **dirCache** | backend/drive + lib/dircache | 路径 ↔ 目录ID | ✅ **只存目录** | ✅ 双向 (cache + invCache) | 路径翻译：把人类路径转为 API 需要的 ID |
+| **VFS Dir.items** | vfs 层 | 目录下的所有子项（文件 + 子目录） | ❌ 文件+目录都有 | ❌ 只有父→子的树形结构 | VFS 展示：快速响应用户 ls/stat |
+
+**为什么 dirCache 只存目录？** 三个核心原因：
+
+1. **设计目标不同**
+   - dirCache 的使命是「路径翻译」：把 `a/b/c/` 这样的字符串路径，翻译成 Google API 需要的 `folderId`
+   - 文件不需要翻译，因为文件操作都是先找到父目录 ID，再通过文件名操作
+   - 类比：dirCache 是「街道地址 → 楼号」的翻译器，不需要记住每个房间号
+
+2. **规模差异巨大**
+   - 目录数量通常是文件的 1/10 ~ 1/100
+   - 如果文件也存进 dirCache，内存占用会暴涨
+   - 而且文件重命名/移动更频繁，缓存一致性难维护
+
+3. **文件路径可以推导**
+   - 知道了父目录路径 + 文件名，就能拼出完整文件路径
+   - 不需要额外存文件的路径映射
+   - 这也是变更通知中文件路径计算的基本原理
+
+**代码证据**：只有目录才会 Put 进 dirCache
+
+[drive.go#L1670-L1683](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1670-L1683)
+```go
+// itemToDirEntry 中
+if isDir {
+    d := fs.NewDirCopy(ctx, item.Name, t).SetID(item.Id)
+    // ...
+    // ★ 只有目录才 Put 进 dirCache
+    err = f.dirCache.Put(remote, item.Id)
+    return d, err
+}
+```
+
+### 13.2 文件变更路径的完整计算链路
+
+因为文件不在 dirCache 里，文件变更的路径计算**完全依赖父目录**。
+
+#### 计算过程拆解
+
+以「外部修改了 `docs/report.docx`」为例，看看 changeNotifyRunner 怎么处理：
+
+[drive.go#L3271-L3308](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3271-L3308)
+
+```
+change = {
+    FileId: "abc123",                // 文件ID
+    File: {
+        Name: "report.docx",
+        MimeType: "application/...",
+        Parents: ["folderXyz"]       // 父目录ID
+    }
+}
+```
+
+**第一步：找旧路径（通过 fileId 反查）**
+
+```go
+if path, ok := f.dirCache.GetInv(change.FileId); ok {
+    // 加入 pathsToClear
+}
+```
+
+- 文件 ID `abc123` → `dirCache.GetInv("abc123")` → **永远返回 false** ★
+- 因为文件不在 dirCache 里，dirCache 只存目录
+- **结论：文件的旧路径永远无法通过 GetInv 找到**
+
+**第二步：找新路径（通过 parents 正向推导）**
+
+```go
+if change.File != nil {
+    // 确定类型：文件还是目录
+    changeType := fs.EntryObject  // 因为 mimeType != folder
+    
+    if len(change.File.Parents) > 0 {
+        for _, parent := range change.File.Parents {
+            // ★ 通过父目录ID反查父目录路径
+            if parentPath, ok := f.dirCache.GetInv(parent); ok {
+                newPath := path.Join(parentPath, change.File.Name)
+                pathsToClear = append(pathsToClear, entryType{
+                    path: newPath, 
+                    entryType: changeType,
+                })
+            }
+        }
+    } else {
+        // 根对象：直接用文件名当路径
+        pathsToClear = append(pathsToClear, entryType{
+            path: change.File.Name, 
+            entryType: changeType,
+        })
+    }
+}
+```
+
+- 父目录 ID `folderXyz` → `GetInv("folderXyz")` → 如果命中 → `"docs"`
+- 拼接：`path.Join("docs", "report.docx")` → `"docs/report.docx"`
+- **结论：文件的新路径 = 父目录路径 + 文件名**
+
+#### 文件路径计算的前提条件
+
+文件变更能被正确翻译为路径通知，**必须同时满足**：
+
+1. ✅ `change.File != nil`（不是永久删除）
+2. ✅ 父目录在 dirCache 中（`GetInv(parentId)` 能命中）
+3. ✅ 文件名没有编码转换问题（`Enc.ToStandardName` 一致）
+
+如果父目录不在缓存中 → 文件变更直接被丢弃，零通知。
+
+#### 特殊情况：文件被移动
+
+文件从 `a/x.txt` 移动到 `b/x.txt`：
+
+```
+change.File.Parents = [bId]   // 新的父目录
+
+① 旧路径: GetInv(fileId) → ❌ 永远不命中（文件不在dirCache）
+   → 旧路径通知: 无 ★
+
+② 新路径: GetInv(bId) → 命中 → "b"
+   → 拼接: "b/x.txt"
+   → 新路径通知: 有
+```
+
+**问题**：旧位置 `a/x.txt` 不会被通知失效！
+
+- 因为文件不在 dirCache 里，无法通过 fileId 反查旧路径
+- 只有目录移动时，才能通过 GetInv 找到旧路径
+- 文件移动的旧位置通知完全缺失
+
+**后果**：
+- `b/x.txt` 会被标记为新文件（下次 ls b 能看到）
+- 但 `a/x.txt` 在 VFS 缓存中可能还残留着，直到用户 `ls a/` 触发重新列表
+
+> 这是文件级变更通知的一个重要盲区：**移动文件不会通知旧位置失效**。只有当父目录被重新 list 时，旧位置才会被纠正。
+
+### 13.3 目录移动时的双层缓存失效
+
+目录移动比文件移动复杂，因为涉及两层缓存的不同失效策略。
+
+#### 情况 A：rclone 自己移动目录（主动操作）
+
+当 rclone 作为操作方移动目录时，会主动清理 dirCache：
+
+[drive.go#L3168](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3168)
+
+```go
+// dircache.FlushDir 的实现
+func (dc *DirCache) FlushDir(dir string) {
+    // 1. 删除目录本身
+    ID, ok := dc.cache[dir]
+    if ok {
+        delete(dc.cache, dir)
+        delete(dc.invCache, ID)
+    }
+    
+    // 2. ★ 级联删除所有子目录
+    dir += "/"
+    for key, ID := range dc.cache {
+        if strings.HasPrefix(key, dir) {
+            delete(dc.cache, key)
+            delete(dc.invCache, ID)
+        }
+    }
+}
+```
+
+**效果**：
+- `dirCache.FlushDir(srcRemote)` → 源目录及其所有子目录全部从缓存清除
+- 正向 cache 和反向 invCache 同步清理
+- 是**级联的、彻底的**清理
+
+#### 情况 B：外部移动目录（变更通知发现）
+
+当外部客户端移动了目录，变更通知触发时：
+
+**第一步：drive 后端的处理（changeNotifyRunner）**
+
+```
+change = { fileId: dirId, file: { name: "docs", parents: [newParentId] } }
+
+① 旧路径: GetInv(dirId) → 命中 → "old/docs"
+   → 通知 VFS: EntryDirectory
+   
+② 新路径: GetInv(newParentId) → 命中 → "new"
+   → 拼接: "new/docs"
+   → 通知 VFS: EntryDirectory
+```
+
+注意：**changeNotifyRunner 不会调用 dirCache.FlushDir**！
+- dirCache 中的旧映射（`"old/docs" → dirId`、`"old/docs/sub" → subId` 等）**仍然存在**
+- dirCache 不会因为变更通知而自动更新
+
+**第二步：VFS 层的处理（changeNotify）**
+
+[vfs/dir.go#L290-L299](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/vfs/dir.go#L290-L299)
+
+```go
+func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
+    absPath := path.Join(d.path, relativePath)
+    
+    // ★ 总是失效父目录
+    d.invalidateDir(vfscommon.FindParent(absPath))
+    
+    // ★ 如果是目录，也失效目录本身
+    if entryType == fs.EntryDirectory {
+        d.invalidateDir(absPath)
+    }
+}
+```
+
+`invalidateDir` 的实现：
+```go
+func (d *Dir) invalidateDir(absPath string) {
+    node := d.vfs.root.cachedNode(absPath)
+    if dir, ok := node.(*Dir); ok {
+        dir.mu.Lock()
+        if !dir.read.IsZero() {
+            dir.read = time.Time{}   // 标记为过期，下次访问重拉
+        }
+        dir.mu.Unlock()
+    }
+}
+```
+
+**VFS 层的失效特点**：
+1. 只把 `dir.read` 设为零值（标记为过期）
+2. **不清空 `dir.items` 映射**（下次 readDir 时才会替换）
+3. **不级联失效子目录** ★
+
+#### 目录移动后两层缓存的状态对比
+
+把目录 `a/docs/` 移动到 `b/docs/` 后：
+
+| 缓存层 | 旧路径（a/docs/） | 新路径（b/docs/） | 子目录（a/docs/sub/） |
+|--------|------------------|------------------|---------------------|
+| **dirCache** | 还在，没被清 | 还没有，等下次 list b 时 Put | 还在，没被清 |
+| **VFS 层** | read 标记为过期 | 不存在（还没访问过） | read 仍然是新鲜的 ★ |
+
+**关键发现**：VFS 层收到目录变更通知后，**只失效目录本身，不失效子目录**。子目录的 VFS 缓存仍然认为自己是新鲜的。
+
+但实际影响不大，因为：
+- 要访问子目录 `a/docs/sub/`，必须先经过父目录 `a/docs/`
+- 父目录已经被 invalidate 了，访问时会重新 list
+- 重新 list 的结果里不会有 sub（因为整个 docs 都被移走了）
+- 子目录的 VFS 节点自然不会被创建
+
+### 13.4 目录删除时的级联失效机制
+
+删除目录是最能暴露边界行为的场景。
+
+#### Google API 的行为（已删除目录的变更事件）
+
+Google Drive API 对删除操作的处理：
+- 删除一个目录 → **只产生 1 条该目录的 change 事件**
+- 目录内的所有文件和子目录 → **不会产生各自的 change 事件**
+- 这是 API 本身的限制，rclone 无法突破
+
+#### dirCache 层的表现
+
+```
+删除 docs/ 目录（内含 sub/、report.docx 等）
+
+changeNotifyRunner 收到 1 条 change（docs/ 本身）
+
+  ① 旧路径: GetInv(docsId) → 命中 → "docs"
+     → 加入 pathsToClear (EntryDirectory)
+     
+  ② 新路径: change.File == nil（永久删除）或 trashed=true
+     → 跳过（删除不需要新路径）
+
+→ 只通知了 "docs" 一条路径
+```
+
+**dirCache 中的状态**：
+- `"docs" → docsId` → 还在缓存里（变更通知不会删 dirCache）
+- `"docs/sub" → subId` → 还在缓存里
+- 所有子目录的映射 → 全部都还在
+
+**变更通知不会清理 dirCache**。dirCache 里的脏数据会一直残留，直到：
+1. 调用 `FlushDir("docs")` 主动清理
+2. 调用 `DirCacheFlush()` 全部重置
+3. 同路径被重新 list 时，Put 会覆盖正向缓存，但反向缓存可能残留旧 ID
+
+#### VFS 层的表现
+
+VFS 层收到 `changeNotify("docs", EntryDirectory)` 后：
+
+```
+1. invalidateDir("")        // 失效父目录（根目录）
+2. invalidateDir("docs")    // 失效 docs 目录本身
+```
+
+对 VFS 来说：
+- `docs/` 目录的 `read` 被清零 → 下次访问会重拉
+- `docs/sub/` 子目录的 VFS 节点 → **不会被主动失效**
+- 但因为要访问 `docs/sub/` 必须经过 `docs/`，而 `docs/` 重拉后不会有 `sub/` 了
+- 所以 `docs/sub/` 的 VFS 节点虽然还在内存里，但不会被访问到
+
+#### 永久删除 vs 移入回收站
+
+| 删除方式 | change.File | 文件是否还在 dirCache 影响中 | 能否通过旧路径发现 |
+|---------|------------|---------------------------|-----------------|
+| 移入回收站 | 非 nil，`trashed=true` | 是，目录路径映射还在 | 能，TrashedOnly 模式下可见 |
+| 永久删除 | nil | 是，目录路径映射还在（脏数据） | 不能，404 或 list 不到 |
+
+两种情况下，dirCache 中的旧映射都不会自动清除。
+
+### 13.5 两层缓存的协作全景图
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        Google Drive API                              │
+│  - Files.List    → 返回目录内容（文件+子目录）                        │
+│  - Changes.List  → 返回变更事件（fileId + 部分字段）                  │
+└──────────────────────────────────────────────────────────────────────┘
+                          │              │
+                          │ list         │ Changes.List
+                          ▼              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                      backend/drive 层                                │
+│                                                                      │
+│  ┌──────────────────────────────┐    ┌──────────────────────────┐   │
+│  │  list() 通用查询              │    │  changeNotifyRunner()    │   │
+│  │  - 构建查询条件               │    │  - 处理每一条 change      │   │
+│  │  - 分页遍历                   │    │  - 计算旧路径/新路径      │   │
+│  │  - 回调 itemToDirEntry       │    │  - 调用 notifyFunc        │   │
+│  └───────────────┬──────────────┘    └────────────┬─────────────┘   │
+│                  │ Put(目录)                        │ 路径字符串     │
+│                  ▼                                  ▼                │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │  dirCache (lib/dircache)                                     │    │
+│  │                                                              │    │
+│  │  cache:     path → dirId     (正向，只有目录)                │    │
+│  │  invCache:  dirId → path     (反向，只有目录)                │    │
+│  │                                                              │    │
+│  │  ★ 变更通知不会修改 dirCache                                  │    │
+│  │  ★ 只有 list() 时的 Put 才会写入                              │    │
+│  │  ★ FlushDir 才会级联删除                                     │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────┘
+                              │ notifyFunc(path, type)
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                          VFS 层                                       │
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  Dir.changeNotify()                                         │    │
+│  │    - 总是失效父目录                                         │    │
+│  │    - 目录类型：额外失效自身目录                              │    │
+│  │    - 不级联失效子目录 ★                                      │    │
+│  └────────────────────────┬────────────────────────────────────┘    │
+│                           │ invalidateDir                             │
+│                           ▼                                           │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  VFS 目录树（Dir.items）                                     │    │
+│  │                                                              │    │
+│  │  每个 Dir 有:                                                │    │
+│  │    - items: map[name]Node (File + Dir)                       │    │
+│  │    - read: 时间戳（是否新鲜）                                │    │
+│  │                                                              │    │
+│  │  ★ 失效 = read 清零，不是清空 items                           │    │
+│  │  ★ 下次 _readDir 时才会替换内容                               │    │
+│  │  ★ 文件+目录都存                                             │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.6 十个关键问题澄清
+
+**Q1: dirCache 为什么不存文件？**
+A: dirCache 的设计目标是「路径 → 目录ID」的翻译器。文件操作通过父目录 ID + 文件名完成，不需要文件 ID 到路径的映射。存文件会大幅增加内存占用且收益很低。
+
+**Q2: 文件变更的旧路径能找到吗？**
+A: 不能。因为文件不在 dirCache 里，`GetInv(fileId)` 永远返回 false。只有目录变更才能通过 GetInv 找到旧路径。
+
+**Q3: 文件移动会通知旧位置吗？**
+A: 不会。文件移动的 change 事件里，parents 已经是新的父目录了。旧位置因为文件不在 dirCache 里，无法反查。旧位置的 VFS 缓存会残留，直到父目录重拉。
+
+**Q4: 变更通知会修改 dirCache 吗？**
+A: 不会。`changeNotifyRunner` 只**读取** dirCache（GetInv），从不写入。dirCache 只在 `list()` 列表操作时通过 `Put` 更新，或主动 `FlushDir` 时删除。
+
+**Q5: 删除目录后，dirCache 里的子目录条目还在吗？**
+A: 还在。变更通知只产生一条目录级 change，不会级联清理 dirCache。但这些脏数据不会造成错误，因为下次访问父目录重拉时就不会再看到它们了（正向路径不会被用到），反向 ID 查路径可能暂时还能查到旧路径但通常也不会被调用。
+
+**Q6: VFS 收到目录变更通知会级联失效子目录吗？**
+A: 不会。`changeNotify` 只失效目录本身和父目录。子目录的 VFS 缓存仍然是"新鲜"标记，但因为必须经过父目录才能访问，父目录重拉后子项自然消失，所以实际影响不大。
+
+**Q7: 移动目录后新路径怎么被发现？**
+A: 当用户或程序访问新的父目录时，触发 List → 发现了这个子目录 → `itemToDirEntry` 里 `dirCache.Put(newPath, dirId)` → dirCache 中就有了新路径的映射。旧路径的映射仍然存在，变成了脏数据。
+
+**Q8: 共享盘参数会影响变更通知吗？**
+A: 会。`Changes.List` 同样需要设置 `SupportsAllDrives(true)`、`IncludeItemsFromAllDrives(true)`、`DriveId(TeamDriveID)`。如果遗漏，可能查不到变更或只查到个人盘的变更。
+
+**Q9: dirCache 和 VFS 缓存会不一致吗？**
+A: 经常不一致。两者是独立的缓存，生命周期不同：
+- dirCache: 后端级，Fs 创建时初始化，常驻
+- VFS 缓存: 前端级，每个 VFS 实例有一份，有超时（DirCacheTime）
+多数情况下这种不一致是无害的，因为 VFS 最终会重拉，重拉时通过 dirCache 找目录 ID。
+
+**Q10: 为什么 dirCache 要做双向映射？**
+A: 正向映射（路径→ID）用于列表查询前的路径翻译。反向映射（ID→路径）是给变更通知专用的——Google API 返回的是 fileId，需要翻译成 VFS 能理解的路径字符串才能通知失效。没有反向映射，变更检测拿到的 ID 就是无意义的字符串。
+
+### 13.7 一句话总结
+
+> **dirCache 是翻译官（路径 ↔ ID），只管目录；VFS 是展示层（目录内容），文件目录都管。变更通知只读 dirCache 来翻译路径，翻译完去失效 VFS 缓存，反过来却不会修改 dirCache。两层缓存各活各的，靠列表操作（Put）来同步。**

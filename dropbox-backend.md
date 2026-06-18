@@ -42,7 +42,7 @@ type Fs struct {
     sharing        sharing.Client // Dropbox Sharing API 客户端
     users          users.Client   // Dropbox Users API 客户端
     pacer          *fs.Pacer      // 统一速率/重试控制器
-    ns             string         // 根命名空间 ID
+    ns             string         // 根命名空间 ID（空字符串表示默认）
     batcher        *batcher.Batcher[...] // 批量上传
 }
 
@@ -60,16 +60,17 @@ type Options struct {
 
 ## 二、NewFs 初始化分支全景
 
-`NewFs` 函数是后端初始化的唯一入口，包含四个主要决策分支：
+`NewFs` 函数是后端初始化的唯一入口，包含四个主要决策分支，**执行顺序至关重要**：
 
 ```
 NewFs(ctx, name, root, m)
     │
     ├─ 分支 1: SharedFiles == true
-    │    └─ 共享文件模式，功能受限
+    │    └─ 直接 return，跳过后续所有分支（命名空间/文件检测等）
     │
     ├─ 分支 2: SharedFolders == true
-    │    └─ 共享文件夹模式 → 尝试挂载 → 成功则降级为普通模式
+    │    ├─ root == "" → 直接 return，跳过后续
+    │    └─ root != "" → 挂载 → SharedFolders=false → 继续向下执行
     │
     ├─ 分支 3: 根命名空间设置
     │    ├─ RootNsid != "" → 直接使用
@@ -79,7 +80,10 @@ NewFs(ctx, name, root, m)
          └─ root 是文件 → 回退到父目录 + 返回 ErrorIsFile
 ```
 
-各分支的执行顺序至关重要：SharedFiles → SharedFolders → RootNsid → 文件检测。
+**关键事实**：
+- `SharedFiles == true` 时直接 return，**完全不会**执行到命名空间设置和文件检测
+- `SharedFolders == true` 且 `root == ""` 时直接 return，也不会执行到命名空间设置
+- `SharedFolders == true` 且 `root != ""` 时，挂载后 `SharedFolders = false`，然后继续执行后续所有分支
 
 ---
 
@@ -88,11 +92,11 @@ NewFs(ctx, name, root, m)
 ### 3.1 背景：Dropbox 命名空间概念
 
 Dropbox API 使用**命名空间（Namespace）**隔离不同的数据域：
-- **个人用户命名空间**：用户自己的文件空间
+- **个人用户命名空间**：用户自己的文件空间（默认 home namespace）
 - **团队命名空间**：Dropbox Business 团队的共享空间
 - **共享文件夹命名空间**：每个共享文件夹独立的命名空间
 
-路径解析需要指定在哪个命名空间下进行。
+路径解析需要指定在哪个命名空间下进行。默认情况下，Dropbox 使用用户的 home namespace。
 
 ### 3.2 命名空间的两种设置方式
 
@@ -134,7 +138,7 @@ else if strings.HasPrefix(root, "/") {
 ```go
 func (f *Fs) headerGenerator(hostType string, namespace string, route string) map[string]string {
     if f.ns == "" {
-        return map[string]string{}
+        return map[string]string{}  // f.ns 为空时不注入任何 header
     }
     return map[string]string{
         "Dropbox-API-Path-Root": `{".tag": "namespace_id", "namespace_id": "` + f.ns + `"}`,
@@ -148,23 +152,36 @@ Dropbox SDK 在每次发起 HTTP 请求前调用此函数获取额外请求头�
 ```go
 cfg := dropbox.Config{
     Client:          oAuthClient,
-    HeaderGenerator: f.headerGenerator,  // 在此绑定
+    HeaderGenerator: f.headerGenerator,  // 在此绑定函数引用
 }
 f.srv = files.New(cfg)
+f.sharing = sharing.New(cfg)  // sharing 客户端也使用相同的 headerGenerator
 ```
 
-这意味着即使 `f.ns` 后续被修改（如 SharedFolders 挂载后），所有新建请求也会自动使用最新的命名空间。
+这意味着即使 `f.ns` 后续被修改，所有新建请求也会自动使用最新的命名空间——因为 `headerGenerator` 是闭包，每次调用时动态读取 `f.ns`。
 
-### 3.4 命名空间接入传输链路
+### 3.4 各模式下命名空间的实际状态
+
+| 模式 | f.ns 是否被设置 | 原因 |
+|------|-----------------|------|
+| 正常模式（默认） | 空字符串 | 未触发命名空间设置条件 |
+| 正常模式 + RootNsid | 有值 | 显式配置 |
+| 正常模式 + root 以 "/" 开头 | 有值 | 自动检测 |
+| **SharedFiles 模式** | **空字符串** | **SharedFiles 分支直接 return，跳过命名空间代码** |
+| SharedFolders（root=""） | 空字符串 | 直接 return，跳过命名空间代码 |
+| SharedFolders（root≠""，挂载后） | 取决于 RootNsid 和 root 格式 | 挂载后 SharedFolders=false，继续执行命名空间设置 |
+
+### 3.5 命名空间接入传输链路
 
 ```
-所有 API 调用 (ListFolder / GetMetadata / Download / ...)
+所有 API 调用 (srv.ListFolder / srv.GetMetadata / sharing.ListFolders / ...)
     ↓
 Dropbox SDK 内部发送 HTTP 请求
     ↓
 SDK 调用 headerGenerator(hostType, namespace, route)
     ↓
 如果 f.ns != ""，注入 Dropbox-API-Path-Root 请求头
+如果 f.ns == ""，不注入额外 header（使用默认 home namespace）
     ↓
 请求到达 Dropbox 服务端，在指定命名空间下解析路径
 ```
@@ -178,6 +195,8 @@ SDK 调用 headerGenerator(hostType, namespace, route)
 ### 4.1 模式说明
 
 当 `--dropbox-shared-files` 启用时，后端工作在**共享文件模式**。此模式下 rclone 仅操作通过共享链接单独分享给用户的文件，而非用户命名空间内的常规文件。
+
+**重要前提**：此模式下 `f.ns` 永远是空字符串（因为 SharedFiles 分支在命名空间设置之前就 return 了）。
 
 ### 4.2 NewFs 中的初始化分支
 
@@ -202,12 +221,13 @@ if f.opt.SharedFiles {
 - `findSharedFile` 遍历所有共享文件查找匹配项
 - **不管查找结果如何，最终 `f.root` 被重置为空字符串**
 - 这是因为共享文件没有真正的"目录"概念，所有文件都列在虚拟根下
+- **此分支直接 return，完全跳过后续的命名空间设置、文件检测等逻辑**
 
 ### 4.3 共享文件模式下的功能限制
 
 此模式功能极度受限，以下操作统一返回 `errNotSupportedInSharedMode`：
 
-| 操作 | 位置 |
+| 操作 | 说明 |
 |------|------|
 | `Put` / `PutStream` | 上传文件 |
 | `Mkdir` | 创建目录 |
@@ -223,6 +243,8 @@ var errNotSupportedInSharedMode = fserrors.NoRetryError(
 )
 ```
 
+**注意**：这些函数的判断条件是 `f.opt.SharedFiles || f.opt.SharedFolders`，即两种共享模式都会被限制。
+
 ### 4.4 列表链路接入
 
 `ListP` 中的分支：
@@ -237,7 +259,7 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
         }
         return list.Flush()
     }
-    // ... 正常模式代码
+    // ... 其他分支
 }
 ```
 
@@ -246,11 +268,14 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 - 改为调用 `sharing.ListReceivedFiles`（Sharing API）
 - 通过 `list.Add` → `list.Flush` 仍接入统一列表缓冲流程
 - 通过 `f.pacer.Call` 仍接入统一传输/重试链路
+- `sharing` 客户端也配置了 `headerGenerator`，但因 `f.ns` 为空，不注入命名空间 header
 
 `listReceivedFiles` 实现：
 
 ```go
 func (f *Fs) listReceivedFiles(ctx context.Context, callback func(fs.DirEntry) error) error {
+    started := false
+    var res *sharing.ListFilesResult
     for {
         if !started {
             arg := sharing.ListFilesArg{Limit: 100}
@@ -269,7 +294,7 @@ func (f *Fs) listReceivedFiles(ctx context.Context, callback func(fs.DirEntry) e
         for _, entry := range res.Entries {
             o := &Object{
                 fs:      f,
-                url:     entry.PreviewUrl,  // 保存共享链接 URL
+                url:     entry.PreviewUrl,  // 保存共享链接 URL（后续下载用）
                 remote:  entry.Name,
                 modTime: *entry.TimeInvited,
             }
@@ -282,8 +307,9 @@ func (f *Fs) listReceivedFiles(ctx context.Context, callback func(fs.DirEntry) e
 
 **与正常模式的差异**：
 - API 从 `files.ListFolder` 变为 `sharing.ListReceivedFiles`
+- 客户端从 `f.srv` 变为 `f.sharing`
 - Object 不保存 `id` / `bytes` / `hash`，仅保存 `url` + `remote` + `modTime`
-- `bytes` 字段为 0（零值），`hash` 为空
+- `bytes` 字段为 0（零值），`hash` 为空字符串
 
 ### 4.5 NewObject 链路接入
 
@@ -301,21 +327,28 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 ```go
 func (f *Fs) findSharedFile(ctx context.Context, name string) (*Object, error) {
     errFoundFile := errors.New("found file")
-    err = f.listReceivedFiles(ctx, func(entry fs.DirEntry) error {
+    var o *Object
+    err := f.listReceivedFiles(ctx, func(entry fs.DirEntry) error {
         if entry.(*Object).remote == name {
             o = entry.(*Object)
-            return errFoundFile
+            return errFoundFile  // 找到后提前中断遍历
         }
         return nil
     })
     if errors.Is(err, errFoundFile) {
         return o, nil
     }
+    if err != nil {
+        return nil, err
+    }
     return nil, fs.ErrorObjectNotFound
 }
 ```
 
-**注意**：每次 `NewObject` 都会触发一次完整的共享文件列表遍历，复杂度 O(n)。
+**真实职责**：
+- `findSharedFile` 是 `NewObject` 在 SharedFiles 模式下的**具体实现**
+- 每次 `NewObject` 都会触发一次完整的共享文件列表遍历，复杂度 O(n)
+- 返回的 Object 仅有 `url` / `remote` / `modTime`，缺少 `id` / `bytes` / `hash`
 
 ### 4.6 文件读取（Open）链路接入
 
@@ -343,6 +376,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 **接入要点**：
 - 不使用 Object ID，使用共享链接 URL（`o.url`）
 - API 从 `files.Download` 变为 `sharing.GetSharedLinkFile`
+- 客户端从 `f.srv` 变为 `f.sharing`
 - 不支持 Range 请求（`OpenOptions` 被拒绝）
 - 通过 `pacer.Call` + `shouldRetry` 仍接入统一传输链路
 
@@ -351,22 +385,30 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 ```
 SharedFiles == true
     │
+    ├─ NewFs
+    │    ├─ setRoot(root)
+    │    ├─ [root != ""] findSharedFile → listReceivedFiles 遍历
+    │    ├─ setRoot("")  // 强制重置为空
+    │    └─ return f (直接返回，跳过命名空间/文件检测等后续分支)
+    │
     ├─ List / ListP
-    │    └─ listReceivedFiles (sharing.ListReceivedFiles + pacer.Call)
-    │         └─ list.NewHelper → 统一列表缓冲
+    │    └─ listReceivedFiles
+    │         └─ f.sharing.ListReceivedFiles + f.pacer.Call
+    │              └─ list.NewHelper → 统一列表缓冲
     │
     ├─ NewObject
     │    └─ findSharedFile → 遍历 listReceivedFiles
+    │         └─ 每次 O(n) 复杂度
     │
     ├─ Object.Open
-    │    └─ sharing.GetSharedLinkFile(o.url) + pacer.Call
-    │         └─ 统一重试/速率控制
+    │    └─ f.sharing.GetSharedLinkFile(o.url) + f.pacer.Call
+    │         └─ 统一重试/速率控制，不支持 Range
     │
     ├─ Put / Update / Mkdir / Rmdir / Remove / Hash
     │    └─ 直接返回 errNotSupportedInSharedMode (NoRetryError)
     │
-    └─ 命名空间 / headerGenerator
-         └─ 不影响，仍正常工作
+    └─ 命名空间
+         └─ f.ns 永远为空 → headerGenerator 返回空 map → 使用默认 home namespace
 ```
 
 ---
@@ -375,7 +417,12 @@ SharedFiles == true
 
 ### 5.1 模式说明
 
-当 `--dropbox-shared-folders` 启用时，后端工作在**共享文件夹模式**。该模式允许用户浏览和挂载被分享的文件夹。
+当 `--dropbox-shared-folders` 启用时，后端工作在**共享文件夹模式**。该模式有两种截然不同的行为：
+
+| 场景 | 行为 |
+|------|------|
+| `root == ""` | 列表模式：列出所有共享文件夹（已挂载 + 未挂载） |
+| `root != ""` | 挂载模式：找到指定共享文件夹并挂载，然后降级为普通模式 |
 
 ### 5.2 NewFs 中的初始化分支
 
@@ -383,7 +430,8 @@ SharedFiles == true
 if f.opt.SharedFolders {
     f.setRoot(root)
     if f.root == "" {
-        return f, nil  // 空 root → 列出所有共享文件夹
+        // 空 root → 直接返回，后续列表时列出所有共享文件夹
+        return f, nil
     }
 
     // root 非空，解析出共享文件夹名
@@ -406,7 +454,7 @@ if f.opt.SharedFolders {
             // 已经挂载过不算错误
             if e.EndpointError != nil && 
                e.EndpointError.Tag == sharing.MountFolderErrorAlreadyMounted {
-                // 忽略
+                // 忽略，继续执行
             } else {
                 return nil, err
             }
@@ -417,17 +465,17 @@ if f.opt.SharedFolders {
 
     // 关键：挂载成功后关闭共享文件夹模式，走正常流程
     f.opt.SharedFolders = false
+    // ↓ 继续向下执行：命名空间设置 / setRoot / 文件检测等
 }
 ```
 
-**执行流程**：
-1. 空 root → 直接返回，后续列表时列出所有共享文件夹
-2. 非空 root → 按名称查找共享文件夹 ID → 挂载 → `SharedFolders = false`
-3. 挂载后，共享文件夹变成用户命名空间下的普通文件夹，后续所有操作走正常路径
+**两种场景的执行路径**：
+1. **root == ""**：直接 return，跳过命名空间设置、文件检测等所有后续逻辑
+2. **root != ""**：查找 → 挂载 → `SharedFolders = false` → 继续执行后续所有步骤（命名空间、setRoot、文件检测）
 
-### 5.3 共享文件夹列表链路
+### 5.3 列表模式（root == ""）
 
-当 root 为空且 `SharedFolders == true` 时，`ListP` 的分支：
+当 root 为空时，`ListP` 的分支：
 
 ```go
 func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
@@ -447,7 +495,11 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 `listSharedFolders` 实现：
 
 ```go
+// listSharedFolders lists all available shared folders mounted and not mounted
+// we'll need the id later so we have to return them in original format
 func (f *Fs) listSharedFolders(ctx context.Context, callback func(fs.DirEntry) error) error {
+    started := false
+    var res *sharing.ListFoldersResult
     for {
         if !started {
             arg := sharing.ListFoldersArgs{Limit: 100}
@@ -473,14 +525,24 @@ func (f *Fs) listSharedFolders(ctx context.Context, callback func(fs.DirEntry) e
 }
 ```
 
-**返回类型**：返回 `*fs.Dir` 目录条目（而非 Object），因为浏览的是文件夹列表。
+**listSharedFolders 的真实职责（双重身份）**：
 
-### 5.4 文件夹查找与挂载
+| 身份 | 调用方 | 用途 |
+|------|--------|------|
+| 列表数据源 | `ListP` | 列出共享文件夹给用户浏览 |
+| 查找工具 | `findSharedFolder` | 内部遍历，按名称查找 ID |
 
-`findSharedFolder` 遍历共享文件夹列表按名称匹配：
+**返回类型**：返回 `*fs.Dir` 目录条目（而非 Object），ID 字段存储 `SharedFolderId`，用于后续挂载。
+
+### 5.4 文件夹查找：findSharedFolder
+
+`findSharedFolder` 是一个**内部工具函数**，负责按名称查找共享文件夹的 ID：
 
 ```go
-func (f *Fs) findSharedFolder(ctx context.Context, name string) (string, error) {
+// findSharedFolder find the id for a given shared folder name
+// somewhat annoyingly there is no endpoint to query a shared folder by it's name
+// so our only option is to iterate over all shared folders
+func (f *Fs) findSharedFolder(ctx context.Context, name string) (id string, err error) {
     errFoundFile := errors.New("found file")
     err = f.listSharedFolders(ctx, func(entry fs.DirEntry) error {
         if entry.(*fs.Dir).Remote() == name {
@@ -492,13 +554,22 @@ func (f *Fs) findSharedFolder(ctx context.Context, name string) (string, error) 
     if errors.Is(err, errFoundFile) {
         return id, nil
     }
+    if err != nil {
+        return "", err
+    }
     return "", fs.ErrorDirNotFound
 }
 ```
 
-`mountSharedFolder` 调用 Sharing API 挂载：
+**真实职责**：
+- 只返回 `string` 类型的 ID，不返回完整的目录对象
+- 内部通过调用 `listSharedFolders` 遍历来实现（因为 Dropbox API 不支持按名称直接查询共享文件夹）
+- 是 `mountSharedFolder` 的前置步骤
+
+### 5.5 文件夹挂载：mountSharedFolder
 
 ```go
+// mountSharedFolder mount a shared folder to the root namespace
 func (f *Fs) mountSharedFolder(ctx context.Context, id string) error {
     arg := sharing.MountFolderArg{
         SharedFolderId: id,
@@ -511,7 +582,9 @@ func (f *Fs) mountSharedFolder(ctx context.Context, id string) error {
 }
 ```
 
-### 5.5 模式降级：从共享文件夹到普通模式
+**挂载效果**：共享文件夹被添加到用户的根命名空间中，之后可以通过正常的 Files API 访问。
+
+### 5.6 模式降级：从共享文件夹到普通模式
 
 **关键设计**：当 `NewFs` 中指定了一个具体的共享文件夹路径并成功挂载后，执行：
 
@@ -522,42 +595,80 @@ f.opt.SharedFolders = false
 这意味着后续的 `List` / `NewObject` / `Put` / `Open` 等所有操作**不再走共享文件夹分支**，而是直接使用正常的 Files API。
 
 ```
-挂载前（SharedFolders=true）        挂载后（SharedFolders=false）
-─────────────────────────         ─────────────────────────
-ListP → listSharedFolders          ListP → files.ListFolder
-NewObject → 不适用（返回 Dir）      NewObject → files.GetMetadata
-Put → errNotSupportedInSharedMode  Put → files.Upload / UploadSession
-...                                 ...
+挂载前（SharedFolders=true，root=""）    挂载后（SharedFolders=false）
+────────────────────────────────         ─────────────────────────
+ListP → listSharedFolders                ListP → files.ListFolder
+  (Sharing API，返回 Dir)                  (Files API，返回 Object+Dir)
+                                           
+NewObject → newObjectWithInfo            NewObject → newObjectWithInfo
+  (走正常路径，但可能找不到)                  (正常路径，能找到)
+                                           
+Put → errNotSupportedInSharedMode        Put → files.Upload / UploadSession
+...                                       ...
+命名空间：f.ns 为空                        命名空间：取决于 RootNsid/root 格式
 ```
 
-这也是为什么配置说明中提到："首次使用某个共享文件夹后，`--dropbox-shared-folders` 参数可以省略"——因为文件夹一旦被挂载，就永久出现在用户的正常命名空间中了。
+**注意**：挂载后会继续执行第 660 行的 `f.setRoot(root)`，即使用原始 root 路径重新设置。因为挂载后共享文件夹出现在用户命名空间的根目录下，原始路径（如 `"MySharedFolder/subdir"`）就可以通过正常 Files API 访问了。
 
-### 5.6 共享文件夹模式接入全景
+### 5.7 列表模式下的 NewObject 行为
+
+**容易混淆的事实**：`NewObject` 函数只有 `SharedFiles` 分支，**没有 `SharedFolders` 分支**：
+
+```go
+func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+    if f.opt.SharedFiles {
+        return f.findSharedFile(ctx, remote)
+    }
+    return f.newObjectWithInfo(ctx, remote, nil)  // SharedFolders 模式也走这里
+}
+```
+
+这意味着：
+- 在 `SharedFolders == true` 且 `root == ""` 的列表模式下，调用 `NewObject("some_file.txt")` 会走 `newObjectWithInfo` 正常路径
+- `newObjectWithInfo` 内部调用 `getFileMetadata` → `getMetadata` → `f.srv.GetMetadata`（Files API）
+- 但因为文件在共享文件夹中（未挂载），Files API 找不到，会返回 `ErrorObjectNotFound`
+- 这是合理的：列表模式下用户只是在浏览共享文件夹列表，还没有进入具体的共享文件夹
+
+### 5.8 共享文件夹模式接入全景
 
 ```
 SharedFolders == true
     │
-    ├─ NewFs
-    │    ├─ root == ""
-    │    │    └─ 直接返回，不做命名空间处理
-    │    └─ root != ""
-    │         ├─ findSharedFolder → listSharedFolders 遍历查找
-    │         ├─ mountSharedFolder → sharing.MountFolder + pacer.Call
-    │         └─ f.opt.SharedFolders = false → 降级为普通模式
+    ├─ 场景 A: root == ""（列表模式）
+    │    │
+    │    ├─ NewFs
+    │    │    ├─ setRoot("")
+    │    │    └─ return f (直接返回，跳过命名空间/文件检测)
+    │    │
+    │    ├─ List / ListP
+    │    │    └─ listSharedFolders
+    │    │         └─ f.sharing.ListFolders + f.pacer.Call
+    │    │              └─ list.NewHelper → 统一列表缓冲
+    │    │              └─ 返回 *fs.Dir，ID 为 SharedFolderId
+    │    │
+    │    ├─ NewObject
+    │    │    └─ newObjectWithInfo（正常路径）
+    │    │         └─ f.srv.GetMetadata → 通常找不到（未挂载）
+    │    │
+    │    ├─ Put / Mkdir / Rmdir / Remove / Hash
+    │    │    └─ 直接返回 errNotSupportedInSharedMode
+    │    │
+    │    └─ 命名空间
+    │         └─ f.ns 为空 → headerGenerator 返回空 map
     │
-    ├─ List / ListP（仅 root 为空时走此分支）
-    │    └─ listSharedFolders (sharing.ListFolders + pacer.Call)
-    │         └─ list.NewHelper → 统一列表缓冲
-    │
-    ├─ NewObject（仅 root 为空时，实际上返回 Dir 而非 Object）
-    │    └─ 普通模式分支（因为 SharedFolders 已被设为 false 或 root 为空）
-    │
-    ├─ Put / Update / Mkdir / 等写入操作
-    │    └─ root 为空时返回 errNotSupportedInSharedMode
-    │    └─ root 非空时走普通模式（SharedFolders=false）
-    │
-    └─ 命名空间
-         └─ root 非空挂载后，正常使用 f.ns（如果有设置）
+    └─ 场景 B: root != ""（挂载模式）
+         │
+         ├─ NewFs
+         │    ├─ setRoot(root)
+         │    ├─ findSharedFolder(dir) → 遍历 listSharedFolders 查找 ID
+         │    ├─ mountSharedFolder(id) → sharing.MountFolder + pacer.Call
+         │    ├─ f.opt.SharedFolders = false  ← 降级为普通模式
+         │    ├─ ↓ 继续执行后续步骤 ↓
+         │    ├─ 命名空间设置（RootNsid / root "/" 检测）
+         │    ├─ setRoot(root)  ← 重新设置原始 root
+         │    └─ 根路径文件检测
+         │
+         └─ 后续所有操作 → 走正常模式路径（Files API）
 ```
 
 ---
@@ -573,12 +684,21 @@ rclone ls dropbox:path/to/file.txt
 
 这里 `root` 是 `"path/to/file.txt"`，指向一个文件而不是目录。后端需要正确处理这种情况。
 
-### 6.2 检测与回退逻辑
+### 6.2 哪些模式会执行此检测
 
-`NewFs` 末尾的代码（注意：此逻辑在 SharedFiles/SharedFolders 分支之后执行）：
+| 模式 | 是否执行文件回退检测 | 原因 |
+|------|---------------------|------|
+| 正常模式 | 是 | 正常执行流程 |
+| SharedFiles 模式 | **否** | SharedFiles 分支提前 return，跳过此逻辑 |
+| SharedFolders（root=""） | **否** | 提前 return，跳过此逻辑 |
+| SharedFolders（root≠""，挂载后） | 是 | 降级为普通模式，正常执行 |
+
+### 6.3 检测与回退逻辑
+
+`NewFs` 末尾的代码：
 
 ```go
-f.setRoot(root)
+f.setRoot(root)  // 先按正常方式设置 root
 
 // See if the root is actually an object
 if f.root != "" {
@@ -587,7 +707,7 @@ if f.root != "" {
         // 成功获取文件元数据 → root 确实是文件
         newRoot := path.Dir(f.root)
         if newRoot == "." {
-            newRoot = ""
+            newRoot = ""  // 根目录下的文件，父目录是空
         }
         f.setRoot(newRoot)  // 回退到父目录
         // 返回 fs.ErrorIsFile 告诉上层：root 指向的是文件
@@ -606,7 +726,7 @@ return f, nil
    - 重新设置 root 为父目录
    - 返回 `(f, fs.ErrorIsFile)` 对
 
-### 6.3 getFileMetadata 的实现
+### 6.4 getFileMetadata 的实现
 
 ```go
 func (f *Fs) getFileMetadata(ctx context.Context, filePath string) (*files.FileMetadata, error) {
@@ -641,7 +761,7 @@ func (f *Fs) getFileMetadata(ctx context.Context, filePath string) (*files.FileM
 
 注意 `getFileMetadata` 内部也走 `pacer.Call` + `shouldRetry`，接入了统一传输链路。
 
-### 6.4 ErrorIsFile 的语义
+### 6.5 ErrorIsFile 的语义
 
 `fs.ErrorIsFile` 是一个约定错误，告诉调用方：
 
@@ -651,7 +771,7 @@ func (f *Fs) getFileMetadata(ctx context.Context, filePath string) (*files.FileM
 - `rclone ls dropbox:path/to/file.txt` → 列出该文件所在目录并过滤显示该文件
 - `rclone copy dropbox:path/to/file.txt /tmp/` → 直接复制这一个文件
 
-### 6.5 回退处理接入传输链路
+### 6.6 回退处理接入传输链路
 
 ```
 NewFs(root = "path/to/file.txt")
@@ -660,7 +780,7 @@ NewFs(root = "path/to/file.txt")
     │    └─ f.slashRoot = "/path/to/file.txt"
     │
     ├─ f.getFileMetadata(ctx, f.slashRoot)
-    │    └─ f.getMetadata(...)
+    │    └─ f.possibleMetadatas → f.getMetadata(...)
     │         └─ f.pacer.Call(func() {
     │              f.srv.GetMetadata(...)
     │              return shouldRetry(ctx, err)
@@ -829,9 +949,17 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
     list := list.NewHelper(callback)
     
-    // ===== 特殊模式分支（已在第四、五章详述）=====
-    if f.opt.SharedFiles { return f.listReceivedFiles(ctx, list.Add) }
-    if f.opt.SharedFolders { return f.listSharedFolders(ctx, list.Add) }
+    // ===== 特殊模式分支 =====
+    if f.opt.SharedFiles {
+        err := f.listReceivedFiles(ctx, list.Add)
+        if err != nil { return err }
+        return list.Flush()
+    }
+    if f.opt.SharedFolders {
+        err := f.listSharedFolders(ctx, list.Add)
+        if err != nil { return err }
+        return list.Flush()
+    }
     
     // ===== 正常模式 =====
     root := f.slashRoot
@@ -909,7 +1037,20 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 - **Limit 控制**：每次最多返回 1000 条（API 限制）
 - **流式处理**：通过 `list.Add()` 分批回调，避免全量内存占用
 
-### 8.5 list.NewHelper 统一缓冲
+### 8.5 各模式下的分页列表对比
+
+| 模式 | API 端点 | 客户端 | 返回条目类型 |
+|------|----------|--------|-------------|
+| 正常模式 | `files.ListFolder` / `ListFolderContinue` | `f.srv` | Dir + Object |
+| SharedFiles | `sharing.ListReceivedFiles` / `Continue` | `f.sharing` | Object（仅 url/remote/modTime） |
+| SharedFolders（列表） | `sharing.ListFolders` / `Continue` | `f.sharing` | Dir（ID 为 SharedFolderId） |
+
+**共同点**：
+- 都使用 `f.pacer.Call` + `shouldRetry` 接入统一传输链路
+- 都通过 `list.NewHelper` → `list.Add` → `list.Flush` 接入统一列表缓冲
+- 都支持 Cursor 分页
+
+### 8.6 list.NewHelper 统一缓冲
 
 `list.NewHelper` 提供统一的条目缓冲和刷新机制：
 
@@ -1196,12 +1337,12 @@ dropbox.Fs.List
 list.WithListP (统一列表入口)
     ↓
 dropbox.Fs.ListP
-    ├─ [SharedFiles] → listReceivedFiles → sharing.ListReceivedFiles
-    ├─ [SharedFolders] → listSharedFolders → sharing.ListFolders
-    └─ [正常模式] → files.ListFolder / ListFolderContinue
+    ├─ [SharedFiles] → listReceivedFiles → f.sharing.ListReceivedFiles
+    ├─ [SharedFolders] → listSharedFolders → f.sharing.ListFolders
+    └─ [正常模式] → f.srv.ListFolder / ListFolderContinue
     ↓
 f.pacer.Call(func() {
-    f.srv.SomeListAPI(arg)
+    f.{srv|sharing}.SomeListAPI(arg)
     return shouldRetry(ctx, err)
 })
     ↓
@@ -1224,7 +1365,7 @@ dropbox.Fs.Put
 dropbox.Object.Update
     ↓
 [size > chunkSize || batching] → uploadChunked (分块上传)
-[else] → files.Upload (单块上传)
+[else] → f.srv.Upload (单块上传)
     ↓ [每个块/请求]
 f.pacer.Call(func() {
     f.srv.UploadSessionAppendV2(...)
@@ -1242,7 +1383,7 @@ fs.NewObject (统一接口)
     ↓
 dropbox.Fs.NewObject
     ├─ [SharedFiles] → findSharedFile → listReceivedFiles 遍历
-    └─ [正常模式]
+    └─ [正常模式 / SharedFolders]
          ↓
 dropbox.Object.readEntryAndSetMetadata
     ↓
@@ -1264,12 +1405,12 @@ operations.Copy (下载端)
 fs.Object.Open (统一接口)
     ↓
 dropbox.Object.Open
-    ├─ [SharedFiles] → sharing.GetSharedLinkFile (使用 URL)
-    ├─ [exportType] → files.Export (导出 Paper)
-    └─ [正常模式] → files.Download (使用 ID，支持 Range)
+    ├─ [SharedFiles] → f.sharing.GetSharedLinkFile (使用 URL)
+    ├─ [exportType] → f.srv.Export (导出 Paper)
+    └─ [正常模式] → f.srv.Download (使用 ID，支持 Range)
     ↓
 f.pacer.Call(func() {
-    f.srv.SomeDownloadAPI(...)
+    f.{srv|sharing}.SomeDownloadAPI(...)
     return shouldRetry(ctx, err)
 })
     ↓
@@ -1311,36 +1452,44 @@ lib/pacer 决定是否继续循环
 1. **延迟绑定**：`headerGenerator` 在请求发送时才读取 `f.ns`，支持运行时修改
 2. **透明注入**：命名空间通过 HTTP 头传递，对上层业务逻辑完全透明
 3. **双通道**：显式配置（`RootNsid`）与自动检测（root 以 "/" 开头）互补
+4. **两客户端共享**：`f.srv` 和 `f.sharing` 都配置了相同的 `headerGenerator`
 
 ### 11.3 共享模式分支策略
 
-1. **SharedFiles**：完全独立的 API 路径（Sharing API），仅读不写
+1. **SharedFiles**：完全独立的 API 路径（Sharing API），仅读不写，NewFs 直接 return 跳过后续
 2. **SharedFolders**：列表时用 Sharing API，指定路径后挂载并降级为普通模式
 3. **统一错误**：`errNotSupportedInSharedMode` 作为所有不支持操作的哨兵错误
+4. **不同客户端**：Files API 用 `f.srv`，Sharing API 用 `f.sharing`
 
-### 11.4 文件路径回退模式
+### 11.4 列表函数的双重职责模式
+
+1. **listSharedFolders**：既是 ListP 的数据源，也是 findSharedFolder 的内部遍历工具
+2. **listReceivedFiles**：既是 ListP 的数据源，也是 findSharedFile 的内部遍历工具
+3. 通过 callback 模式实现复用，一次遍历服务于两种用途
+
+### 11.5 文件路径回退模式
 
 1. **检测先行**：`getFileMetadata` 确认 root 是否为文件
 2. **路径收敛**：`path.Dir` 回退到父目录，`.` → `""` 特殊处理
 3. **协议约定**：通过 `fs.ErrorIsFile` 与上层通信，保持 Fs 接口一致性
 
-### 11.5 分页列表两阶段
+### 11.6 分页列表两阶段
 
 1. **统一入口**：`List` → `list.WithListP` → `ListP` 标准化调用
 2. **流式处理**：`list.NewHelper` 缓冲 + 回调，避免全量加载
 
-### 11.6 重试边界三层防护
+### 11.7 重试边界三层防护
 
 1. **排除层**：`shouldRetryExclude` 过滤绝对不可重试错误
 2. **适配层**：`shouldRetry` 处理 Dropbox 特定错误（速率限制、最终一致性）
 3. **通用层**：`fserrors.ShouldRetry` 处理网络等通用错误
 
-### 11.7 统一传输接入点
+### 11.8 统一传输接入点
 
 **所有 Dropbox API 调用必经之路**：
 ```go
 err = f.pacer.Call(func() (bool, error) {
-    result, err = f.srv.SomeAPICall(args)
+    result, err = f.{srv|sharing}.SomeAPICall(args)
     return shouldRetry(ctx, err)  // ← 边界判定接入点
 })
 ```
@@ -1363,35 +1512,39 @@ NewFs(ctx, name, root, m)
     ├─ 1. 解析 Options
     ├─ 2. 创建 OAuth 客户端
     ├─ 3. 初始化 Fs + Pacer + Batcher
-    ├─ 4. 创建 SDK 客户端 (srv/sharing/users/team)
+    ├─ 4. 创建 SDK 客户端 (srv/sharing/users/team，共用 headerGenerator)
     │
-    ├─ 5. SharedFiles 分支
+    ├─ 5. SharedFiles 分支 ← 最早执行
     │    ├─ setRoot(root)
     │    ├─ root == "" → return (f, nil)
-    │    ├─ findSharedFile(root)
+    │    ├─ findSharedFile(root) → listReceivedFiles 遍历
     │    ├─ setRoot("")  // 强制重置
     │    ├─ 找到 → return (f, fs.ErrorIsFile)
     │    └─ 没找到 → return (f, nil)
+    │         └─ 直接返回，跳过后续所有步骤
     │
     ├─ 6. SharedFolders 分支
     │    ├─ setRoot(root)
-    │    ├─ root == "" → return (f, nil)  // 后续列表共享文件夹
-    │    ├─ findSharedFolder(dir)  // 遍历查找 ID
-    │    ├─ mountSharedFolder(id)  // 挂载到命名空间
-    │    │    └─ 已挂载错误 → 忽略
-    │    ├─ f.opt.SharedFolders = false  // 降级为普通模式
-    │    └─ ↓ 继续执行后续步骤
+    │    ├─ root == "" → return (f, nil)  ← 直接返回，跳过后续
+    │    └─ root != ""
+    │         ├─ findSharedFolder(dir) → listSharedFolders 遍历查找 ID
+    │         ├─ mountSharedFolder(id) → sharing.MountFolder + pacer.Call
+    │         │    └─ 已挂载错误 → 忽略
+    │         ├─ f.opt.SharedFolders = false  ← 降级为普通模式
+    │         └─ ↓ 继续执行后续步骤 ↓
     │
-    ├─ 7. 命名空间设置
+    ├─ 7. f.features.Fill(ctx, f)
+    │
+    ├─ 8. 命名空间设置
     │    ├─ RootNsid != "" → f.ns = RootNsid
     │    └─ strings.HasPrefix(root, "/")
-    │         ├─ users.GetCurrentAccount()
+    │         ├─ f.pacer.Call → users.GetCurrentAccount()
     │         ├─ TeamRootInfo → f.ns = TeamRootNamespaceId
     │         └─ UserRootInfo → f.ns = UserRootNamespaceId
     │
-    ├─ 8. setRoot(root)  // 最终设置路径
+    ├─ 9. setRoot(root)  // 最终设置路径
     │
-    ├─ 9. 根路径文件检测
+    ├─ 10. 根路径文件检测
     │    └─ f.root != ""
     │         ├─ getFileMetadata(slashRoot)  // pacer.Call 接入
     │         ├─ 是文件
@@ -1401,7 +1554,7 @@ NewFs(ctx, name, root, m)
     │         │    └─ return (f, fs.ErrorIsFile)
     │         └─ 不是文件 → 继续
     │
-    └─ 10. return (f, nil)  // 正常目录 Fs
+    └─ 11. return (f, nil)  // 正常目录 Fs
 ```
 
 ---
@@ -1410,16 +1563,18 @@ NewFs(ctx, name, root, m)
 
 | 能力 | 正常模式 | SharedFiles | SharedFolders (列表) | SharedFolders (挂载后) |
 |------|----------|-------------|----------------------|-----------------------|
-| List 目录 | ✅ Files API | ✅ Sharing API | ✅ Sharing API | ✅ Files API |
-| NewObject | ✅ GetMetadata | ✅ 遍历查找 | ❌ (返回 Dir) | ✅ GetMetadata |
-| Open 下载 | ✅ Download | ✅ GetSharedLinkFile | ❌ | ✅ Download |
+| List 目录 | ✅ Files API (`f.srv`) | ✅ Sharing API (`f.sharing`) | ✅ Sharing API (`f.sharing`) | ✅ Files API (`f.srv`) |
+| List 返回类型 | Dir + Object | Object（仅 url/remote/modTime） | Dir（ID=SharedFolderId） | Dir + Object |
+| NewObject | ✅ GetMetadata | ✅ 遍历 listReceivedFiles | ⚠️ 走正常路径但通常找不到 | ✅ GetMetadata |
+| Open 下载 | ✅ Download（支持 Range） | ✅ GetSharedLinkFile（不支持 Range） | ❌ | ✅ Download（支持 Range） |
 | Put 上传 | ✅ Upload | ❌ NoRetryError | ❌ NoRetryError | ✅ Upload |
 | Update 更新 | ✅ UploadSession | ❌ NoRetryError | ❌ NoRetryError | ✅ UploadSession |
 | Mkdir | ✅ CreateFolder | ❌ NoRetryError | ❌ NoRetryError | ✅ CreateFolder |
 | Remove | ✅ DeleteV2 | ❌ NoRetryError | ❌ NoRetryError | ✅ DeleteV2 |
 | Copy 服务端 | ✅ CopyV2 | ❌ | ❌ | ✅ CopyV2 |
 | Move 服务端 | ✅ MoveV2 | ❌ | ❌ | ✅ MoveV2 |
-| Hash 哈希 | ✅ DropboxHash | ❌ NoRetryError | ❌ | ✅ DropboxHash |
-| 命名空间 | ✅ headerGenerator | ✅ (不影响) | ✅ (不影响) | ✅ headerGenerator |
+| Hash 哈希 | ✅ DropboxHash | ❌ NoRetryError | ❌ NoRetryError | ✅ DropboxHash |
+| 根命名空间 | 可选设置 | 空（跳过设置） | 空（跳过设置） | 可选设置 |
 | Pacer 重试 | ✅ | ✅ | ✅ | ✅ |
 | list 缓冲 | ✅ list.NewHelper | ✅ list.NewHelper | ✅ list.NewHelper | ✅ list.NewHelper |
+| 命名空间注入 | ✅ headerGenerator | ✅（但 f.ns 为空） | ✅（但 f.ns 为空） | ✅ headerGenerator |

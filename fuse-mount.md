@@ -488,15 +488,17 @@ func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error)
 - 仅提供 `Type` 和 `Name`，不提供 inode 等完整属性
 - 调用方需要再通过 Lookup/Getattr 获取详细属性
 
-### 5.2 go-fuse/v2：DirStream 迭代器模式
+### 5.2 go-fuse/v2：DirStream 迭代器模式（先取完整列表再迭代）
 
 文件：`cmd/mount2/node.go`
+
+**重要说明**：go-fuse 的 DirStream 虽然名为 "Stream"，但此处实现**并非后端流式读取**，而是先一次性获取完整目录列表到内存，再用 DirStream 做内存迭代。
 
 自定义 DirStream 实现 [cmd/mount2/node.go:222-288]：
 ```go
 type dirStream struct {
-    nodes []os.FileInfo
-    i     int   // 当前迭代位置
+    nodes []os.FileInfo   // 完整的内存列表，所有条目已预取
+    i     int             // 当前迭代位置
 }
 
 // HasNext 检查是否还有条目（可能被多次调用）
@@ -513,11 +515,11 @@ func (ds *dirStream) Next() (de fuse.DirEntry, errno syscall.Errno) {
         ds.i++
         return fuse.DirEntry{Mode: fuse.S_IFDIR, Name: "..", Ino: 0}, 0
     }
-    fi := ds.nodes[ds.i-2]
+    fi := ds.nodes[ds.i-2]              // 从已加载的内存切片中读取
     de = fuse.DirEntry{
-        Mode: getMode(fi),    // 包含文件类型权限位
+        Mode: getMode(fi),              // 包含文件类型权限位
         Name: path.Base(fi.Name()),
-        Ino:  0,              // FIXME: 未设置 inode
+        Ino:  0,                         // FIXME: 未设置 inode
     }
     ds.i++
     return de, 0
@@ -534,17 +536,43 @@ Readdir 入口 [cmd/mount2/node.go:300-322]：
 ```go
 func (n *Node) Readdir(ctx) (ds fusefs.DirStream, errno syscall.Errno) {
     fh, err := n.node.Open(os.O_RDONLY)       // 1. 打开目录句柄
-    defer func() { fh.Close() }()
-    items, err := fh.Readdir(-1)              // 2. 读取所有 FileInfo
-    return &dirStream{nodes: items}, 0        // 3. 返回迭代器
+    if err != nil {
+        return nil, translateError(err)
+    }
+    defer func() {
+        closeErr := fh.Close()                 // 4. 关闭目录句柄
+        if errno == 0 && closeErr != nil {
+            errno = translateError(closeErr)
+        }
+    }()
+    items, err := fh.Readdir(-1)               // 2. 关键：Readdir(-1) 一次性读取 ALL 条目
+                                               //    -1 表示读取所有，完整列表已加载到内存
+    if err != nil {
+        return nil, translateError(err)
+    }
+    return &dirStream{nodes: items}, 0         // 3. 返回封装完整列表的迭代器
 }
 ```
 
+**完整流程说明**：
+```
+应用 readdir()
+  → Node.Readdir() 被调用
+    1. n.node.Open() 打开目录句柄
+    2. fh.Readdir(-1) 【一次性读取完整目录】到 []os.FileInfo
+    3. fh.Close() 关闭目录句柄（此时 VFS 层目录读取已完成）
+    4. 返回 &dirStream{nodes: items} 迭代器
+  → 内核通过 DirStream.HasNext()/Next() 逐条获取
+    - 所有条目已在内存中，迭代仅操作已加载的切片
+    - 不再涉及后端网络请求
+```
+
 特点：
-- `DirStream` 迭代器接口：`HasNext()`/`Next()`/`Close()` 流式访问
+- `DirStream` 迭代器接口：`HasNext()`/`Next()`/`Close()` 对**内存列表**进行迭代
+- **非后端流式**：`fh.Readdir(-1)` 先完整获取所有条目，DirStream 仅做内存遍历
 - 提供 `Mode`（含权限位）而非仅 `Type`
-- 实现 `FileSeekdirer` 接口支持 lseek(fd, 0) 回绕
-- 需要手动打开/关闭目录句柄
+- 实现 `FileSeekdirer` 接口支持 lseek(fd, 0) 回绕（复位内存索引）
+- 需要手动打开/关闭目录句柄（在返回 DirStream 前已关闭）
 
 ### 5.3 WinFsp/cgofuse：fill 回调填充
 
@@ -588,13 +616,21 @@ func (fsys *FS) Readdir(
 
 | 维度 | mount (bazil) | mount2 (go-fuse) | cmount (cgofuse) |
 |------|--------------|------------------|------------------|
-| API 模式 | `ReadDirAll()` 返回切片 | `DirStream` 迭代器 | `fill()` 回调填充 |
-| 返回时机 | 一次性全部返回 | 流式逐条迭代 | 逐条回调填充 |
+| API 模式 | `ReadDirAll()` 返回切片 | `DirStream` 迭代器（内存遍历） | `fill()` 回调填充 |
+| 数据获取时机 | `d.Dir.ReadDirAll()` 一次性全部获取 | `fh.Readdir(-1)` 一次性全部获取到内存 | `dir.ReadDirAll()` 一次性全部获取后再遍历 |
+| 返回方式 | 返回完整 `[]fuse.Dirent` 切片 | DirStream 对**已在内存**的列表逐条迭代 | 对**已在内存**的列表逐条调用 `fill()` 回调 |
 | 返回信息 | `Dirent{Type, Name}` | `DirEntry{Mode, Name, Ino}` | `(name, *Stat_t, ofst)` |
 | 属性信息 | 仅类型 | 模式权限位 | 完整 stat 结构（可选） |
-| Seek 支持 | 不支持 | `Seekdir()` 支持回绕到 0 | 不支持（返回 ESPIPE） |
+| Seek 支持 | 不支持 | `Seekdir()` 支持回绕到 0（重置内存索引） | 不支持（返回 ESPIPE） |
 | ReaddirPlus | 不支持 | 不支持（`DisableReadDirPlus: true`） | 支持（`SetCapReaddirPlus(true)`） |
 | "." 和 ".." | 手动添加 | DirStream 内处理 | fill 回调添加 |
+
+**关键说明**：三种实现的目录读取本质上**全部是先一次性获取完整列表到内存，再逐条返回**，不存在真正的后端流式分页读取：
+- mount：`d.Dir.ReadDirAll()` → 返回完整 `[]fuse.Dirent` 切片
+- mount2：`fh.Readdir(-1)` → 封装为 `dirStream{nodes: items}` 迭代器
+- cmount：`dir.ReadDirAll()` → for 循环逐条 `fill()` 回调
+
+其中 mount2 的 DirStream 虽然接口上是 "stream"，但底层实现是先将目录条目完整加载到 `nodes []os.FileInfo` 切片，再通过 `HasNext()/Next()` 对内存切片进行迭代。所有条目在 DirStream 创建前已完整加载，无后端流式分页。
 
 ---
 
@@ -1158,13 +1194,26 @@ a.Mode = f.File.Mode() &^ os.ModeAppend
 func getMode(node os.FileInfo) uint32 {
     vfsMode := node.Mode()
     Mode := vfsMode.Perm()
-    if vfsMode & os.ModeDir      != 0 { Mode |= fuse.S_IFDIR }
-    if vfsMode & os.ModeSymlink  != 0 { Mode |= fuse.S_IFLNK }
-    if vfsMode & os.ModeNamedPipe != 0 { Mode |= fuse.S_IFIFO }
-    else                              { Mode |= fuse.S_IFREG }
+    if vfsMode&os.ModeDir != 0 {
+        Mode |= fuse.S_IFDIR
+    } else if vfsMode&os.ModeSymlink != 0 {
+        Mode |= fuse.S_IFLNK
+    } else if vfsMode&os.ModeNamedPipe != 0 {
+        Mode |= fuse.S_IFIFO
+    } else {
+        Mode |= fuse.S_IFREG
+    }
     return uint32(Mode)
 }
 ```
+
+**真实互斥关系说明**：代码使用 `if/else if/else if/else` 结构，各文件类型分支是**完全互斥**的。一个节点只能匹配以下四种类型之一：
+1. 目录 (`os.ModeDir`) → 设置 `S_IFDIR`
+2. 否则如果是符号链接 (`os.ModeSymlink`) → 设置 `S_IFLNK`
+3. 否则如果是命名管道 (`os.ModeNamedPipe`) → 设置 `S_IFIFO`
+4. 否则（默认）→ 设置 `S_IFREG`（普通文件）
+
+不存在一个节点同时匹配多个类型分支的情况。
 
 ---
 

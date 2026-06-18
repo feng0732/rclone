@@ -610,6 +610,207 @@ type RangeOption struct {
 - 因为无法计算 `Content-Range` 响应头的总长度
 - 此时如果收到 Range 请求，返回 `416 Requested Range Not Satisfiable`
 
+### 4.3.5 未知大小对象的读取边界深度分析
+
+当对象的 `Size()` 返回 `-1`（未知大小，如流式传输的存储后端）时，两条路径的处理差异显著且存在重要设计决策。
+
+---
+
+#### ▎通用对象服务路径（serve.Object）的四种场景
+
+**核心代码**：[serve.go#L66-L114](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L66-L114)
+
+```go
+// 关键片段：未知大小下的 end 计算和 size 覆写
+size := o.Size()  // 未知大小时 size = -1
+if rangeRequest != "" {
+    option, _ := fs.ParseRangeOption(rangeRequest)
+    offset, limit := option.Decode(o.Size())  // 传入 size=-1
+    end := o.Size()  // end 初始 = -1
+    if limit >= 0 {
+        end = offset + limit  // 例如 Range=0-1023 → limit=1024 → end=1024
+    }
+    if end > o.Size() {       // 1024 > -1 成立！ → end 被覆写为 -1
+        end = o.Size()
+    }
+    size = end - offset        // -1 - 0 = -1（负数！）
+    w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, end-1, o.Size()))
+    // → "bytes 0--2/-1"（完全无效的 HTTP 响应头！）
+    code = 206
+}
+w.Header().Set("Content-Length", strconv.FormatInt(size, 10))  // 无 Range 时 → "-1"
+```
+
+---
+
+**场景 1：未知大小 + 无 Range**
+
+| 处理步骤 | 代码行为 | 结果 |
+|---------|---------|------|
+| Content-Length 初始化 | [serve.go#L26-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L26-L28) `if o.Size()>=0` 判断为 false | **不设置** Content-Length 头 |
+| size 变量 | [serve.go#L68](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L68) `size := o.Size()` | size = -1 |
+| Range 分支 | 无 Range 头，跳过解析 | code = 200 |
+| **Content-Length 覆写** | [serve.go#L94](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L94) **无条件执行** | **设置** Content-Length: `-1`（❌ 非法值） |
+| Open | `o.Open(ctx)` 无范围参数 | 打开完整流 |
+| io.Copy | `io.Copy(w, in)` 读到 EOF | 实际传输完整内容 |
+
+**关键缺陷**：第 94 行的 Content-Length 设置是无条件的，会覆盖第 26-28 行的正确判断，将 `Content-Length: -1` 写入响应头。HTTP/1.1 规范要求 Content-Length 为非负十进制整数，`-1` 为非法值。实际效果：多数 HTTP 客户端会忽略这个非法值，依靠 EOF 判断传输结束（行为等同 chunked），但严格客户端可能报错。
+
+---
+
+**场景 2：未知大小 + 开放式 Range（bytes=100-）**
+
+| 处理步骤 | 代码行为 | 结果 |
+|---------|---------|------|
+| RangeOption | `ParseRangeOption("bytes=100-")` | `Start=100, End=-1` |
+| Decode(o.Size()=-1) | [open_options.go#L119-L134](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/open_options.go#L119-L134) Start≥0, End<0 | offset=100, limit=-1 |
+| end 初始 | `end := o.Size()` | end = -1 |
+| end = offset+limit | limit = -1 < 0，跳过 | end 保持 -1 |
+| end > o.Size() | -1 > -1 → false | end 保持 -1 |
+| **size = end - offset** | -1 - 100 | **size = -101**（❌ 负数） |
+| **Content-Range** | `fmt.Sprintf(..., 100, -2, -1)` | **`bytes 100--2/-1`**（❌ 完全无效） |
+| Content-Length | `FormatInt(-101, 10)` | `-101`（❌ 非法负数） |
+| code | 显式设为 206 | 状态码 206 |
+| Open | `o.Open(ctx, RangeOption{Start:100, End:-1})` | 依赖后端自行处理 |
+
+**严重问题**：向客户端发送了完全无效的 HTTP 响应头（`Content-Range: bytes 100--2/-1`、`Content-Length: -101`），同时使用 `206 Partial Content` 状态码。客户端极有可能无法正确解析此响应。
+
+---
+
+**场景 3：未知大小 + 闭合式 Range（bytes=0-1023）**
+
+| 处理步骤 | 代码行为 | 结果 |
+|---------|---------|------|
+| RangeOption | `ParseRangeOption("bytes=0-1023")` | `Start=0, End=1023` |
+| Decode(-1) | Start≥0, End≥0 | offset=0, limit=1024 |
+| end 初始 | end = -1 | -1 |
+| end = offset+limit | 0+1024 | **end=1024**（✓ 计算正确） |
+| **end > o.Size()** | **1024 > -1 → true** | **end 被覆写为 -1**（❌ 截断错误） |
+| size = end - offset | -1 - 0 | **size = -1**（❌ 负数） |
+| **Content-Range** | `fmt.Sprintf(..., 0, -2, -1)` | **`bytes 0--2/-1`**（❌ 无效） |
+| Content-Length | `-1` | 非法值 |
+
+**核心缺陷**：[serve.go#L84-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L84-L86) 的 `end > o.Size()` 截断逻辑在 `o.Size() = -1` 时会**错误地将正确计算出的 end 覆盖为 -1**。这是因为任何正数都大于 -1。
+
+---
+
+**场景 4：未知大小 + 后缀 Range（bytes=-500）**
+
+| 处理步骤 | 代码行为 | 结果 |
+|---------|---------|------|
+| RangeOption | `ParseRangeOption("bytes=-500")` | `Start=-1, End=500` |
+| **Decode(-1)** | Start<0 → `offset = size - o.End = -1 - 500` | **offset = -501**（❌ 负偏移） |
+| end 初始 | end = -1 | -1 |
+| end = offset+limit | limit=-1，跳过 | end 保持 -1 |
+| Content-Range | `bytes -501--2/-1` | 完全无意义 |
+| Open | `o.Open(ctx, RangeOption{Start:-1, End:500})` | 交给后端，但 FixRangeOption [open_options.go#L146-L148](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/open_options.go#L146-L148) 会直接 return |
+
+**结论**：serve.Object 路径在未知大小 + Range 的所有子场景下都存在响应头无效的问题。该路径在设计上**默认假设对象大小已知**，对未知大小流的 Range 请求未做防护。
+
+---
+
+#### ▎VFS 句柄路径（serveFile）的两种场景
+
+**核心代码**：[http.go#L366-L420](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/http/http.go#L366-L420)
+
+```go
+knownSize := obj.Size() >= 0
+if knownSize {
+    w.Header().Set("Content-Length", strconv.FormatInt(node.Size(), 10))
+}
+// ... 省略响应头设置 ...
+if r.Method == "HEAD" { return }
+in, _ := file.Open(os.O_RDONLY)  // 获取 ReadFileHandle（io.ReadSeeker）
+// ...
+if knownSize {
+    http.ServeContent(w, r, remote, node.ModTime(), in)  // ← 已知大小走标准库
+} else {
+    // http.ServeContent can't serve unknown length files
+    if rangeRequest := r.Header.Get("Range"); rangeRequest != "" {
+        http.Error(w, "Can't use Range: on files of unknown length", 416)  // ← 显式拒绝
+        return
+    }
+    n, err := io.Copy(w, in)  // ← 无 Range 走 io.Copy
+}
+```
+
+VFS 路径采用完全不同的策略：**在入口处就明确区分已知和未知大小**，选择不同的处理代码路径。
+
+---
+
+**场景 A：未知大小 + 无 Range**
+
+| 处理步骤 | 代码行为 | 结果 |
+|---------|---------|------|
+| Content-Length 初始化 | `if knownSize` → false | **不设置** Content-Length |
+| 打开文件 | `file.Open(os.O_RDONLY)` → *ReadFileHandle | 延迟打开，尚未触发 openPending |
+| Range 检查 | `rangeRequest != ""` → false，跳过 | 无错误 |
+| **实际打开** | `io.Copy(w, in)` 第一次 Read 触发 openPending → chunkedreader.New(o, ...).Open() | 打开完整对象流 |
+| **传输编码** | Go net/http 检测到无 Content-Length、无 Transfer-Encoding | **自动添加 Transfer-Encoding: chunked**（✓ 符合 HTTP/1.1 规范） |
+| 传输结束 | io.Copy 在 EOF 时正常返回 | chunked 编码以 `0\r\n\r\n` 结束 |
+| 统计 | NewTransfer(obj, nil) 中 obj.Size()=-1，Transfer 记录 size=-1 | 实际以 n（io.Copy 返回值）为准 |
+
+**关键设计决策**：
+1. **不设置 Content-Length**（不像 serve.Object 那样覆写），交给 Go 标准库决定传输方式
+2. Go net/http 的 response.go 逻辑：若无 Content-Length 且无显式 Transfer-Encoding，则自动启用 chunked 编码
+3. 客户端通过识别 chunked 编码的终止标记正确感知传输结束
+
+---
+
+**场景 B：未知大小 + 有 Range**
+
+| 处理步骤 | 代码行为 | 结果 |
+|---------|---------|------|
+| Range 检查 | [http.go#L411-L413](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/http/http.go#L411-L413) 显式检查 | 发现 Range 头 |
+| **提前拒绝** | `http.Error(w, "Can't use Range: on files of unknown length", 416)` | **返回 416** |
+| 文件打开 | 未执行到 `file.Open()` | 无资源消耗 |
+| io.Copy | 未执行 | 无传输 |
+
+**关键设计决策**：
+1. **显式拒绝而非尝试服务** — 与 serve.Object 的"静默失败+无效头"形成对比
+2. 状态码 `416 Requested Range Not Satisfiable` 是 HTTP 规范中为"范围请求无法满足"预留的
+3. 返回 416 时，响应体包含可读错误消息 `Can't use Range: on files of unknown length`
+4. **不打开文件句柄** — 避免不必要的后端连接创建
+
+---
+
+#### ▎两条路径在未知大小下的行为对比总结
+
+| 维度 | serve.Object（通用路径） | serveFile（VFS 路径） |
+|------|------------------------|----------------------|
+| **未知大小 + 无 Range** 的 Content-Length | 设置为 `-1`（❌ 非法） | 不设置，Go 自动 chunked（✓ 规范） |
+| **未知大小 + Range** 的响应 | 206 + 无效响应头（❌ 静默失败） | 明确返回 416（✓ 提前拒绝） |
+| Range 入口检查 | 无，直接进入计算 | 有，knownSize 分支前检查 |
+| end 截断 bug（`end > o.Size()`） | 存在，o.Size()=-1 时任何 end> -1 都被覆写 | 不存在，未知大小不走 Range 代码 |
+| 对象打开时机 | 总是打开（即使 Range 无效） | 有 Range 时**不打开**（节约资源） |
+| io.Copy 的 n 与声称 Content-Length | n（实际字节）≠ Content-Length（-1 或负数） | 无 Content-Length，n 由 EOF 决定 |
+| 传输结束标记 | 依赖底层连接关闭/EOF | chunked 编码 0 帧终止 |
+
+---
+
+#### ▎io.Copy 在未知大小下的传输统计
+
+两条路径都使用 `accounting.Transfer` 做传输统计，对未知大小的行为一致：
+
+**创建阶段** [stats.go#L821-L831](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/accounting/stats.go#L821-L831) + [transfer.go#L81-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/accounting/transfer.go#L81-L89)：
+```go
+// NewTransfer(obj) → newTransfer → newTransferRemoteSize(..., obj.Size()=-1, ...)
+tr := &Transfer{
+    // ...
+    size: -1,  // 保存原始 size
+}
+```
+
+**读取阶段**：`tr.Account(ctx, file)` 包装的 reader 在每次 `Read(p []byte)` 时累加实际读取字节数，与 size 字段无关。
+
+**完成阶段**：
+- VFS 路径：`defer tr.Done(r.Context(), nil)` — io.Copy 成功时 err=nil，Done 记录完成字节数
+- serve.Object 路径：`defer func() { tr.Done(r.Context(), err) }()` — 同样以实际 n 为准，err 用于错误统计
+
+**进度条显示**：当 Transfer.size = -1 时，进度条显示为 `ETA unknown`（进度未知模式），以已传输字节增量形式呈现。
+
+---
+
 ### 4.4 ReadFileHandle 读取实现
 
 实际的文件读取由 `ReadFileHandle` [read.go#L19-L37](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/vfs/read.go#L19-L37) 实现：
@@ -831,12 +1032,30 @@ SetHeader (Accept-Ranges, Server)
 | 条件 | VFS 句柄路径 | 通用对象服务路径 | 说明 |
 |-----|-------------|-----------------|------|
 | 已知大小 + 正常 Range | ✅ http.ServeContent 处理 | ✅ ParseRangeOption + OpenOption | 两条路径均支持 |
-| 已知大小 + 后缀 Range (bytes=-N) | ✅ http.ServeContent 处理 | ⚠️ Decode 对 o.Size()<0 计算负 offset | 通用服务路径依赖 o.Size() 正确 |
-| 未知大小 (Size < 0) + Range | ❌ 返回 416 | ❌ Content-Range 中 size 为负数 | 均无法正确处理 |
-| 未知大小 (Size < 0) + 无 Range | ✅ io.Copy 顺序读取 | ✅ io.Copy 顺序读取 | 降级为完整读取 |
+| 已知大小 + 后缀 Range (bytes=-N) | ✅ http.ServeContent 处理 | ✅ Decode(size) + FixRangeOption 修正 | 均正确 |
+| 未知大小 + 无 Range | ✅ io.Copy + chunked 编码 | ⚠️ io.Copy + Content-Length: -1 | VFS 路径规范，通用路径设非法 CL |
+| 未知大小 + 开放式 Range (bytes=N-) | ❌ 返回 416 | ❌ 206 + Content-Range: `N--2/-1` | 通用路径响应头完全无效 |
+| 未知大小 + 闭合式 Range (bytes=M-N) | ❌ 返回 416 | ❌ `end > -1` 截断 bug，CL 为负 | 通用路径计算出正确 end 后被覆写 |
+| 未知大小 + 后缀 Range (bytes=-N) | ❌ 返回 416 | ❌ Decode(-1) 计算负 offset | 通用路径 offset=-1-N，无意义 |
 | 多范围请求 (逗号分隔) | ❌ http.ServeContent 不支持 | ❌ ParseRangeOption 拒绝 | 两条路径均不支持 |
 | 未知大小 + SeekEnd | ❌ RangeSeek 返回 ErrorInvalidSeek | 不涉及 | chunkedreader 无法从末尾定位 |
+
+**两条路径的未知大小防护对比**：
+
+| 防护措施 | serveFile（VFS 路径） | serve.Object（通用路径） |
+|---------|----------------------|------------------------|
+| Range 请求入口检查 | ✅ 显式检查，有 Range 直接 416 | ❌ 无检查，直接进入计算 |
+| Content-Length 负值防护 | ✅ knownSize=false 不设置 CL | ❌ [serve.go#L94](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L94) 无条件写 CL |
+| end 值截断边界检查 | 不涉及（不走 Range 分支） | ❌ [serve.go#L84](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L84) `end > -1` 恒真导致 end 被覆写为 -1 |
+| 无 Range 时传输编码 | ✅ Go 自动 chunked | ❌ CL=-1 非法，依赖客户端 EOF 容错 |
+| 对象打开资源保护 | 有 Range 时不打开句柄 | ❌ 总是打开（即使 Range 无效） |
 
 **VFS 路径 Range 实现链**：`Range 头` → `http.ServeContent` → `ReadSeeker.Seek()` → `ReadFileHandle.seek()` → `chunkedreader.RangeSeek()` → 后端 `Open(ctx)` 完整打开 → 由 chunkedreader 控制范围
 
 **通用服务路径 Range 实现链**：`Range 头` → `fs.ParseRangeOption()` → `RangeOption.Decode(size)` → `o.Open(ctx, RangeOption)` → 后端直接打开指定范围
+
+**serve.Object 已知大小路径才正确的原因**：当 `o.Size() >= 0` 时
+1. [serve.go#L26-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L26-L28) 初始化 CL 为正确值（不会被第 94 行覆盖为负数）
+2. [serve.go#L84](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L84) `end > o.Size()` 变成正常的边界截断（1024 > 4096 = false，正确；5000 > 4096 = true，截断到 4096）
+3. `Content-Range` 构造中的 `/o.Size()` 是有效正数
+4. `FixRangeOption(options, size)` [open_options.go#L145-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/open_options.go#L145-L177) 能正确把后缀 Range 和 SeekOption 转成绝对范围

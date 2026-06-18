@@ -1,20 +1,20 @@
 # WebDAV Backend 代码分析
 
-本文档围绕 rclone 的 WebDAV backend 实现，深入分析三大核心机制：**远端能力探测**、**属性读取**、**上传覆盖语义**。
+本文档围绕 rclone 的 WebDAV backend 实现，深入分析三大核心机制：**远端能力探测**、**属性读取**、**上传覆盖语义**，特别对 TUS 协议的断点续传和同名覆盖做代码级对照分析。
 
 ---
 
 ## 一、代码文件总览
 
-| 文件 | 职责 |
-|------|------|
-| [webdav.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go) | 主文件，Fs/Object 结构定义，核心方法（列表、上传、属性、copy/move 等） |
-| [api/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go) | API 类型定义：Prop、Response、Multistatus、Error、Time、Quota |
-| [chunking.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go) | Nextcloud 分块上传（chunked upload）逻辑 |
-| [tus.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus.go) | ownCloud Infinite Scale TUS 协议上传入口 |
-| [tus-uploader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-uploader.go) | TUS 上传器实现 |
-| [tus-upload.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-upload.go) | TUS Upload 结构定义 |
-| [tus-errors.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-errors.go) | TUS 错误定义 |
+| 文件（仓库相对路径） | 职责 |
+|----------------------|------|
+| [backend/webdav/webdav.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go) | 主文件，Fs/Object 结构定义，核心方法（列表、上传、属性、copy/move 等） |
+| [backend/webdav/api/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go) | API 类型定义：Prop、Response、Multistatus、Error、Time、Quota |
+| [backend/webdav/chunking.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go) | Nextcloud 分块上传（chunked upload）逻辑 |
+| [backend/webdav/tus.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus.go) | ownCloud Infinite Scale TUS 协议上传入口 |
+| [backend/webdav/tus-uploader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-uploader.go) | TUS 上传器、单 chunk PATCH、主循环调度 |
+| [backend/webdav/tus-upload.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-upload.go) | TUS Upload 结构、Reader→ReadSeeker 适配、Metadata 编码 |
+| [backend/webdav/tus-errors.go](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-errors.go) | TUS 错误码定义（ErrOffsetMismatch、ErrVersionMismatch 等） |
 
 ---
 
@@ -53,52 +53,33 @@ type Fs struct {
 func (f *Fs) setQuirks(ctx context.Context, vendor string) error {
     switch vendor {
     case "fastmail":
-        f.canStream = true
-        f.precision = time.Second
-        f.useOCMtime = true
-        f.hasMESHA1 = true
+        f.canStream = true;  f.precision = time.Second
+        f.useOCMtime = true; f.hasMESHA1 = true
     case "owncloud":
-        f.canStream = true
-        f.precision = time.Second
-        f.useOCMtime = true
-        f.propsetMtime = true
-        f.hasOCMD5 = true
-        f.hasOCSHA1 = true
+        f.canStream = true;  f.precision = time.Second
+        f.useOCMtime = true; f.propsetMtime = true
+        f.hasOCMD5 = true;   f.hasOCSHA1 = true
     case "infinitescale":
-        f.precision = time.Second
-        f.useOCMtime = true
-        f.propsetMtime = true
-        f.hasOCMD5 = false
-        f.hasOCSHA1 = true
-        f.canChunk = false
-        f.canTus = true              // 启用 TUS 协议
+        f.precision = time.Second;    f.useOCMtime = true
+        f.propsetMtime = true;        f.hasOCSHA1 = true
+        f.canTus = true;              // ← 启用 TUS 协议
         f.opt.ChunkSize = 10 * fs.Mebi
     case "nextcloud":
-        f.precision = time.Second
-        f.useOCMtime = true
-        f.propsetMtime = true
-        f.hasOCSHA1 = true
-        f.canChunk = true            // 启用分块上传
-        // 解析并设置 chunksUploadURL ...
+        f.precision = time.Second;    f.useOCMtime = true
+        f.propsetMtime = true;        f.hasOCSHA1 = true
+        f.canChunk = true             // ← 启用分块上传
+        f.chunksUploadURL = /*从正则解析*/
     case "sharepoint":
-        f.srv.RemoveHeader("Authorization")
-        f.retryWithZeroDepth = true
-        // ... Cookie 认证逻辑
+        f.retryWithZeroDepth = true   // ← 列表失败后降级重试
+        // ... Cookie 认证（odrvcookie）+ 12h 自动续期
     case "sharepoint-ntlm":
-        f.retryWithZeroDepth = true
-        f.checkBeforePurge = true
+        f.retryWithZeroDepth = true;  f.checkBeforePurge = true
     case "rclone":
-        f.canStream = true
-        f.precision = time.Second
-        f.useOCMtime = true
+        f.canStream = true;  f.precision = time.Second;  f.useOCMtime = true
     case "other":
         f.useStandardProps = true
     }
-
-    // 若不支持流式上传，则从 features 中移除 PutStream
-    if !f.canStream {
-        f.features.PutStream = nil
-    }
+    if !f.canStream { f.features.PutStream = nil }
     return nil
 }
 ```
@@ -121,22 +102,21 @@ func (f *Fs) setQuirks(ctx context.Context, vendor string) error {
 能力探测在 **Fs 初始化阶段** 触发，调用链如下：
 
 ```
-NewFs() [webdav.go#L440]
-  └─► f.setQuirks(ctx, opt.Vendor) [webdav.go#L533]
-        └─► 根据 vendor 设置各能力标志位
-        └─► 对于 nextcloud，调用 f.getChunksUploadURL() [chunking.go#L62]
-        └─► 对于 sharepoint，通过 odrvcookie 获取认证 cookies
-        └─► 移除不支持的 features（如 PutStream）
+NewFs() [backend/webdav/webdav.go#L440]
+  └─► f.setQuirks(ctx, opt.Vendor) [backend/webdav/webdav.go#L533]
+        ├─► 根据 vendor 设置各能力标志位
+        ├─► nextcloud: f.getChunksUploadURL() [backend/webdav/chunking.go#L62]
+        │      └─► 正则 ^(.*)/dav/files/([^/]+) 校验 URL 格式
+        ├─► sharepoint: odrvcookie.Cookies() 获取认证 Cookie + 12h 续期
+        └─► !canStream → 移除 features.PutStream
 ```
 
 ### 2.5 动态运行时探测点
 
 除了静态 vendor 映射外，以下情况会触发**运行时能力检查**：
 
-1. **Nextcloud 分块上传 URL 校验**：[getChunksUploadURL()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go#L62-L72) 用正则 `^(.*)/dav/files/([^/]+)` 校验 endpoint 是否为正确格式，否则报错。
-
+1. **Nextcloud 分块上传 URL 校验**：[getChunksUploadURL()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go#L62-L72) 用正则校验 endpoint 是否为 `/dav/files/USER` 格式，否则报错提示用户改用正确 URL。
 2. **流式上传动态判断**：[PutStream()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L984-L987) 只有 `canStream=true` 时才真正可用。
-
 3. **哈希支持动态返回**：[Hashes()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1301-L1311) 根据 `hasOCMD5` / `hasOCSHA1` / `hasMESHA1` 动态组合支持的哈希集。
 
 ---
@@ -151,21 +131,21 @@ NewFs() [webdav.go#L440]
 
 ```go
 type Prop struct {
-    Status       []string  `xml:"DAV: status"`          // propstat 的 HTTP 状态
+    Status       []string  `xml:"DAV: status"`          // propstat 的 HTTP 状态（多值）
     Name         string    `xml:"DAV: prop>displayname,omitempty"`
     Type         *xml.Name `xml:"DAV: prop>resourcetype>collection,omitempty"`
     IsCollection *string   `xml:"DAV: prop>iscollection,omitempty"` // Microsoft 扩展
     Size         int64     `xml:"DAV: prop>getcontentlength,omitempty"`
     Modified     Time      `xml:"DAV: prop>getlastmodified,omitempty"`
-    Checksums    []string  `xml:"prop>checksums>checksum,omitempty"`  // ownCloud: "SHA1:xxx MD5:xxx"
-    Permissions  string    `xml:"prop>permissions,omitempty"`        // ownCloud 权限
-    MESha1Hex    *string   `xml:"ME: prop>sha1hex,omitempty"`        // Fastmail SHA1
+    Checksums    []string  `xml:"prop>checksums>checksum,omitempty"`  // ownCloud
+    Permissions  string    `xml:"prop>permissions,omitempty"`        // ownCloud
+    MESha1Hex    *string   `xml:"ME: prop>sha1hex,omitempty"`        // Fastmail
 }
 ```
 
 **状态判定**：
-- [StatusOK()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go#L104-L116)：正则 `^HTTP/[\d.]+\s+2\d{2}` 判定是否任一 propstat 为 2xx
-- [Code()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go#L86-L99)：提取首个状态的 HTTP 状态码
+- [StatusOK()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go#L104-L116)：正则 `^HTTP/[\d.]+\s+2\d{2}` 判定是否**任意一个** propstat 为 2xx
+- [Code()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go#L86-L99)：提取**首个**状态的 HTTP 状态码
 
 ### 3.2 三种 PROPFIND 请求体
 
@@ -178,12 +158,9 @@ type Prop struct {
 <?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
   <d:prop>
-    <d:displayname />
-    <d:getlastmodified />
-    <d:getcontentlength />
-    <d:resourcetype />
-    <oc:checksums />
-    <oc:permissions />
+    <d:displayname />        <d:getlastmodified />
+    <d:getcontentlength />   <d:resourcetype />
+    <oc:checksums />         <oc:permissions />
   </d:prop>
 </d:propfind>
 ```
@@ -195,10 +172,8 @@ type Prop struct {
 <?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop>
-    <d:displayname/>
-    <d:getlastmodified/>
-    <d:getcontentlength/>
-    <d:resourcetype/>
+    <d:displayname/>         <d:getlastmodified/>
+    <d:getcontentlength/>    <d:resourcetype/>
   </d:prop>
 </d:propfind>
 ```
@@ -216,23 +191,22 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Pr
     opts := rest.Opts{
         Method: "PROPFIND",
         Path:   f.filePath(path),
-        ExtraHeaders: map[string]string{
-            "Depth": "0",         // 关键：Depth=0 只请求自身
-        },
+        ExtraHeaders: map[string]string{ "Depth": "0" },
         CheckRedirect: rest.PreserveMethodRedirectFn,
     }
-    // 根据能力标志选择 Body ...
+    // 根据 hasOCMD5/hasOCSHA1/useStandardProps 选择 Body ...
+
     var result api.Multistatus
     err = f.pacer.Call(func() (bool, error) {
         resp, err = f.srv.CallXML(ctx, &opts, nil, &result)
         return f.shouldRetry(ctx, resp, err)
     })
 
-    // 错误处理：
-    // 404 / 301 / 302 / 303 → 返回 fs.ErrorObjectNotFound
-    // 响应数 < 1 → ErrorObjectNotFound
-    // status 非 2xx 且非 425(Too Early) → ErrorObjectNotFound
-    // 是目录 → fs.ErrorIsDir
+    // 错误映射：
+    //   404 / 301 / 302 / 303  → fs.ErrorObjectNotFound
+    //   len(Responses) < 1      → ErrorObjectNotFound
+    //   !StatusOK() && Code!=425 → ErrorObjectNotFound
+    //   itemIsDir(item)==true   → fs.ErrorIsDir
 
     return &item.Props, nil
 }
@@ -243,27 +217,23 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Pr
 Object 的元数据采用 **懒加载（lazy loading）** 模式：
 
 ```go
-// readMetaData [webdav.go#L1415-L1424]
+// readMetaData [backend/webdav/webdav.go#L1415-L1424]
 func (o *Object) readMetaData(ctx context.Context) (err error) {
-    if o.hasMetaData {  // 已加载则直接返回
-        return nil
-    }
+    if o.hasMetaData { return nil }  // 已加载则直接返回
     info, err := o.fs.readMetaDataForPath(ctx, o.remote)
-    if err != nil {
-        return err
-    }
+    if err != nil { return err }
     return o.setMetaData(info)
 }
 
-// setMetaData [webdav.go#L1395-L1410]
+// setMetaData [backend/webdav/webdav.go#L1395-L1410]
 func (o *Object) setMetaData(info *api.Prop) (err error) {
     o.hasMetaData = true
     o.size = info.Size
     o.modTime = time.Time(info.Modified)
     if o.fs.hasOCMD5 || o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
-        hashes := info.Hashes()   // 解析 "SHA1:xxx MD5:xxx" 格式
+        hashes := info.Hashes()  // 解析 "SHA1:xxx MD5:xxx" 格式
         o.sha1 = hashes[hash.SHA1]
-        o.md5 = hashes[hash.MD5]
+        o.md5  = hashes[hash.MD5]
     }
     return nil
 }
@@ -280,35 +250,31 @@ func (f *Fs) listAll(ctx context.Context, dir string, directoriesOnly bool,
     filesOnly bool, depth string, fn listAllFn) (found bool, err error) {
 
     opts := rest.Opts{
-        Method: "PROPFIND",
-        Path:   f.dirPath(dir),
-        ExtraHeaders: map[string]string{
-            "Depth": depth,   // 默认 depth="1"（一级子项）
-        },
+        Method: "PROPFIND", Path: f.dirPath(dir),
+        ExtraHeaders: map[string]string{ "Depth": depth }, // 默认 depth="1"
+        AuthRedirect: f.opt.AuthRedirect,
     }
-    // 根据能力选择 Body ...
+    // Body 选择同上 ...
 
-    // 失败重试：对于 sharepoint 等需要 retryWithZeroDepth 的 vendor，
-    // 404 后降级到 depth="0" 重试：
-    if f.retryWithZeroDepth && depth != "0" {
-        return f.listAll(ctx, dir, directoriesOnly, filesOnly, "0", fn)
+    var result api.Multistatus
+    err = f.pacer.Call(/* CallXML + shouldRetry */)
+    if apiErr.StatusCode == 404 && f.retryWithZeroDepth && depth != "0" {
+        return f.listAll(ctx, dir, directoriesOnly, filesOnly, "0", fn) // 降级重试
     }
 
-    // 遍历 Multistatus 响应：
     for i := range result.Responses {
         item := &result.Responses[i]
-        isDir := itemIsDir(item)  // 判定是否为目录
+        isDir := itemIsDir(item)
 
-        // URL 路径处理：Join → 去前缀 → Decode → 标准化
+        // URL 标准化：Join → TrimPrefix → Encode 解码 → 转 remote
         remote := path.Join(dir, subPath)
+        if remote == dir { continue } // 跳过自身条目
 
-        // 跳过自身（列表中包含请求的目录本身）
-        if remote == dir { continue }
+        // 过滤：ExcludeShares(Permissions 含 'S')、ExcludeMounts(含 'M')
+        if f.opt.ExcludeShares && strings.Contains(item.Props.Permissions, "S") { continue }
+        if f.opt.ExcludeMounts && strings.Contains(item.Props.Permissions, "M") { continue }
 
-        // 过滤：ExcludeShares（含 'S' 权限）、ExcludeMounts（含 'M' 权限）
-        if f.opt.ExcludeShares && strings.Contains(item.Props.Permissions, "S") {
-            continue
-        }
+        if fn(remote, isDir, &item.Props) { found = true; break }
     }
 }
 ```
@@ -317,30 +283,30 @@ func (f *Fs) listAll(ctx context.Context, dir string, directoriesOnly bool,
 
 [itemIsDir()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L321-L341) 采用**双重判定**策略：
 
-1. **标准判定**：`resourcetype` 是否为 `DAV:collection`（主判据）
-2. **Microsoft 扩展**：若 `iscollection` 属性存在，解析其值为 `0/false` 或 `1/true`
-3. **兜底**：都不满足则视为**非目录（文件）**（遵循 WebDAV 规范：未知资源类型默认按非集合处理）
+1. **标准判定**（主判据）：`resourcetype` 元素的 XML name 是否为 `DAV:collection`
+2. **Microsoft 扩展判定**：若 `iscollection` 属性存在，解析其值为 `"0"/"false"` → 否，`"1"/"true"` → 是
+3. **兜底判定**：都不满足则视为**非目录（文件）**——遵循 WebDAV 规范：未知资源类型默认按非集合处理
 
 ### 3.7 时间解析：自定义 Time 类型
 
-[Time.UnmarshalXML()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go#L202-L235) 支持 5 种时间格式（依次尝试）：
+[Time.UnmarshalXML()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go#L202-L235) 支持 5 种时间格式（依次尝试，命中即停）：
 
-| 格式 | 示例 | 说明 |
-|------|------|------|
-| `time.RFC1123` | `Wed, 27 Sep 2017 14:28:34 GMT` | RFC 标准格式 |
-| `time.RFC1123Z` | `Fri, 05 Jan 2018 14:14:38 +0000` | mydrive.ch 使用 |
+| 格式常量 | 示例 | 来源 |
+|----------|------|------|
+| `time.RFC1123` | `Wed, 27 Sep 2017 14:28:34 GMT` | RFC 标准（主格式） |
+| `time.RFC1123Z` | `Fri, 05 Jan 2018 14:14:38 +0000` | mydrive.ch |
 | `time.UnixDate` | `Wed May 17 15:31:58 UTC 2017` | 某内部服务器 |
 | `noZerosRFC1123` | `Fri, 7 Sep 2018 08:49:58 GMT` | #2574 无前导零 |
-| `time.RFC3339` | `Wed, 31 Oct 2018 13:57:11 CET` | komfortcloud.de |
+| `time.RFC3339` | `2018-10-31T13:57:11+01:00` | komfortcloud.de |
 
-解析失败时使用 `Unix(0, 0)`（epoch）兜底，并只输出一次错误日志。
+解析失败时使用 `Unix(0, 0)`（epoch 1970-01-01）兜底，并通过 `sync.Once` 只输出一次错误日志。
 
 ### 3.8 校验和解析：Prop.Hashes()
 
 [Hashes()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/api/types.go#L118-L140) 支持两种格式：
 
-1. **ownCloud 格式**：`<oc:checksum>SHA1:f572d... MD5:b194... ADLER32:084b...</oc:checksum>`，以空格分隔，按前缀匹配 SHA1/MD5
-2. **Fastmail 格式**：直接从 `ME:sha1hex` 属性读取
+1. **ownCloud 格式**：`<oc:checksum>SHA1:f572d... MD5:b194... ADLER32:084b...</oc:checksum>` —— 以空格分隔，按 `sha1:` / `md5:` 前缀匹配
+2. **Fastmail 格式**：直接从 `ME:sha1hex` 属性的 `<string>` 指针读取
 
 ---
 
@@ -348,9 +314,27 @@ func (f *Fs) listAll(ctx context.Context, dir string, directoriesOnly bool,
 
 WebDAV 的上传/复制/移动涉及多种覆盖场景，rclone 通过不同机制处理。
 
-### 4.1 普通上传覆盖：PUT 方法
+### 4.1 Update() 的分发：三种上传路径的选择
 
-#### 4.1.1 核心方法：updateSimple()
+在 [Update()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1553-L1591) 中按优先级选择上传策略：
+
+```
+优先级 1：canTus == true（即 vendor = "infinitescale"）
+            └─► updateViaTus()  →  TUS 协议 (POST + PATCH)
+            │
+优先级 2：shouldUseChunkedUpload() == true
+            │   (canChunk && ChunkSize>0 && size>ChunkSize)
+            └─► updateChunked() →  Nextcloud 分块（MKCOL目录 + PUT分片 + MOVE合并）
+            │
+优先级 3：其余所有情况
+            └─► updateSimple()  →  标准 PUT（单请求）
+```
+
+---
+
+### 4.2 普通上传覆盖：PUT 方法
+
+#### 4.2.1 核心方法：updateSimple()
 
 [updateSimple()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1616-L1652) 是最基础的 PUT 上传：
 
@@ -361,63 +345,61 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader,
     options ...fs.OpenOption) (err error) {
 
     opts := rest.Opts{
-        Method:        "PUT",
-        Path:          filePath,
-        GetBody:       getBody,
-        Body:          body,
-        ContentLength: &size,
-        ContentType:   contentType,
-        ExtraHeaders:  extraHeaders,  // 包含 X-OC-Mtime、OC-Checksum
-        RootURL:       rootURL,
+        Method: "PUT", Path: filePath,
+        GetBody: getBody, Body: body,
+        ContentLength: &size, ContentType: contentType,
+        ExtraHeaders: extraHeaders,  // X-OC-Mtime、OC-Checksum
+        RootURL: rootURL,
     }
 
-    // 使用 CallNoRetry，避免 HTTP 层的自动重试
     err = o.fs.pacer.CallNoRetry(func() (bool, error) {
         resp, err = o.fs.srv.Call(ctx, &opts)
         return o.fs.shouldRetry(ctx, resp, err)
     })
 
     if err != nil {
-        time.Sleep(1 * time.Second)  // 等服务端整理内部状态
-        _ = o.Remove(ctx)            // 清理可能的部分上传产物
+        time.Sleep(1 * time.Second)   // 等服务端整理内部状态
+        _ = o.Remove(ctx)             // 清理可能的部分上传（忽略删除错误）
         return err
     }
     return nil
 }
 ```
 
-#### 4.1.2 PUT 的覆盖语义：隐式覆盖
+#### 4.2.2 PUT 的覆盖语义：隐式覆盖
 
 WebDAV PUT 方法**默认会覆盖已存在的目标资源**（RFC 4918 §7.6）。rclone 的实现中**没有设置 `If-None-Match` 或 `Overwrite` 头**，因此：
 
 - **目标不存在** → 创建新文件（201 Created）
-- **目标已存在** → **覆盖写入**（200 OK / 204 No Content）
+- **目标已存在** → **无条件覆盖写入**（200 OK / 204 No Content）
 
-> ⚠️ rclone 不做"仅当不存在时创建"的原子保护，覆盖由上层业务（如 sync 的 check 逻辑）控制。
+> ⚠️ rclone 不做"仅当不存在时创建"的原子保护，覆盖判定由上层业务（如 `rclone sync` 的 check + 比较逻辑）控制。
 
-#### 4.1.3 上传的 ModTime 和 Checksum 传递
+#### 4.2.3 上传的 ModTime 和 Checksum 传递
 
 通过 [extraHeaders()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1593-L1614) 设置：
 
-| Header | 条件 | 值 |
-|--------|------|----|
-| `X-OC-Mtime` | `useOCMtime=true` | `src.ModTime().Unix()`（Unix 时间戳） |
-| `OC-Checksum` | `hasOCSHA1=true` 且有 SHA1 | `SHA1:<hex>` |
-| `OC-Checksum` | `hasOCMD5=true` 且无 SHA1 但有 MD5 | `MD5:<hex>` |
+| Header | 启用条件 | 值格式 |
+|--------|----------|--------|
+| `X-OC-Mtime` | `useOCMtime=true` | `src.ModTime().Unix()`（Unix 秒时间戳） |
+| `OC-Checksum` | `hasOCSHA1=true` 且能获取 SHA1 | `SHA1:<40位hex>` |
+| `OC-Checksum` | `hasOCMD5=true` 且无 SHA1 但能获取 MD5 | `MD5:<32位hex>` |
 
-### 4.2 COPY/MOVE 的覆盖语义：Overwrite 头
+---
 
-#### 4.2.1 copyOrMove() 的处理
+### 4.3 COPY/MOVE 的覆盖语义：Overwrite 头
+
+#### 4.3.1 copyOrMove() 的处理
 
 在 [copyOrMove()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1154-L1206) 中：
 
 ```go
 opts := rest.Opts{
-    Method:     method,   // "COPY" 或 "MOVE"
-    Path:       srcObj.filePath(),
+    Method: method,  // "COPY" 或 "MOVE"
+    Path:   srcObj.filePath(),
     ExtraHeaders: map[string]string{
         "Destination": destinationURL.String(),
-        "Overwrite":   "T",           // ← 关键：强制允许覆盖
+        "Overwrite":   "T",             // ← 强制允许覆盖
     },
 }
 if f.useOCMtime {
@@ -425,39 +407,41 @@ if f.useOCMtime {
 }
 ```
 
-**Overwrite 头的规范值**（RFC 4918 §10.6）：
+**Overwrite 头规范值**（RFC 4918 §10.6）：
 - `"T"` / `"t"` → **允许覆盖**已存在的目标资源
-- `"F"` / `"f"` → **不允许覆盖**，若目标存在返回 412 Precondition Failed
+- `"F"` / `"f"` → **禁止覆盖**，若目标存在则返回 412 Precondition Failed
 
 rclone 一律使用 `"T"`，即 **COPY/MOVE 始终覆盖目标**。
 
-#### 4.2.2 ModTime 二次确认逻辑
+#### 4.3.2 ModTime 二次确认逻辑
 
-COPY/MOVE 完成后，如果：
-1. `useOCMtime=true`（使用了 `X-OC-Mtime` 头）
-2. 响应头 `X-OC-Mtime` **不是** `"accepted"`（服务端未确认接受 mtime）
+COPY/MOVE 完成后，若以下 4 个条件同时满足：
+1. `useOCMtime=true`（上传时带了 `X-OC-Mtime` 头）
+2. 响应头 `X-OC-Mtime` **不是** `"accepted"`（服务端未显式确认接受 mtime）
 3. `propsetMtime=true`（支持 PROPPATCH 设置 mtime）
-4. 实际 ModTime 与预期不相等
+4. 重读后实际 ModTime 与预期不相等
 
 则通过 `dstObj.SetModTime()` 发起 **PROPPATCH** 二次修正 mtime。
 
-### 4.3 Nextcloud 分块上传的覆盖
+---
 
-在 [updateChunked()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go#L78-L104) 中，分三步：
+### 4.4 Nextcloud 分块上传的覆盖
 
-#### 步骤 1：创建上传目录
+在 [updateChunked()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go#L78-L104) 中分三步：
+
+#### 步骤 1：创建上传目录（清理残留）
 
 [createChunksUploadDirectory()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go#L144-L169)：
-- 根据目标文件路径做 MD5，生成 `rclone-chunked-upload-<md5>` 目录名
-- **先 purge 同名目录**（清理上次未成功的残留）
-- 再 `MKCOL` 创建新目录
+- 用 `md5(filePath())` 生成 `rclone-chunked-upload-<md5hex>` 目录名
+- **先 DELETE purge 同名目录**（清理上次未成功的残留）→ 404 被视为 OK
+- 再 `MKCOL` 创建新的临时上传目录
 
 #### 步骤 2：上传数据块
 
 [uploadChunks()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go#L106-L142)：
-- 按 `ChunkSize` 分块，文件命名为 `{uploadDir}/{offset:015d}-{endOffset:015d}`
-- 每个 chunk 使用 `updateSimple()` 的 PUT 方法，上传到 `chunksUploadURL`（独立 URL，如 `/dav/uploads/<user>/`）
-- 使用 `RepeatableLimitReaderBuffer` 支持 HTTP/2 重试（通过 `GetBody`）
+- 按 `ChunkSize`（默认 10 MiB）顺序分块，命名 `{uploadDir}/{offset:015d}-{endOffset:015d}`
+- 每个 chunk 用 `updateSimple()` PUT 到独立的 `chunksUploadURL`（如 `/dav/uploads/<user>/`）
+- 用 `RepeatableLimitReaderBuffer` + `GetBody()` 支持 HTTP/2 GOAWAY 重试
 
 #### 步骤 3：MOVE 合并（关键覆盖点）
 
@@ -465,81 +449,243 @@ COPY/MOVE 完成后，如果：
 
 ```go
 opts := rest.Opts{
-    Method:     "MOVE",
-    Path:       path.Join(uploadDir, ".file"),  // 源：虚拟的 .file
-    ExtraHeaders: map[string]string{
-        "Destination": destinationURL.String(),  // 目标：真实路径
-        // X-OC-Mtime 和 OC-Checksum 通过 extraHeaders 注入
-    },
-    RootURL:    o.fs.chunksUploadURL,
+    Method: "MOVE",
+    Path:   path.Join(uploadDir, ".file"),  // 源：虚拟的 .file
+    RootURL: o.fs.chunksUploadURL,
 }
-
-// 特殊重试逻辑：423 LOCKED → 退避等待服务端合并
-// 423 后收到 404 → 视为合并成功（wasLocked 标记）
+opts.ExtraHeaders["Destination"] = destinationURL.String()  // 目标：真实文件路径
+// X-OC-Mtime 和 OC-Checksum 通过 extraHeaders() 注入
+// ⚠️ 未显式设置 Overwrite 头！
 ```
 
-**关键点**：
-- 最终合并使用 MOVE 方法，**隐式覆盖目标**（Nextcloud 的 chunking 协议中 MOVE 始终覆盖）
-- 未显式设置 `Overwrite` 头，依赖 Nextcloud 服务端语义
-- 423 LOCKED 是合并中的正常状态，按指数退避（5s, 10s, 20s...）重试
+**特殊重试**（`shouldRetryChunkMerge()`）：
+- 收到 **423 LOCKED**：标记 `wasLocked=true`，指数退避（5s→10s→20s…）等待合并
+- 423 后再收到 **404**：视为合并成功（Nextcloud 合并完成后删除虚拟 .file）
 
-### 4.4 TUS 协议的覆盖
+**覆盖语义结论**：
+- MOVE 的 Destination 就是最终目标路径
+- 代码中**未显式设置 `Overwrite: T`**，但 Nextcloud 的 chunking 协议中，此 MOVE 操作**默认会覆盖目标**
+- 如果目标已存在且非空，Nextcloud 服务端会以合并结果覆盖原文件
 
-ownCloud Infinite Scale 使用 [TUS 协议](https://tus.io/protocols/resumable-upload)：
+---
+
+### 4.5 TUS 协议（ownCloud Infinite Scale）—— 代码级深度分析
+
+#### 4.5.1 TUS 上传入口：updateViaTus()
 
 [updateViaTus()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus.go#L20-L43)：
-1. **POST 创建上传会话**：`POST /dav/files/<user>/<dir>/`，带 `Upload-Length`、`Upload-Metadata`、`Tus-Resumable`
-2. 从响应 `Location` 头获得上传 URL
-3. **PATCH 上传数据块**（tus-uploader 实现），支持断点续传
-4. 服务端在 PATCH 完成后自动组装为最终文件
 
-**TUS 的覆盖语义**：创建会话时 TUS 协议本身不定义覆盖机制，由服务端实现决定。在 OCIS 中，**重复上传同一路径会被视为新文件覆盖旧文件**。
+```go
+func (o *Object) updateViaTus(ctx context.Context, in io.Reader, contentType string,
+    src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 
-### 4.5 SetModTime 的独立覆盖
+    fn := filepath.Base(src.Remote())
+    metadata := map[string]string{
+        "filename": fn,
+        "mtime":    strconv.FormatInt(src.ModTime(ctx).Unix(), 10),
+        "filetype": contentType,
+    }
 
-通过 [SetModTime()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1465-L1518) 可独立修改已有文件的 mtime：
+    // ⚠️ Fingerprint 硬编码为空字符串！注释明确说未实现断点续传
+    // "Fingerprint is used to identify the upload when resuming. That is not yet implemented"
+    fingerprint := ""
+
+    upload := NewUpload(in, src.Size(), metadata, fingerprint)
+    uploader, err := o.CreateUploader(ctx, upload, options...)
+    if err == nil {
+        err = uploader.Upload(ctx, options...)  // 主循环调度
+    }
+    return err
+}
+```
+
+#### 4.5.2 步骤 1：创建上传会话 — CreateUploader()
+
+[CreateUploader()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus.go#L61-L108)：
+
+```go
+func (o *Object) CreateUploader(ctx context.Context, u *Upload, options ...fs.OpenOption) (*Uploader, error) {
+    // 从目标文件路径中切出目录部分（TUS 会话创建在目录上）
+    p := o.filePath()
+    dir, _ := filepath.Split(p)
+    if dir == "" { dir = "/" }
+
+    // === 关键检查 ===
+    // ❌ 这里没有调用 NewObject() / readMetaDataForPath()
+    // ❌ 没有检查目标文件是否已存在
+    // ❌ 没有设置 If-None-Match 头
+    // ❌ 没有设置 Overwrite 头（TUS 协议也没有）
+
+    l := int64(0)
+    opts := rest.Opts{
+        Method: "POST", Path: dir, RootURL: o.fs.endpointURL,
+        ContentLength: &l, NoResponse: true,
+        ExtraHeaders: o.extraHeaders(ctx, o),  // X-OC-Mtime + OC-Checksum（由 Object 复用）
+        Options: options,
+    }
+    opts.ExtraHeaders["Upload-Length"]   = strconv.FormatInt(u.size, 10)
+    opts.ExtraHeaders["Upload-Metadata"] = u.EncodedMetadata()  // filename/mtime/filetype base64
+    opts.ExtraHeaders["Tus-Resumable"]   = "1.0.0"
+
+    var tusLocation string
+    err := o.fs.pacer.CallNoRetry(func() (bool, error) {
+        res, err := o.fs.srv.Call(ctx, &opts)
+        return o.fs.getTusLocationOrRetry(ctx, res, err)  // 201 → 读 Location 头
+    })
+    // upload URL 格式：/dav/uploads/<user>/<upload-uuid>
+
+    // ⚠️ offset 硬编码为 0！不从 HEAD 查询已有进度
+    uploader := NewUploader(o.fs, tusLocation, u, 0)
+    return uploader, nil
+}
+```
+
+**同名覆盖的代码级结论（创建阶段）**：
+- **不做存在性预检**：创建会话前不会 PROPFIND 检查目标路径是否已有同名文件
+- **不设条件头**：POST 请求中没有 `If-None-Match` 等防止覆盖的条件头
+- **文件名只在 Metadata 中传递**：`Upload-Metadata: filename <base64(fn)>`，服务端据此决定最终路径
+- **覆盖决策权完全在 OCIS 服务端**：OCIS 在上传完成（PATCH 全部写完后）组装文件时，如果检测到同名冲突，默认策略为**覆盖写入**——与 rclone 其他上传方式保持一致
+
+#### 4.5.3 步骤 2：数据上传主循环 — Uploader.Upload()
+
+[Upload()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-uploader.go#L107-L122) + [UploadChunk()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-uploader.go#L124-L162)：
+
+```go
+func (u *Uploader) Upload(ctx context.Context, options ...fs.OpenOption) error {
+    cnt := 1
+    // ⚠️ 循环条件：从 u.offset 开始，但 CreateUploader 中 offset 固定为 0
+    for u.offset < u.upload.size && !u.aborted {
+        err := u.UploadChunk(ctx, cnt, options...)
+        cnt++
+        if err != nil { return err }
+    }
+    return nil
+}
+
+func (u *Uploader) UploadChunk(ctx context.Context, cnt int, options ...fs.OpenOption) error {
+    chunkSize := u.fs.opt.ChunkSize  // infinitescale 固定为 10 MiB
+    data := make([]byte, chunkSize)
+
+    // ⚠️ 从 u.offset 开始 Seek 读取 —— 如果能从服务端 HEAD 拿到 offset，这里就能断点续传
+    _, err := u.upload.stream.Seek(u.offset, 0)
+    size, err := u.upload.stream.Read(data)
+    body := bytes.NewBuffer(data[:size])
+
+    // PATCH 到临时的 tusLocation
+    newOffset, err := u.uploadChunk(ctx, body, int64(size), u.offset, options...)
+
+    u.offset = newOffset  // 从响应的 Upload-Offset 头更新（重要！见下）
+    u.upload.updateProgress(u.offset)
+    return nil
+}
+```
+
+#### 4.5.4 步骤 3：单 chunk PATCH —— uploadChunk()
+
+[uploadChunk()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-uploader.go#L57-L105)：
+
+```go
+func (u *Uploader) uploadChunk(ctx context.Context, body io.Reader, size int64,
+    offset int64, options ...fs.OpenOption) (int64, error) {
+
+    method := "PATCH"
+    extraHeaders := map[string]string{}
+    extraHeaders["Upload-Offset"] = strconv.FormatInt(offset, 10)  // 客户端声明 offset
+    extraHeaders["Tus-Resumable"] = "1.0.0"
+    extraHeaders["filetype"] = u.upload.Metadata["filetype"]
+    if u.overridePatchMethod {
+        method = "POST"
+        extraHeaders["X-HTTP-Method-Override"] = "PATCH"  // 兼容不支持 PATCH 的网关
+    }
+
+    opts := rest.Opts{
+        Method: method, ContentType: "application/offset+octet-stream",
+        ContentLength: &size, Body: body, /* ... */
+    }
+
+    var newOffset int64
+    err = u.fs.pacer.CallNoRetry(func() (bool, error) {
+        res, err := u.fs.srv.Call(ctx, &opts)
+        // shouldRetryChunk() 关键逻辑：
+        //   204 → 从响应头 Upload-Offset 读 newOffset，视为成功
+        //   409 → ErrOffsetMismatch（客户端声明的 offset 与服务端不符）
+        //   412 → ErrVersionMismatch
+        //   413 → ErrLargeUpload
+        return u.fs.shouldRetryChunk(ctx, res, err, &newOffset)
+    })
+    return newOffset, err
+}
+```
+
+#### 4.5.5 ⚠️ TUS 断点续传：代码级结论 —— **实际上未实现！**
+
+对照 TUS 协议规范（[tus.io/protocols/resumable-upload](https://tus.io/protocols/resumable-upload)），断点续传需要 5 个核心要素。rclone 的实现状态如下：
+
+| TUS 断点续传要素 | 协议要求 | rclone 实现状态 | 代码证据 |
+|------------------|----------|-----------------|----------|
+| ① Fingerprint 生成 | 为上传创建唯一标识，用于下次恢复时查找 | ❌ **未实现**，硬编码空串 | `tus.go#L29-L30` 注释：*"That is not yet implemented"*；`fingerprint := ""` |
+| ② 持久化 Upload URL | 将 `(fingerprint → tusLocation URL + 当前 offset)` 持久化到本地存储 | ❌ **无持久化代码** | `CreateUploader` 中只把 URL 放入内存变量，返回后随 GC 丢失；tus-errors.go 有 `ErrNilStore` 但从未使用 |
+| ③ HEAD 请求查询当前 Offset | 恢复时对旧 tusLocation 发 HEAD，读 `Upload-Offset` 头 | ❌ **无 HEAD 请求实现** | 代码中无任何 HEAD 方法调用；`shouldRetryChunk` 只处理 204/409/412/413 |
+| ④ Resume 分支入口 | 检测到本地有未完成的 fingerprint 时走恢复路径 | ❌ **无分支判断** | `CreateUploader` 顶部注释掉的代码 `// if c.Config.Resume ... ErrFingerprintNotSet` 显示曾计划但未落地 |
+| ⑤ 失败后从 Upload-Offset 重试 | PATCH 失败后下次能从服务端确认的 offset 继续 | ⚠️ **仅有单次 chunk 内的软校验** | `uploadChunk` 成功时从响应头 `Upload-Offset` 更新 `newOffset`，这是**单 chunk 内的一致性确认**，不是跨进程的断点续传 |
+
+**最终结论**：rclone 的 TUS 实现只完成了**协议的基础上传骨架**（POST 创建 + PATCH 分块 + Upload-Offset 校验），**断点续传功能在代码层面未实现**——`fingerprint` 为空、无持久化、无 HEAD 查询、无 Resume 分支。每次 `Update()` 调用 TUS 都是**从 offset=0 重新创建新会话**。如果上传中途崩溃，之前的数据块在 OCIS 服务端会作为垃圾回收（具体取决于服务端策略），无法恢复。
+
+---
+
+### 4.6 SetModTime 的独立覆盖
+
+通过 [SetModTime()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1465-L1518) 可独立修改已有文件的 mtime，不影响文件内容：
 
 ```go
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
     if o.fs.propsetMtime {
-        // 构造 PROPPATCH Body：
-        // 有校验和 → owncloudPropsetWithChecksum（同时写入 mtime 和 checksums）
-        // 无校验和 → owncloudPropset（只写 mtime）
+        checksums := /* SHA1:<hex> 或 MD5:<hex> 或空 */
 
-        opts := rest.Opts{
-            Method:     "PROPPATCH",
-            Path:       o.filePath(),
-            NoRedirect: true,
-            Body:       strings.NewReader(fmt.Sprintf(...)),
+        bodyTpl := owncloudPropset                // 只写 lastmodified
+        if checksums != "" {
+            bodyTpl = owncloudPropsetWithChecksum // 同时写 lastmodified + oc:checksums
         }
 
-        // 判定成功：
-        // 1. 响应 Multistatus 中首个且状态 OK → 直接缓存
-        // 2. 否则通过 NewObject() 重读确认，匹配则也算成功
+        opts := rest.Opts{
+            Method: "PROPPATCH", Path: o.filePath(), NoRedirect: true,
+            Body: strings.NewReader(fmt.Sprintf(bodyTpl, modTime.Unix(), checksums)),
+        }
+
+        var result api.Multistatus
+        err := o.fs.pacer.Call(/* CallXML + shouldRetry */)
+
+        // 三阶段判定成功：
+        // 1. Multistatus 中恰好 1 条响应且 StatusOK() → 直接更新缓存，返回成功
+        // 2. 否则 NewObject() 重读真实 mtime，若与预期相等 → 也算成功（服务端格式差异）
         // 3. 仍不匹配 → 返回 fs.ErrorCantSetModTime
     }
+    return fs.ErrorCantSetModTime
 }
 ```
 
-### 4.6 覆盖语义总览表
+---
 
-| 操作 | HTTP 方法 | 覆盖控制 | 行为 |
-|------|-----------|----------|------|
-| 普通上传 | PUT | 无（默认覆盖） | 始终覆盖已存在目标 |
-| 流式上传 | PUT | 无（默认覆盖） | 始终覆盖 |
-| 服务端 COPY | COPY | `Overwrite: T` | 强制覆盖 |
-| 服务端 MOVE | MOVE | `Overwrite: T` | 强制覆盖 |
-| 目录移动 | MOVE | `Overwrite: T` | 强制覆盖（但先检查目标不存在） |
-| Nextcloud 分块合并 | MOVE | 依赖服务端默认 | 隐式覆盖 |
-| TUS 上传 | POST + PATCH | 依赖服务端实现 | 隐式覆盖 |
-| ModTime 修正 | PROPPATCH | N/A | 只修改属性不覆盖内容 |
+### 4.7 覆盖语义总览表
 
-### 4.7 失败清理策略
+| 操作 | HTTP 方法 | 覆盖控制机制 | 行为 |
+|------|-----------|--------------|------|
+| 普通上传 | PUT | 无控制头，依赖 PUT 默认语义 | **始终覆盖**已存在目标 |
+| 流式上传 | PUT | 同上 | **始终覆盖** |
+| 服务端 COPY 文件 | COPY | `Overwrite: T` 头 | 强制覆盖 |
+| 服务端 MOVE 文件 | MOVE | `Overwrite: T` 头 | 强制覆盖 |
+| 服务端 MOVE 目录 | MOVE | `Overwrite: T` + 预检 DirNotEmpty | 强制覆盖（但先检查目标不存在） |
+| Nextcloud 分块合并 | MOVE | 未显式设 Overwrite，依赖服务端默认 | **隐式覆盖**目标路径 |
+| TUS 上传（infinitescale） | POST + PATCH | 不做预检，无 If-None-Match，由服务端完成时决定 | **隐式覆盖**（OCIS 默认策略） |
+| SetModTime 修正 | PROPPATCH | N/A | 只修改 DAV 属性，不覆盖文件内容 |
 
-在 `updateSimple()` 中，上传失败后：
-1. 等待 1 秒给服务端整理状态
-2. 调用 `o.Remove(ctx)` 删除可能的部分上传产物
-3. 删除失败被**静默忽略**（`_ = o.Remove(ctx)`）
+### 4.8 失败清理策略
+
+| 上传方式 | 失败清理行为 | 代码位置 |
+|----------|-------------|----------|
+| 标准 PUT (`updateSimple`) | Sleep 1s → `Remove()` 尝试删除可能的部分上传 → 忽略删除错误 | [backend/webdav/webdav.go#L1646-L1648](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1646-L1648) |
+| Nextcloud 分块 | 任一步骤失败直接返回；旧目录残留由**下次同路径上传前 purge** 清理（`createChunksUploadDirectory` 先 DELETE） | [backend/webdav/chunking.go#L150-L153](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/chunking.go#L150-L153) |
+| TUS 上传 | **无失败清理**（已知缺陷） | `tus-uploader.go#L99-L102` 有 FIXME 注释提及删除问题但未实现；服务端 TUS 会话由 OCIS 自行 GC |
 
 ---
 
@@ -549,26 +695,40 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 
 | 优点 | 缺点 |
 |------|------|
-| 配置简单，用户只需选 vendor | 无法自动发现能力，依赖用户正确配置 |
-| 避免运行时探测的不确定性 | 新 vendor 需要代码改动 |
-| 各 vendor 的 quirks 集中管理，可读性好 | 静态映射无法适配同 vendor 不同版本的差异 |
+| 用户配置简单，只需选择 vendor | **无法自动发现能力**，依赖用户正确配置 |
+| 避免运行时 OPTIONS/PROPFIND 探测的不确定性 | 新 vendor 接入需要改代码发版 |
+| 各 vendor 的 quirks 集中管理，可维护性好 | 静态映射无法适配同 vendor 不同版本的差异（如 ownCloud 9 vs 10 vs infinitescale） |
 
 ### 5.2 属性读取的弹性设计
 
-- **XML 反序列化的宽松性**：Prop 中所有字段带 `omitempty`，不识别的属性被忽略
-- **多时间格式兜底**：5 种格式依次尝试，最后回落到 epoch
-- **双路径目录判定**：标准 `resourcetype` + Microsoft `iscollection` 扩展
-- **懒加载缓存**：`hasMetaData` 标志避免重复 PROPFIND
+- **XML 反序列化的宽松性**：所有字段带 `omitempty`，不识别的属性静默忽略
+- **多时间格式兜底链**：5 种格式依次尝试，最终回落到 epoch（`sync.Once` 控制只报一次错）
+- **双路径目录判定**：标准 `DAV:resourcetype` 为主，Microsoft `iscollection` 扩展为辅
+- **懒加载缓存**：`hasMetaData` 布尔 + `readMetaData()` 统一入口，避免 Size/ModTime/Hash 各自发起 PROPFIND
+- **Sharepoint 深度降级**：`retryWithZeroDepth` 404 后降级到 `Depth=0` 重试
 
-### 5.3 上传的多种策略选择
+### 5.3 上传策略的渐进式选择
 
-在 [Update()](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/webdav.go#L1553-L1591) 中按优先级选择：
+在 `Update()` 中按 **TUS → 分块 → 标准 PUT** 的优先级选择：
 
 ```
-1. canTus → TUS 协议上传（infinitescale）
-   ↓
-2. shouldUseChunkedUpload(canChunk && ChunkSize>0 && size>ChunkSize)
-   → Nextcloud 分块上传
-   ↓
-3. updateSimple() → 标准 PUT（其余所有情况）
+条件命中（由高到低）：
+  canTus=true ............................................. →  TUS 协议
+  └─ vendor=infinitescale
+
+  canChunk && ChunkSize>0 && size>ChunkSize ............... →  Nextcloud 分块
+  └─ vendor=nextcloud
+
+  其他所有情况（包括 nextcloud 小文件、所有其他 vendor）..... →  标准 PUT
+     └─ fastmail / owncloud / sharepoint / rclone / other
 ```
+
+### 5.4 TUS 实现的已知局限清单
+
+| 局限 | 影响 |
+|------|------|
+| **无断点续传** | 大文件上传中断后必须从头开始 |
+| **无失败清理** | OCIS 服务端产生孤儿会话（依赖其自身 GC） |
+| PATCH 未设置 OC-Checksum | [tus-uploader.go#L66](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-uploader.go#L66) 有 FIXME；OC-Checksum 只在 POST 创建时设置，PATCH 数据块无法被校验 |
+| `GetBody` 未实现 | [tus-uploader.go#L79](file:///d:/fz/0601-2/solo-dogfeeding/code/47-rclone/backend/webdav/tus-uploader.go#L79) 有 FIXME；HTTP/2 GOAWAY 时无法重试 PATCH |
+| offset 读取用 `strconv.ParseInt` 无错误处理 | 204 响应无 `Upload-Offset` 头时 newOffset 保持 0，可能导致下一轮循环写 0 |

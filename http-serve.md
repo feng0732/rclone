@@ -131,18 +131,19 @@ type Directory struct {
 
 ## 3. 请求鉴权机制
 
-### 3.1 认证初始化流程
+### 3.1 initAuth 初始化：三种场景的边界
 
 认证中间件在 `Server.initAuth()` 函数 [server.go#L431-L464](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/server.go#L431-L464) 中初始化。
 
-**关键逻辑**：
+核心逻辑由一个关键变量 `altUsernameEnabled` 控制，其含义是"是否启用了备选用户名来源"，决定 `UserFromHeader` 和 `CertificateUser` 的行为方式：
 
 ```go
 func (s *Server) initAuth() {
     s.usingAuth = false
+    // 关键判断：仅当没有 htpasswd 和 basic user 时，才可能启用备选用户名
     altUsernameEnabled := s.auth.HtPasswd == "" && s.auth.BasicUser == ""
 
-    // 第一阶段：备选用户名来源（仅当未配置 htpasswd 和 basic user 时）
+    // ── 第一阶段：备选用户名来源 ──
     if altUsernameEnabled {
         s.usingAuth = true
         if s.auth.UserFromHeader != "" {
@@ -150,103 +151,198 @@ func (s *Server) initAuth() {
         } else if s.tlsConfig != nil && s.tlsConfig.ClientAuth != tls.NoClientCert {
             s.mux.Use(MiddlewareAuthCertificateUser())
         } else {
+            // 既无 header 也无证书 → 无法启用备选用户名
             s.usingAuth = false
             altUsernameEnabled = false
         }
     }
 
-    // 第二阶段：主认证方式
+    // ── 第二阶段：主认证方式 ──
     if s.auth.CustomAuthFn != nil {
         s.usingAuth = true
+        // altUsernameEnabled 决定了 CustomAuth 是否从 context 取用户名
         s.mux.Use(MiddlewareAuthCustom(s.auth.CustomAuthFn, s.auth.Realm, altUsernameEnabled))
         return
     }
-    // ... htpasswd 和 basic user 认证
+
+    if s.auth.HtPasswd != "" {
+        s.usingAuth = true
+        s.mux.Use(MiddlewareAuthHtpasswd(s.auth.HtPasswd, s.auth.Realm))
+        return
+    }
+
+    if s.auth.BasicUser != "" {
+        s.usingAuth = true
+        s.mux.Use(MiddlewareAuthBasic(s.auth.BasicUser, s.auth.BasicPass, s.auth.Realm, s.auth.Salt))
+        return
+    }
 }
 ```
 
-**优先级判定**：
-1. `CustomAuthFn` > `Htpasswd` > `BasicUser` （三者互斥）
-2. `UserFromHeader` 和 `CertificateUser` 作为**备选用户名来源**，不独立使用，必须配合 `CustomAuthFn`
+根据配置组合，产生**三种截然不同的认证场景**：
 
-### 3.2 请求头/证书认证与自定义认证的衔接
+---
 
-这是最关键的衔接逻辑。当同时配置了 `--auth-proxy`（启用 CustomAuthFn）和 `--user-from-header`（或客户端证书）时，认证流程如下：
+### 3.2 场景一：请求头/证书认证独立工作
+
+**触发条件**：配置了 `--user-from-header` 或客户端证书，**但没有**配置 `--auth-proxy`、`--htpasswd`、`--user`/`--pass`
+
+**initAuth 执行路径**：
+
+```
+altUsernameEnabled = true （因为 HtPasswd=="" && BasicUser==""）
+    ↓
+注册 MiddlewareAuthGetUserFromHeader 或 MiddlewareAuthCertificateUser
+    ↓
+altUsernameEnabled 保持 true
+    ↓
+CustomAuthFn == nil → 不注册 MiddlewareAuthCustom
+HtPasswd == ""      → 不注册 MiddlewareAuthHtpasswd
+BasicUser == ""     → 不注册 MiddlewareAuthBasic
+    ↓
+最终中间件链：仅 UserFromHeader 或 CertificateUser
+```
+
+**中间件行为**：
+
+| 中间件 | 注入 context | 验证方式 | 拒绝行为 |
+|--------|-------------|---------|---------|
+| `MiddlewareAuthGetUserFromHeader` [middleware.go#L159-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L159-L175) | `ctxKeyUser = username` | HTTP 头存在且正则匹配 | `401 Unauthorized` |
+| `MiddlewareAuthCertificateUser` [middleware.go#L78-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L78-L94) | `ctxKeyUser = CN` | 客户端证书含非空 CN | `401 Unauthorized` |
+
+**独立工作证据**：
+
+1. 这两个中间件自身会拦截未认证请求（返回 401），无需下游认证
+2. `IsAuthenticated` [context.go#L29-L37](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/context.go#L29-L37) 检查 `ctxKeyUser` 或 `ctxKeyAuth` 任一非空即为已认证
+3. 业务层通过 `CtxGetUser(ctx)` 获取用户名即可，无需 `ctxKeyAuth`
+
+**实际用途**：反向代理场景，认证由前置代理（如 nginx auth_request）完成，rclone 只需信任代理传入的用户名。
+
+---
+
+### 3.3 场景二：请求头/证书认证为自定义认证提供用户名
+
+**触发条件**：同时配置了 `--user-from-header`（或客户端证书）和 `--auth-proxy`
+
+**initAuth 执行路径**：
+
+```
+altUsernameEnabled = true （因为 HtPasswd=="" && BasicUser==""）
+    ↓
+注册 MiddlewareAuthGetUserFromHeader 或 MiddlewareAuthCertificateUser
+    ↓
+altUsernameEnabled 保持 true
+    ↓
+CustomAuthFn != nil → 注册 MiddlewareAuthCustom(fn, realm, altUsernameEnabled=true)
+return （提前返回，不检查 Htpasswd/BasicUser）
+    ↓
+最终中间件链：UserFromHeader/CertificateUser → MiddlewareAuthCustom
+```
+
+**中间件衔接流程**：
 
 ```
 HTTP 请求
     ↓
 [MiddlewareAuthGetUserFromHeader 或 MiddlewareAuthCertificateUser]
-    │  职责：仅提取用户名
-    │  - 从 HTTP 头（如 X-Remote-User）提取用户名
-    │  - 或从客户端证书 CN 提取用户名
+    │  职责：提取用户名，注入 ctxKeyUser
+    │  - 从 HTTP 头或证书 CN 提取
     │  - 验证用户名格式
-    ↓  通过 ctxKeyUser 注入 context
+    │  - 失败则返回 401（请求在此被拦截，不会到达 CustomAuth）
+    ↓  成功后 next.ServeHTTP()
     ↓
-[MiddlewareAuthCustom]  ← altUsernameEnabled = true
-    │  核心衔接逻辑 [middleware.go#L128-L131]：
-    │  1. 首先尝试从 Basic Auth 头解析 user/pass
-    │  2. 如果解析失败（!ok）且 userFromContext=true
-    │     → 从 context 的 ctxKeyUser 获取用户名
-    │  3. pass 为空字符串（因为头/证书认证不提供密码）
-    ↓
-调用自定义认证函数 fn(user, pass="")
+[MiddlewareAuthCustom(fn, realm, userFromContext=true)]
+    │  核心衔接 [middleware.go#L128-L131]：
     │
-    ↓  （在 HTTP serve 中，fn 就是 s.auth）
-    ↓
-proxy.Call(user, pass="", false)
+    │  user, pass, ok := parseAuthorization(r)   // 步骤1：尝试 Basic Auth
+    │  if !ok && userFromContext {                 // 步骤2：Basic Auth 无效
+    │      user, ok = CtxGetUser(r.Context())      //   → 从上游中间件取用户名
+    │  }
     │
+    │  → 两种子场景：
+    │  ├─ 客户端同时发了 Basic Auth → ok=true, 使用 Basic Auth 的 user+pass
+    │  └─ 客户端没发 Basic Auth     → ok=false, 使用 ctxKeyUser 的 user, pass=""
+    │
+    ↓  value, err := fn(user, pass)
     ↓
-创建/获取 VFS，通过 ctxKeyAuth 注入 context
+调用 s.auth(user, pass) → proxy.Call(user, pass, false)
+    │
+    ↓  value（VFS 实例）通过 ctxKeyAuth 注入 context
     ↓
-业务 Handler
+业务 Handler 通过 getVFS(ctx) → CtxGetAuth(ctx) 获取 VFS
 ```
 
-**关键代码衔接点**在 `MiddlewareAuthCustom` [middleware.go#L118-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L118-L155)：
+**关键衔接代码** [middleware.go#L128-L131](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L128-L131)：
 
 ```go
-func MiddlewareAuthCustom(fn CustomAuthFn, realm string, userFromContext bool) Middleware {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            // 第一步：尝试从 Basic Auth 解析
-            user, pass, ok := parseAuthorization(r)
-            
-            // 第二步：如果解析失败且允许从上下文获取
-            if !ok && userFromContext {
-                user, ok = CtxGetUser(r.Context())  // 从上游中间件获取
-            }
-
-            if !ok {
-                // 返回 401
-            }
-
-            // 调用自定义认证函数（pass 可能为空）
-            value, err := fn(user, pass)
-            
-            // 认证成功，value（通常是 VFS）注入 context
-            if value != nil {
-                r = r.WithContext(context.WithValue(r.Context(), ctxKeyAuth, value))
-            }
-            next.ServeHTTP(w, r)
-        })
-    }
+user, pass, ok := parseAuthorization(r)
+if !ok && userFromContext {
+    user, ok = CtxGetUser(r.Context())
 }
 ```
 
 **重要边界**：
-- 当使用 `UserFromHeader` 或 `CertificateUser` 时，`pass` 参数为空字符串
-- 代理程序（`--auth-proxy`）需要能够处理 `pass=""` 的情况
-- 这两种认证方式**不独立工作**，必须配合 `CustomAuthFn` 使用
+- 当 `userFromContext=true` 时，`parseAuthorization` 失败不是终点，而是**切换到备选来源的信号**
+- 备选来源只提供用户名，密码为空字符串 `""`
+- 代理程序（`--auth-proxy`）必须能处理 `pass=""`
+- 如果客户端同时提供了 Basic Auth，**Basic Auth 优先**（`parseAuthorization` 成功则不再查 ctxKeyUser）
 
-### 3.3 五种认证方式详解
+---
 
-#### 3.3.1 自定义认证（CustomAuthFn）
+### 3.4 场景三：请求头/证书认证与 Htpasswd/Basic 互斥
 
-最高优先级，用于代理模式。通过 `MiddlewareAuthCustom` 中间件实现：
+**触发条件**：同时配置了 `--htpasswd` 或 `--user`/`--pass`，以及 `--user-from-header`（或客户端证书）
+
+**initAuth 执行路径**：
+
+```
+altUsernameEnabled = false （因为 HtPasswd!="" 或 BasicUser!=""）
+    ↓
+if altUsernameEnabled { ... } → 跳过，不注册任何备选用户名中间件
+    ↓
+注册 MiddlewareAuthHtpasswd 或 MiddlewareAuthBasic
+return
+    ↓
+最终中间件链：仅 Htpasswd 或 Basic User
+```
+
+**互斥根因** [server.go#L433](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/server.go#L433)：
+
+```go
+altUsernameEnabled := s.auth.HtPasswd == "" && s.auth.BasicUser == ""
+```
+
+只要 `HtPasswd` 或 `BasicUser` 任一非空，`altUsernameEnabled` 就为 `false`，导致：
+1. `UserFromHeader` 和 `CertificateUser` 中间件**根本不会注册**
+2. 即使后续有 `CustomAuthFn`，`userFromContext` 参数也为 `false`
+
+**设计意图**：Htpasswd/Basic 认证已经通过密码验证了用户身份，不需要也不应该信任外部的用户名来源，避免认证绕过风险。
+
+**三种场景配置组合全表**：
+
+| HtPasswd | BasicUser | UserFromHeader / Cert | CustomAuthFn | 实际认证方式 | 场景 |
+|----------|-----------|----------------------|--------------|-------------|------|
+| - | - | ✅ | - | 仅 UserFromHeader/Cert | 场景一 |
+| - | - | ✅ | ✅ | UserFromHeader/Cert → CustomAuth | 场景二 |
+| - | - | - | ✅ | 仅 CustomAuth | 常规代理 |
+| ✅ | - | ✅ | - | 仅 Htpasswd（忽略 header） | 场景三 |
+| - | ✅ | ✅ | - | 仅 Basic（忽略 header） | 场景三 |
+| ✅ | - | - | - | 仅 Htpasswd | 常规 |
+| - | ✅ | - | - | 仅 Basic | 常规 |
+| - | - | - | - | 无认证 | 开放 |
+
+---
+
+### 3.5 五种认证方式详解
+
+#### 3.5.1 自定义认证（CustomAuthFn）
+
+最高优先级，用于代理模式。通过 `MiddlewareAuthCustom` 中间件 [middleware.go#L118-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L118-L155) 实现：
 
 - 支持从 Basic Auth 或上下文（`userFromContext`）获取用户名
 - 调用自定义函数 `fn(user, pass)` 进行认证
 - 认证成功后将返回值存入 context 的 `ctxKeyAuth` 键
+- `userFromContext` 参数仅在场景二中为 `true`
 
 在 HTTP serve 中，自定义认证用于 Proxy 模式 [http.go#L171-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/http/http.go#L171-L177)：
 
@@ -260,39 +356,43 @@ func (s *HTTP) auth(user, pass string) (value any, err error) {
 }
 ```
 
-#### 3.3.2 Htpasswd 文件认证
+#### 3.5.2 Htpasswd 文件认证
 
 通过 `MiddlewareAuthHtpasswd` 中间件 [middleware.go#L96-L102](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L96-L102) 实现：
 
 - 使用 `go-http-auth` 库的 `HtpasswdFileProvider`
 - 支持 MD5、SHA1、BCrypt 等多种哈希算法
 - 文件可在运行时更新
+- **互斥效果**：存在时 UserFromHeader/CertificateUser 不生效
 
-#### 3.3.3 Basic 单用户认证
+#### 3.5.3 Basic 单用户认证
 
 通过 `MiddlewareAuthBasic` 中间件 [middleware.go#L104-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L104-L116) 实现：
 
 - 使用 MD5 Crypt 哈希密码（带 salt）
 - 通过 `--user` 和 `--pass` 标志配置
+- **互斥效果**：存在时 UserFromHeader/CertificateUser 不生效
 
-#### 3.3.4 HTTP 头用户认证
+#### 3.5.4 HTTP 头用户认证
 
 通过 `MiddlewareAuthGetUserFromHeader` 中间件 [middleware.go#L159-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L159-L175) 实现：
 
 - 适用于反向代理场景，由代理完成认证
 - 从指定 HTTP 头（如 `X-Remote-User`）提取用户名
 - 用户名需通过正则验证：`^[\p{L}\d@._-]+$`
-- **不独立使用**，需配合 CustomAuthFn
+- **可独立工作**（场景一），也可配合 CustomAuthFn（场景二）
+- 被 Htpasswd/Basic 互斥时（场景三）不注册
 
-#### 3.3.5 客户端证书认证
+#### 3.5.5 客户端证书认证
 
 通过 `MiddlewareAuthCertificateUser` 中间件 [middleware.go#L78-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/middleware.go#L78-L94) 实现：
 
-- 当配置了 `--client-ca` 时启用
+- 当配置了 `--client-ca` 时启用（`tlsConfig.ClientAuth != tls.NoClientCert`）
 - 从客户端证书的 Common Name (CN) 提取用户名
-- **不独立使用**，需配合 CustomAuthFn
+- **可独立工作**（场景一），也可配合 CustomAuthFn（场景二）
+- 被 Htpasswd/Basic 互斥时（场景三）不注册
 
-### 3.4 认证上下文传递
+### 3.6 认证上下文传递
 
 认证结果通过 Go context 传递，定义在 [context.go#L9-L16](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/context.go#L9-L16)：
 
@@ -308,30 +408,35 @@ const (
 ```
 
 辅助函数：
-- `CtxGetAuth(ctx)` - 获取认证值（VFS 实例）
-- `CtxGetUser(ctx)` - 获取用户名
-- `IsAuthenticated(r)` - 检查是否已认证
+- `CtxGetAuth(ctx)` - 获取认证值（VFS 实例），仅场景二中有值
+- `CtxGetUser(ctx)` - 获取用户名，场景一/二中均有值
+- `IsAuthenticated(r)` [context.go#L29-L37](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/context.go#L29-L37) - 检查 `ctxKeyAuth` **或** `ctxKeyUser` 任一非空
 
-### 3.5 代理认证（Auth Proxy）
+**场景与 context 值的关系**：
+
+| 场景 | ctxKeyAuth | ctxKeyUser | 认证判断 |
+|------|-----------|-----------|---------|
+| 场景一（独立） | nil | ✅ username | `IsAuthenticated` 通过 ctxKeyUser 判定为已认证 |
+| 场景二（衔接） | ✅ VFS | ✅ username | `IsAuthenticated` 两个 key 均非空 |
+| Htpasswd/Basic | nil | nil | 认证由中间件内部完成，不设 context |
+| 无认证 | nil | nil | `IsAuthenticated` 返回 false |
+
+### 3.7 代理认证（Auth Proxy）
 
 当使用 `--auth-proxy` 参数时，rclone 调用外部程序动态创建后端和 VFS，实现在 [proxy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/proxy/proxy.go)。
 
-**完整工作流程**：
+**完整工作流程（场景二为例）**：
 
 ```
 1. 客户端发起请求
-   ├─ 场景 A：携带 Basic Auth 凭证（user:pass）
-   └─ 场景 B：反向代理已认证，注入 X-Remote-User 头
+   ├─ 子场景 2a：携带 Basic Auth 凭证（user:pass）
+   └─ 子场景 2b：反向代理已认证，注入 X-Remote-User 头
     ↓
 2. 中间件链执行
-   ├─ 场景 A：直接进入 MiddlewareAuthCustom
-   │    └─ parseAuthorization → user, pass, ok=true
-   └─ 场景 B：先执行 MiddlewareAuthGetUserFromHeader
-        ├─ 从 X-Remote-User 提取 user
-        ├─ 注入 ctxKeyUser
-        └─ 进入 MiddlewareAuthCustom
-             ├─ parseAuthorization → ok=false
-             └─ CtxGetUser → user, ok=true, pass=""
+   ├─ 子场景 2a：Header 中间件通过 → CustomAuth 中 parseAuthorization 成功
+   │    └─ user, pass, ok=true（使用 Basic Auth 凭证）
+   └─ 子场景 2b：Header 中间件提取 user → CustomAuth 中 parseAuthorization 失败
+        └─ CtxGetUser → user, ok=true, pass=""
     ↓
 3. 调用 s.auth(user, pass) → proxy.Call(user, pass, false)
     ↓
@@ -344,7 +449,7 @@ const (
     ↓
 5. VFS 存入 context（ctxKeyAuth）
     ↓
-6. 业务 Handler 通过 getVFS(ctx) 获取 VFS
+6. 业务 Handler 通过 getVFS(ctx) → CtxGetAuth(ctx) 获取 VFS
 ```
 
 缓存机制：
@@ -703,13 +808,15 @@ SetHeader (Accept-Ranges, Server)
 
 ### 7.1 认证边界
 
-| 认证方式 | 独立使用 | 需配合 | 用户名来源 | 密码来源 |
-|---------|---------|-------|-----------|---------|
-| Htpasswd | ✅ | - | Basic Auth | Basic Auth |
-| Basic User | ✅ | - | Basic Auth | Basic Auth |
-| UserFromHeader | ❌ | CustomAuthFn | HTTP 头 | 空字符串 |
-| CertificateUser | ❌ | CustomAuthFn | 客户端证书 CN | 空字符串 |
-| CustomAuthFn | ✅ | - | Basic Auth 或上游 | Basic Auth 或空 |
+| 认证方式 | 独立使用 | 可配合 | 互斥于 | 用户名来源 | 密码来源 | context 写入 |
+|---------|---------|-------|-------|-----------|---------|-------------|
+| Htpasswd | ✅ | - | UserFromHeader, Cert | Basic Auth | Basic Auth | 无 |
+| Basic User | ✅ | - | UserFromHeader, Cert | Basic Auth | Basic Auth | 无 |
+| UserFromHeader | ✅ | CustomAuthFn | Htpasswd, Basic | HTTP 头 | 无（空字符串） | `ctxKeyUser` |
+| CertificateUser | ✅ | CustomAuthFn | Htpasswd, Basic | 证书 CN | 无（空字符串） | `ctxKeyUser` |
+| CustomAuthFn | ✅ | UserFromHeader, Cert | Htpasswd, Basic | Basic Auth 或 ctxKeyUser | Basic Auth 或空 | `ctxKeyAuth` |
+
+**互斥机制**：`altUsernameEnabled = HtPasswd=="" && BasicUser==""` 是互斥的门控条件。Htpasswd/Basic 存在时，UserFromHeader/CertificateUser 中间件根本不会注册。
 
 ### 7.2 文件读取边界
 
@@ -717,13 +824,19 @@ SetHeader (Accept-Ranges, Server)
 |-----|---------|-----------|---------|---------|---------|
 | HTTP serve 主路径 | VFS 句柄 + http.ServeContent | Seek 方式 | `io.ReadSeeker` | ✅ | ✅ |
 | 通用对象服务 | serve.Object | OpenOption 方式 | `io.Reader` | ❌ | ❌ |
-| 未知大小文件 | io.Copy | 不支持 | `io.Reader` | - | - |
+| 未知大小文件（VFS 路径） | io.Copy | 显式拒绝 | `io.Reader` | - | - |
 
 ### 7.3 Range 边界
 
-| 条件 | 是否支持 Range | 原因 |
-|-----|---------------|------|
-| 已知大小文件 + VFS 路径 | ✅ | http.ServeContent 内部处理 |
-| 已知大小文件 + 通用服务 | ✅ | 自行解析 Range 头 |
-| 未知大小文件（Size < 0） | ❌ | 无法计算 Content-Range 总长度 |
-| 多范围请求（逗号分隔） | ❌ | fs.ParseRangeOption 不支持 |
+| 条件 | VFS 句柄路径 | 通用对象服务路径 | 说明 |
+|-----|-------------|-----------------|------|
+| 已知大小 + 正常 Range | ✅ http.ServeContent 处理 | ✅ ParseRangeOption + OpenOption | 两条路径均支持 |
+| 已知大小 + 后缀 Range (bytes=-N) | ✅ http.ServeContent 处理 | ⚠️ Decode 对 o.Size()<0 计算负 offset | 通用服务路径依赖 o.Size() 正确 |
+| 未知大小 (Size < 0) + Range | ❌ 返回 416 | ❌ Content-Range 中 size 为负数 | 均无法正确处理 |
+| 未知大小 (Size < 0) + 无 Range | ✅ io.Copy 顺序读取 | ✅ io.Copy 顺序读取 | 降级为完整读取 |
+| 多范围请求 (逗号分隔) | ❌ http.ServeContent 不支持 | ❌ ParseRangeOption 拒绝 | 两条路径均不支持 |
+| 未知大小 + SeekEnd | ❌ RangeSeek 返回 ErrorInvalidSeek | 不涉及 | chunkedreader 无法从末尾定位 |
+
+**VFS 路径 Range 实现链**：`Range 头` → `http.ServeContent` → `ReadSeeker.Seek()` → `ReadFileHandle.seek()` → `chunkedreader.RangeSeek()` → 后端 `Open(ctx)` 完整打开 → 由 chunkedreader 控制范围
+
+**通用服务路径 Range 实现链**：`Range 头` → `fs.ParseRangeOption()` → `RangeOption.Decode(size)` → `o.Open(ctx, RangeOption)` → 后端直接打开指定范围

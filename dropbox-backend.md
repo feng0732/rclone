@@ -286,7 +286,6 @@ func (f *Fs) findSharedFile(ctx context.Context, name string) (*Object, error) {
 ```
 
 #### 3. 对常规路径映射（remotePath）的影响
-⚠️ **有潜在影响**
 
 `remotePath()` 方法直接使用 `slashRootSlash`：
 ```go
@@ -299,26 +298,55 @@ func (o *Object) remotePath() string {
 - 实际返回：`"/mydir/file.txt"`
 - 预期返回：`"/file.txt"`
 
-**受影响的操作清单**：
+**直接调用风险（Dropbox 后端函数层面）**：
 
-| 操作 | 调用 `remotePath()` 位置 | 是否有 SharedFiles 检查 | 影响 |
-|------|------------------------|----------------------|------|
-| `Copy` | [1299 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1299-L1299) | ❌ 无检查 | 使用错误路径调用 `files.CopyV2`，可能操作错误文件或 API 失败 |
-| `Move` | [1359 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1359-L1359) | ❌ 无检查 | 使用错误路径调用 `files.MoveV2`，可能操作错误文件或 API 失败 |
-| `Update` | [2115 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L2115-L2115) | ✅ 有检查（2112 行） | 提前返回 `errNotSupportedInSharedMode`，无实际影响 |
-| `Remove` | [2162 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L2162-L2162) | ✅ 有检查（2157 行） | 提前返回 `errNotSupportedInSharedMode`，无实际影响 |
-| `Hash` | 间接调用 `readMetaData` | ✅ 有检查（1778 行） | 提前返回 `errNotSupportedInSharedMode`，无实际影响 |
-| `ModTime` | 间接调用 `readMetaData` | ❌ 无检查，但 `modTime` 已设置 | `readMetaData` 检查 `modTime != 0` 直接返回，不调用 `remotePath()`，无实际影响 |
+以下函数直接使用 `remotePath()` 构造 API 路径，在 SharedFiles 模式下会产生错误路径：
 
-#### 额外发现：Copy 和 Move 缺少模式检查
+| 操作 | 调用 `remotePath()` 位置 | 是否有 SharedFiles 检查 | 直接调用风险 |
+|------|------------------------|----------------------|----------|
+| `Copy` | 第 1299 行（FromPath/ToPath） | ❌ 无检查 | 使用错误路径调用 `files.CopyV2`，可能操作错误文件 |
+| `Move` | 第 1359 行（FromPath/ToPath） | ❌ 无检查 | 使用错误路径调用 `files.MoveV2`，可能操作错误文件 |
+| `DirMove` | 第 1482 行（path.Join(slashRoot, ...)） | ❌ 无检查 | 使用未同步的 `slashRoot` 拼接路径 |
+| `Update` | 第 2115 行 | ✅ 有检查（第 2112 行） | 提前返回 `errNotSupportedInSharedMode`，不触发 |
+| `Remove` | 第 2162 行 | ✅ 有检查（第 2157 行） | 提前返回 `errNotSupportedInSharedMode`，不触发 |
+| `Hash` | 间接调用 `readMetaData` | ✅ 有检查（第 1778 行） | 提前返回 `errNotSupportedInSharedMode`，不触发 |
+| `ModTime` | 间接调用 `readMetaData` | ❌ 无检查 | `modTime` 已设置 → `readMetaData` 直接返回，不调用 `remotePath()`，不触发 |
 
-`Copy`（[1276 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1276-L1276)）和 `Move`（[1343 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1343-L1343)）函数缺少 `SharedFiles` 模式检查：
-- 这与 `Update`、`Remove`、`Hash` 等函数的防御性检查不一致
-- 即使路径正确，SharedFiles 模式下 Copy/Move 也应该被拒绝（共享文件是只读的）
+**常规入口风险（rclone 框架调用链路层面）**：
+
+rclone 框架通过 `operations.Copy` → `serverSideCopy` 触发 `f.Copy()`，调用前提为：
+
+```go
+// operations/copy.go 第 139-151 行
+doCopy := c.dstFeatures.Copy  // Fs 实现了 Copier 接口，所以不为 nil
+serverSideCopyOK := false
+if SameConfig(c.src.Fs(), c.f) {
+    serverSideCopyOK = true          // 场景1：同一 remote 内
+} else if SameRemoteType(c.src.Fs(), c.f) {
+    serverSideCopyOK = ...           // 场景2：同类型不同 remote
+}
+```
+
+各场景分析：
+
+| 场景 | 命令示例 | `SameConfig` | 是否触发 `f.Copy()` | 实际风险 |
+|------|---------|-------------|------------------|---------|
+| SharedFiles → 本地 | `rclone copy dropbox_sf: /local/` | false | ❌ 不触发，走下载流程 | ✅ 无风险 |
+| SharedFiles → 其他远程 | `rclone copy dropbox_sf: s3:bucket/` | false | ❌ 不触发，走下载+上传 | ✅ 无风险 |
+| SharedFiles 内部 | `rclone copy dropbox_sf: dropbox_sf:sub/` | true | ✅ 触发 | ⚠️ 路径错误 |
+| 正常 Dropbox → SharedFiles | `rclone copy dropbox: dropbox_sf:` | SameRemoteType 可能为 true | ✅ 可能触发 | ⚠️ 路径错误 |
+| SharedFiles → 正常 Dropbox | `rclone copy dropbox_sf: dropbox:` | SameRemoteType 可能为 true | ✅ 可能触发 | ⚠️ 路径错误 |
+
+**风险定性**：
+
+- **低概率但非零风险**：常规 `rclone copy/move` 从 SharedFiles 到其他远程（最常见的使用方式）**不会触发**服务端 Copy/Move，而是走下载+上传流程
+- **触发条件**：仅在用户将 SharedFiles remote 作为目标，或将同一 SharedFiles remote 同时作为源和目标时，才会触发服务端 Copy/Move
+- **双重缺陷叠加**：即使路径正确，Copy/Move 在共享文件只读场景下也不应被允许，缺少模式检查是第一重缺陷；`slashRootSlash` 未同步导致路径错误是第二重缺陷
+- **API 层面的安全网**：Dropbox API 通常会因为路径不存在而返回错误（`lookup_failed/not_found`），不太可能静默操作错误文件，但此安全网不可依赖
 
 #### 修复建议
 
-正确的代码应该是：
+修复 1（根路径同步，消除缓存不一致）：
 ```go
 _, err := f.findSharedFile(ctx, f.root)
 f.setRoot("")  // ✅ 调用 setRoot 同步更新所有三个字段
@@ -327,9 +355,28 @@ if err == nil {
 }
 ```
 
-而不是：
+修复 2（Copy/Move 增加模式检查，与其他操作保持一致）：
 ```go
-f.root = ""  // ❌ 只更新 root 字段，导致缓存不一致
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Object, err error) {
+    if f.opt.SharedFiles || f.opt.SharedFolders {
+        return nil, errNotSupportedInSharedMode  // 新增
+    }
+    // ... 原有逻辑
+}
+
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+    if f.opt.SharedFiles || f.opt.SharedFolders {
+        return nil, errNotSupportedInSharedMode  // 新增
+    }
+    // ... 原有逻辑
+}
+
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+    if f.opt.SharedFiles || f.opt.SharedFolders {
+        return errNotSupportedInSharedMode  // 新增
+    }
+    // ... 原有逻辑
+}
 ```
 
 ### 4.3 共享文件模式下的功能限制
@@ -356,14 +403,21 @@ var errNotSupportedInSharedMode = fserrors.NoRetryError(
 
 #### 功能限制的不一致性
 
-| 操作 | 是否有模式检查 | 行为 |
-|------|-------------|------|
-| `Update` / `Remove` / `Hash` | ✅ 有检查 | 正确返回 `errNotSupportedInSharedMode` |
-| `Copy` | ❌ 无检查 | 缺少防御性检查，可能使用错误路径调用 `files.CopyV2` |
-| `Move` | ❌ 无检查 | 缺少防御性检查，可能使用错误路径调用 `files.MoveV2` |
-| `DirMove` | ❌ 无检查 | 缺少防御性检查，同上 |
+| 操作 | 是否有模式检查 | 直接调用风险 | 常规入口风险 |
+|------|-------------|----------|----------|
+| `Update` / `Remove` / `Hash` | ✅ 有检查 | 无（提前返回错误） | 无 |
+| `Copy` | ❌ 无检查 | 错误路径 + `files.CopyV2` | 仅 SharedFiles 作为目标时触发 |
+| `Move` | ❌ 无检查 | 错误路径 + `files.MoveV2` | 仅 SharedFiles 作为目标时触发 |
+| `DirMove` | ❌ 无检查 | 未同步 `slashRoot` 拼接 | 仅 SharedFolders 作为目标时触发 |
 
-**风险**：`Copy` 和 `Move` 在 SharedFiles 模式下不仅会失败，还可能因 `slashRootSlash` 未同步而操作到错误的文件。
+**双重缺陷**：
+1. **缺少模式检查**（第一重）：Copy/Move/DirMove 在共享模式下不应被允许，但缺少防御性检查
+2. **路径缓存不一致**（第二重）：`f.root=""` 未同步 `slashRoot*`，即使执行到也会使用错误路径
+
+**常规入口评估**：
+- 常见使用方式（从 SharedFiles 下载到本地或其他远程）**不会触发**服务端 Copy/Move
+- 只有在 SharedFiles/SharedFolders 作为 Copy/Move 目标时才会触发
+- 这属于不合理的操作场景（共享文件/文件夹是只读的），但代码层面未做防御
 
 ### 4.4 列表链路接入
 
@@ -527,9 +581,9 @@ SharedFiles == true
     ├─ Put / Update / Mkdir / Rmdir / Remove / Hash
     │    └─ 直接返回 errNotSupportedInSharedMode (NoRetryError)
     │
-    ├─ Copy / Move  ← ⚠️ 缺少模式检查，可能使用错误路径
-    │    └─ remotePath() 使用未同步的 slashRootSlash → 路径错误
-    │         └─ 调用 files.CopyV2 / MoveV2 → API 失败或操作错误文件
+    ├─ Copy / Move / DirMove  ← ⚠️ 双重缺陷：缺模式检查 + 路径缓存不同步
+    │    ├─ 直接调用风险：remotePath() 使用未同步 slashRootSlash → 错误路径
+    │    └─ 常规入口风险：仅 SharedFiles 作为目标时触发（低概率但非零）
     │
     └─ 命名空间
          └─ f.ns 永远为空 → headerGenerator 返回空 map → 使用默认 home namespace
@@ -1695,8 +1749,8 @@ NewFs(ctx, name, root, m)
 | Update 更新 | ✅ UploadSession | ❌ NoRetryError | ❌ NoRetryError | ✅ UploadSession |
 | Mkdir | ✅ CreateFolder | ❌ NoRetryError | ❌ NoRetryError | ✅ CreateFolder |
 | Remove | ✅ DeleteV2 | ❌ NoRetryError | ❌ NoRetryError | ✅ DeleteV2 |
-| Copy 服务端 | ✅ CopyV2 | ⚠️ 应禁止但缺检查 | ⚠️ 应禁止但缺检查 | ✅ CopyV2 |
-| Move 服务端 | ✅ MoveV2 | ⚠️ 应禁止但缺检查 | ⚠️ 应禁止但缺检查 | ✅ MoveV2 |
+| Copy 服务端 | ✅ CopyV2 | ⚠️ 缺检查+路径错误（常规入口低风险） | ⚠️ 缺检查（常规入口低风险） | ✅ CopyV2 |
+| Move 服务端 | ✅ MoveV2 | ⚠️ 缺检查+路径错误（常规入口低风险） | ⚠️ 缺检查（常规入口低风险） | ✅ MoveV2 |
 | Hash 哈希 | ✅ DropboxHash | ❌ NoRetryError | ❌ NoRetryError | ✅ DropboxHash |
 | 根命名空间 | 可选设置 | 空（跳过设置） | 空（跳过设置） | 可选设置 |
 | Pacer 重试 | ✅ | ✅ | ✅ | ✅ |

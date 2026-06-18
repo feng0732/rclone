@@ -361,21 +361,31 @@ track-renames 的匹配过程分三个阶段，由三个函数各司其职：
 
 各策略下 renameID 的实际输出：
 
+> **注意**：hash 部分直接拼接 `obj.Hash(s.ctx, s.commonHash)` 返回的原始字符串，代码不会添加算法名前缀。下表中 `abc...` 代表后端返回的原始哈希值。
+
 | `--track-renames-strategy` | renameID 输出 | 说明 |
 |--------------------------|--------------|------|
-| `hash` | `"12345,SHA256:abc..."` | size + 逗号 + hash 值 |
+| `hash` | `"12345,abc..."` | size + 逗号 + 原始 hash 值 |
 | `modtime` | `"12345"` | **仅有 size**，modtime 在 popRenameMap 中按 modifyWindow 比较 |
 | `leaf` | `"12345,photo.jpg"` | size + 逗号 + 文件名 |
-| `hash,leaf` | `"12345,SHA256:abc...,photo.jpg"` | size + hash + leaf 顺序拼接 |
-| `hash,modtime` | `"12345,SHA256:abc..."` | hash 写入 key，modtime 在弹出时二次筛选 |
+| `hash,leaf` | `"12345,abc...,photo.jpg"` | size + hash + leaf 顺序拼接 |
+| `hash,modtime` | `"12345,abc..."` | hash 写入 key，modtime 在弹出时二次筛选 |
 | `modtime,leaf` | `"12345,photo.jpg"` | leaf 写入 key，modtime 在弹出时二次筛选 |
-| `hash,modtime,leaf` | `"12345,SHA256:abc...,photo.jpg"` | hash+leaf 写入 key，modtime 在弹出时二次筛选 |
+| `hash,modtime,leaf` | `"12345,abc...,photo.jpg"` | hash+leaf 写入 key，modtime 在弹出时二次筛选 |
 
 **为什么 modtime 不写入 key？** 因为 modtime 是连续值，文件重命名后 modtime 可能因精度 / 时区差异而不完全相同，无法做精确的字符串匹配。按 modifyWindow 容差比较才能正确匹配。
 
-**renameID 返回空字符串的两种情况**：
-1. hash 策略下，对象的 hash 计算失败或返回空
-2. 此时该对象无法参与重命名匹配，`tryRename` 直接返回 false
+**renameID 返回空字符串的原因与后果**：
+
+原因（两种，均出现在 hash 策略下）：
+
+1. `obj.Hash()` 返回 error——哈希计算本身失败（[fs/sync/sync.go#L783-L786](fs/sync/sync.go#L783-L786)）
+2. `obj.Hash()` 返回空字符串——后端不支持该哈希类型或对象无法提供哈希（[fs/sync/sync.go#L787-L789](fs/sync/sync.go#L787-L789)）
+
+后果：
+
+- 对源端对象：`tryRename` 直接返回 false，该文件跳过重命名检测，由 pairRenamer 送入 toBeUploaded 正常传输
+- 对目的端对象：`makeRenameMap` 中该对象不会被加入 renameMap，无法被任何源端文件匹配到；若匹配失败，该对象仍留在 dstFiles 中，最终被 DeleteModeAfter 删除
 
 #### 阶段二：makeRenameMap——构建目的端索引（[fs/sync/sync.go#L855-L892](fs/sync/sync.go#L855-L892)）
 

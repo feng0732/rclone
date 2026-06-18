@@ -1003,36 +1003,120 @@ func (fsys *FS) Destroy() {
 }
 ```
 
-### 8.5 信号处理（全局机制）
+### 8.5 信号处理（两条完全独立的路径）
 
-三种实现共享 `lib/atexit` 信号处理：
+**关键结论**：信号处理分为**退出清理**和**缓存刷新**两条完全独立的路径。**SIGHUP 仅用于刷新缓存，不属于退出清理信号，不会触发程序退出。**
 
+---
+
+#### 路径一：退出清理路径（SIGINT / SIGTERM）
+
+信号分类定义 [lib/atexit/atexit_unix.go:12]：
+```go
+// 退出信号列表 —— 注意：SIGHUP 不在此列表中！
+var exitSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+```
+
+Windows/Plan9 定义 [lib/atexit/atexit_other.go:11]：
+```go
+var exitSignals = []os.Signal{os.Interrupt}
+```
+
+退出清理执行流程 [lib/atexit/atexit.go:41-56]：
 ```go
 // [lib/atexit/atexit.go:41-56]
+// 仅在 init() 时启动一次，全局单例
 go func() {
-    sig := <-exitChan       // 接收 SIGINT, SIGTERM, SIGHUP
+    sig := <-exitChan       // 【仅】接收 SIGINT, SIGTERM（不包含 SIGHUP！）
     signal.Stop(exitChan)
-    signalled.Store(1)
-    Run()                   // 执行所有注册的清理函数
-    os.Exit(exitCode(sig))
+    signalled.Store(1)      // 设置标志位，cmount 卸载时会检查此标志
+    Run()                   // 执行所有注册的 atexit 清理函数
+                            // 包括 finalise() → Unmount() → VFS.Shutdown()
+    os.Exit(exitCode(sig))  // 终止进程
 }()
 ```
 
-VFS 级 SIGHUP 处理 [vfs/vfs.go:296-314]：
+**退出清理信号的效果**：
+1. `SIGINT`（Ctrl+C）或 `SIGTERM`（kill 默认信号）触发
+2. `atexit.Signalled()` 返回 `true`
+3. cmount 检测到标志后跳过 `host.Unmount()` 调用（FUSE 层会自行关闭）
+4. 执行所有清理函数（卸载挂载点、关闭 VFS、关闭缓存）
+5. 进程退出
+
+---
+
+#### 路径二：缓存刷新路径（SIGHUP，仅用于刷新，不退出）
+
+SIGHUP 有自己独立的信号注册和处理逻辑，与退出清理完全无关。
+
+SIGHUP 独立注册 [vfs/sighup.go:13-19]：
 ```go
+// [vfs/sighup.go:13-19]
+func NotifyOnSigHup(sighupChan chan os.Signal) {
+    signal.Notify(sighupChan, syscall.SIGHUP)  // 【单独】注册 SIGHUP
+}
+```
+
+SIGHUP 处理逻辑 [vfs/vfs.go:296-314]：
+```go
+// [vfs/vfs.go:296-314]
+// 每个 VFS 实例启动一个独立 goroutine 监听 SIGHUP
 func (vfs *VFS) signalHandler(ctx context.Context) {
     sigHup := make(chan os.Signal, 1)
-    NotifyOnSigHup(sigHup)
+    NotifyOnSigHup(sigHup)           // 仅监听 SIGHUP
     for {
         select {
-        case <-ctx.Done(): return
-        case <-sigHup:
+        case <-ctx.Done(): return     // VFS 关闭时退出
+        case <-sigHup:                // 收到 SIGHUP
             root, _ := vfs.Root()
-            root.ForgetAll()   // SIGHUP 清空所有目录缓存
+            root.ForgetAll()          // 【仅】清空所有目录缓存
+                                    // 不调用 Run()，不执行清理，不退出！
         }
     }
 }
 ```
+
+**SIGHUP 的效果**（与退出清理完全无关）：
+1. `SIGHUP`（通常由终端断开或 `kill -HUP` 触发）被 VFS 独立接收
+2. 调用 `root.ForgetAll()` 清空所有目录缓存（强制下次访问时从后端重新获取）
+3. **不设置 `signalled` 标志**
+4. **不执行 atexit 清理函数**
+5. **不卸载挂载点**
+6. **不退出进程** —— 程序继续正常运行
+
+---
+
+#### 两条路径对比总结
+
+| 特性 | 退出清理路径 | 缓存刷新路径 |
+|------|-------------|-------------|
+| 触发信号 | `SIGINT`, `SIGTERM` | `SIGHUP` |
+| 信号注册位置 | `lib/atexit/atexit.go` init() | `vfs/sighup.go` NotifyOnSigHup() |
+| 监听 goroutine | atexit 包全局单例 | 每个 VFS 实例一个 |
+| 核心动作 | `Run()` 执行所有清理函数 | `root.ForgetAll()` 清空缓存 |
+| 卸载挂载点 | 是（通过 `finalise()`） | 否 |
+| 关闭 VFS | 是（`VFS.Shutdown()`） | 否 |
+| 设置 `signalled` 标志 | 是 | 否 |
+| 进程退出 | 是（`os.Exit()`） | 否（继续运行） |
+| cmount 跳过 Unmount | 是（`atexit.Signalled()` 检查） | 否 |
+
+---
+
+#### cmount 中的信号检查
+
+在 cmount 的卸载函数中，通过 `atexit.Signalled()` 判断是否是退出信号触发的卸载：
+
+```go
+// [cmd/cmount/mount.go:182-187]
+} else if atexit.Signalled() {
+    // 收到退出信号（SIGINT/SIGTERM），FUSE 将自行关闭
+    // 注意：SIGHUP 不会设置此标志，因此不会触发此分支
+    fs.Debugf(nil, "Not calling host.Unmount as signal received")
+    umountOK = true
+}
+```
+
+**关键说明**：`atexit.Signalled()` 仅在收到 `SIGINT`/`SIGTERM` 等退出信号时返回 `true`。收到 `SIGHUP` 时该标志仍为 `false`，不会触发此跳过逻辑，因为 SIGHUP 根本不会导致卸载。
 
 ### 8.6 VFS.Shutdown 细节
 
@@ -1238,7 +1322,8 @@ func getMode(node os.FileInfo) uint32 {
 | 卸载函数 | `cmd/mount/mount.go:105-109` | `cmd/mount2/mount.go:243-247` | `cmd/cmount/mount.go:172-201` |
 | Init/Destroy | N/A | N/A | `cmd/cmount/fs.go:164-176` |
 | 通用 VFS | `vfs/vfs.go:205-284` New<br>`vfs/vfs.go:390-417` Shutdown | 同左 | 同左 |
-| 信号处理 | `lib/atexit/atexit.go:41-56` | 同左 | 同左 |
+| 信号处理（退出） | `lib/atexit/atexit.go:41-56`<br>`lib/atexit/atexit_unix.go:12`（信号分类） | 同左 | 同左 |
+| 信号处理（SIGHUP 刷新） | `vfs/sighup.go:13-19`<br>`vfs/vfs.go:296-314`（处理逻辑） | 同左 | 同左 |
 | 通用挂载 | `cmd/mountlib/mount.go:368-428` | 同左 | 同左 |
 
 ---

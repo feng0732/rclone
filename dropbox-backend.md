@@ -217,11 +217,120 @@ if f.opt.SharedFiles {
 ```
 
 **关键点**：
-- `setRoot(root)` 先正常设置路径
+- `setRoot(root)` 先正常设置路径（同步更新三个字段）
 - `findSharedFile` 遍历所有共享文件查找匹配项
 - **不管查找结果如何，最终 `f.root` 被重置为空字符串**
 - 这是因为共享文件没有真正的"目录"概念，所有文件都列在虚拟根下
 - **此分支直接 return，完全跳过后续的命名空间设置、文件检测等逻辑**
+
+### 4.2.1 根路径重置的事实校准
+
+**代码事实**（第 591 行）：
+```go
+f.root = ""  // ⚠️ 只重置了 root 字段，没有调用 setRoot("")
+```
+
+**不是** `f.setRoot("")`！`setRoot` 函数会同步更新三个字段：
+```go
+func (f *Fs) setRoot(root string) {
+    f.root = strings.Trim(root, "/")        // 字段 1
+    f.slashRoot = "/" + f.root               // 字段 2
+    f.slashRootSlash = f.slashRoot           // 字段 3
+    if f.root != "" {
+        f.slashRootSlash += "/"
+    }
+}
+```
+
+**字段状态对比**（以 `root="mydir"` 为例）：
+
+| 字段 | `setRoot("mydir")` 后 | `f.root = ""` 后（实际） | `setRoot("")` 后（预期） |
+|------|---------------------|-----------------------|-----------------------|
+| `root` | `"mydir"` | `""` ✅ | `""` |
+| `slashRoot` | `"/mydir"` | `"/mydir"` ❌ 未同步 | `"/"` |
+| `slashRootSlash` | `"/mydir/"` | `"/mydir/"` ❌ 未同步 | `"/"` |
+
+**未同步更新的字段**：
+- `f.slashRoot`：保留旧值，未清空
+- `f.slashRootSlash`：保留旧值，未清空
+
+### 4.2.2 对三大链路的影响评估
+
+#### 1. 对共享文件列表（listReceivedFiles）的影响
+✅ **无影响**
+
+`listReceivedFiles` 创建 Object 时不使用 `slashRoot` 或 `slashRootSlash`：
+```go
+for _, entry := range res.Entries {
+    o := &Object{
+        remote:  entry.Name,  // 直接用 entry.Name，不涉及路径前缀
+        modTime: *entry.TimeInvited,
+        // ...
+    }
+}
+```
+
+#### 2. 对对象查找（findSharedFile）的影响
+✅ **无影响**
+
+`findSharedFile` 只比较 `entry.remote == name`，不涉及路径前缀：
+```go
+func (f *Fs) findSharedFile(ctx context.Context, name string) (*Object, error) {
+    err := f.listReceivedFiles(ctx, func(entry fs.DirEntry) error {
+        if entry.(*Object).remote == name {  // 只比较 remote 字段
+            // ...
+        }
+        return nil
+    })
+}
+```
+
+#### 3. 对常规路径映射（remotePath）的影响
+⚠️ **有潜在影响**
+
+`remotePath()` 方法直接使用 `slashRootSlash`：
+```go
+func (o *Object) remotePath() string {
+    return o.fs.slashRootSlash + o.remote
+}
+```
+
+如果 `slashRootSlash` 是旧值 `"/mydir/"`，而 `o.remote` 是 `"file.txt"`，则：
+- 实际返回：`"/mydir/file.txt"`
+- 预期返回：`"/file.txt"`
+
+**受影响的操作清单**：
+
+| 操作 | 调用 `remotePath()` 位置 | 是否有 SharedFiles 检查 | 影响 |
+|------|------------------------|----------------------|------|
+| `Copy` | [1299 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1299-L1299) | ❌ 无检查 | 使用错误路径调用 `files.CopyV2`，可能操作错误文件或 API 失败 |
+| `Move` | [1359 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1359-L1359) | ❌ 无检查 | 使用错误路径调用 `files.MoveV2`，可能操作错误文件或 API 失败 |
+| `Update` | [2115 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L2115-L2115) | ✅ 有检查（2112 行） | 提前返回 `errNotSupportedInSharedMode`，无实际影响 |
+| `Remove` | [2162 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L2162-L2162) | ✅ 有检查（2157 行） | 提前返回 `errNotSupportedInSharedMode`，无实际影响 |
+| `Hash` | 间接调用 `readMetaData` | ✅ 有检查（1778 行） | 提前返回 `errNotSupportedInSharedMode`，无实际影响 |
+| `ModTime` | 间接调用 `readMetaData` | ❌ 无检查，但 `modTime` 已设置 | `readMetaData` 检查 `modTime != 0` 直接返回，不调用 `remotePath()`，无实际影响 |
+
+#### 额外发现：Copy 和 Move 缺少模式检查
+
+`Copy`（[1276 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1276-L1276)）和 `Move`（[1343 行](file:///d:/fz/0601-2/solo-dogfeeding/code/43-rclone/backend/dropbox/dropbox.go#L1343-L1343)）函数缺少 `SharedFiles` 模式检查：
+- 这与 `Update`、`Remove`、`Hash` 等函数的防御性检查不一致
+- 即使路径正确，SharedFiles 模式下 Copy/Move 也应该被拒绝（共享文件是只读的）
+
+#### 修复建议
+
+正确的代码应该是：
+```go
+_, err := f.findSharedFile(ctx, f.root)
+f.setRoot("")  // ✅ 调用 setRoot 同步更新所有三个字段
+if err == nil {
+    return f, fs.ErrorIsFile
+}
+```
+
+而不是：
+```go
+f.root = ""  // ❌ 只更新 root 字段，导致缓存不一致
+```
 
 ### 4.3 共享文件模式下的功能限制
 
@@ -244,6 +353,17 @@ var errNotSupportedInSharedMode = fserrors.NoRetryError(
 ```
 
 **注意**：这些函数的判断条件是 `f.opt.SharedFiles || f.opt.SharedFolders`，即两种共享模式都会被限制。
+
+#### 功能限制的不一致性
+
+| 操作 | 是否有模式检查 | 行为 |
+|------|-------------|------|
+| `Update` / `Remove` / `Hash` | ✅ 有检查 | 正确返回 `errNotSupportedInSharedMode` |
+| `Copy` | ❌ 无检查 | 缺少防御性检查，可能使用错误路径调用 `files.CopyV2` |
+| `Move` | ❌ 无检查 | 缺少防御性检查，可能使用错误路径调用 `files.MoveV2` |
+| `DirMove` | ❌ 无检查 | 缺少防御性检查，同上 |
+
+**风险**：`Copy` 和 `Move` 在 SharedFiles 模式下不仅会失败，还可能因 `slashRootSlash` 未同步而操作到错误的文件。
 
 ### 4.4 列表链路接入
 
@@ -386,9 +506,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 SharedFiles == true
     │
     ├─ NewFs
-    │    ├─ setRoot(root)
+    │    ├─ setRoot(root)                       ← 同步更新 root/slashRoot/slashRootSlash
     │    ├─ [root != ""] findSharedFile → listReceivedFiles 遍历
-    │    ├─ setRoot("")  // 强制重置为空
+    │    ├─ f.root = ""                         ← ⚠️ 只重置 root，slashRoot 与 slashRootSlash 未同步
     │    └─ return f (直接返回，跳过命名空间/文件检测等后续分支)
     │
     ├─ List / ListP
@@ -406,6 +526,10 @@ SharedFiles == true
     │
     ├─ Put / Update / Mkdir / Rmdir / Remove / Hash
     │    └─ 直接返回 errNotSupportedInSharedMode (NoRetryError)
+    │
+    ├─ Copy / Move  ← ⚠️ 缺少模式检查，可能使用错误路径
+    │    └─ remotePath() 使用未同步的 slashRootSlash → 路径错误
+    │         └─ 调用 files.CopyV2 / MoveV2 → API 失败或操作错误文件
     │
     └─ 命名空间
          └─ f.ns 永远为空 → headerGenerator 返回空 map → 使用默认 home namespace
@@ -1571,10 +1695,11 @@ NewFs(ctx, name, root, m)
 | Update 更新 | ✅ UploadSession | ❌ NoRetryError | ❌ NoRetryError | ✅ UploadSession |
 | Mkdir | ✅ CreateFolder | ❌ NoRetryError | ❌ NoRetryError | ✅ CreateFolder |
 | Remove | ✅ DeleteV2 | ❌ NoRetryError | ❌ NoRetryError | ✅ DeleteV2 |
-| Copy 服务端 | ✅ CopyV2 | ❌ | ❌ | ✅ CopyV2 |
-| Move 服务端 | ✅ MoveV2 | ❌ | ❌ | ✅ MoveV2 |
+| Copy 服务端 | ✅ CopyV2 | ⚠️ 应禁止但缺检查 | ⚠️ 应禁止但缺检查 | ✅ CopyV2 |
+| Move 服务端 | ✅ MoveV2 | ⚠️ 应禁止但缺检查 | ⚠️ 应禁止但缺检查 | ✅ MoveV2 |
 | Hash 哈希 | ✅ DropboxHash | ❌ NoRetryError | ❌ NoRetryError | ✅ DropboxHash |
 | 根命名空间 | 可选设置 | 空（跳过设置） | 空（跳过设置） | 可选设置 |
 | Pacer 重试 | ✅ | ✅ | ✅ | ✅ |
 | list 缓冲 | ✅ list.NewHelper | ✅ list.NewHelper | ✅ list.NewHelper | ✅ list.NewHelper |
 | 命名空间注入 | ✅ headerGenerator | ✅（但 f.ns 为空） | ✅（但 f.ns 为空） | ✅ headerGenerator |
+| 路径缓存一致性 | ✅ setRoot 同步 | ⚠️ `f.root=""` 未同步 `slashRoot*` | ✅ | ✅ |

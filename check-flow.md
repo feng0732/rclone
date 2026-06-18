@@ -131,7 +131,7 @@ if srcName > dstName || (srcName == dstName && srcType > dstType) {
    ├── matchTasks (chan matchTask)   → workers 并行处理
    └── dstMatches (chan <-chan DirEntry) → 保证顺序输出
 3. 每个 worker 处理 matchTask：
-   ├── 目录条目：直接返回 nil（NewObject 不能匹配目录）
+   ├── 目录条目：直接返回 nil（NewObject 不能匹配目录，没有"目录匹配"概念）
    ├── 文件条目：NewObject(m.Ctx, path.Join(job.dstRemote, leaf))
       ├── 成功 → 返回目标对象
       └── 失败 → 返回 nil（表示目标不存在）
@@ -143,8 +143,16 @@ if srcName > dstName || (srcName == dstName && srcType > dstType) {
 
 **顺序保证**：即使 worker 乱序完成，`dstMatches` 通道队列也确保结果按原始源顺序发送到 `dstChan`。
 
+**目录不会匹配为目标目录**：
+- src 是 Directory 时，worker 直接 `t.dstMatch <- nil`（第 454-457 行）
+- matchListings 中 `dst == nil` 走 `case dst == nil: srcOnly(src)`（第 368-370 行）
+- 回调 SrcOnly(Directory) → checkMarch 返回 recurse=true
+- march 为其创建新 listDirJob：`srcRemote=src.Remote(), dstRemote=src.Remote(), noDst=true`
+- **关键点**：NoTraverse 分支（第 421 行）条件是 `m.NoTraverse && !m.NoCheckDest`，不依赖 `job.noDst`，因此子目录 job 仍然走 NewObject 流程处理其下的文件
+- 子目录下的文件仍通过 NewObject 按需定位目标对象，目录本身永远不会被"匹配"
+
 **局限性**：
-- 目录条目在目标侧始终得到 nil，因此会走 SrcOnly(Directory) → recurse=true → 对子目录内的每个文件再走 NewObject 流程
+- 目录条目永远走 SrcOnly(Directory) → recurse，没有"目录 match"的路径
 - 无法检测目标侧多余文件（dstChan 永远不会有源中没有的条目）
 
 ### 2.3 checkMarch 回调：三层比对
@@ -221,13 +229,15 @@ if dstListErr == fs.ErrorDirNotFound {
 **递归报告链路**：
 
 ```
-processJob 处理某目录
+processJob 处理某目录（顶层，noDst=false，未开启 NoTraverse）
 │
-├── dstListErr = fs.ErrorDirNotFound  →  静默，不返回错误
+├── dstListDir(job.dstRemote) → fs.ErrorDirNotFound
 │
-├── dstChan 为空（目标目录无任何条目）
+├── dstChan 被关闭（dstListDir 返回后 wg goroutine close(dstChan)）
 │
 └── matchListings() 比较
+    │
+    ├── dstHasMore 始终为 false（dstChan 已关闭）
     │
     ├── 每个 src 条目都走 srcOnly()  →  Callback.SrcOnly(src)
     │   │
@@ -243,8 +253,17 @@ processJob 处理某目录
     │
     └── 新 job 入队继续处理
         │
-        └── 目标子目录也不存在 → dstListErr 再次为 ErrorDirNotFound
-            └── 重复上述流程，直到 srcDepth 耗尽或所有子目录处理完毕
+        └── processJob 处理子目录（noDst=true）
+            │
+            ├── 第 407 行条件 !m.NoTraverse && !job.noDst → false（noDst=true）
+            ├── 不调用 dstListDir，startedDst 保持 false
+            ├── 第 492 行 if !startedDst { close(dstChan) }
+            │
+            └── dstChan 直接关闭，无任何 dst 条目
+                └── 所有 src 条目走 srcOnly()
+                    ├── Object → report('+')
+                    └── Directory → recurse=true → 生成 noDst=true 的孙目录 job
+                        └── 重复此流程（不再调用 dstListDir，不再产生 ErrorDirNotFound）
 ```
 
 **job 创建细节**（fs/march/march.go 第 497-506 行）：
@@ -255,9 +274,15 @@ jobs = append(jobs, listDirJob{
     srcRemote: src.Remote(),
     dstRemote: src.Remote(),
     srcDepth:  job.srcDepth - 1,
-    noDst:     true,   // 不列出目标，避免再次 ErrorDirNotFound
+    noDst:     true,   // 不列出目标，后续子 job 不再调用 dstListDir
 })
 ```
+
+**关键修正点**：
+- 只有顶层 job 会真正调用 `dstListDir` 并得到 `ErrorDirNotFound`
+- 子 job 设置 `noDst=true` 后，第 407 行的 `!job.noDst` 条件不成立，**不再调用 dstListDir**
+- 子 job 的 `dstChan` 被直接关闭（`startedDst=false → close(dstChan)`），不会再产生 ErrorDirNotFound
+- 所有子层级的"目标不存在"是通过 dstChan 为空来驱动的，而非通过 ErrorDirNotFound
 
 **效果**：目标目录不存在时，源目录树被完整遍历，每个文件都报告为目标缺失（'+'），目录逐层递归，不会因顶层目录不存在而中断。
 
@@ -633,7 +658,7 @@ CheckFn() ── march.Run(NoTraverse=true)
     │   ├── 不调用 dstListDir
     │   │
     │   ├── matchTasks 队列（ci.Checkers 个 worker 并行）
-    │   │   ├── src 是 Directory → dstMatch <- nil
+    │   │   ├── src 是 Directory → dstMatch <- nil（目录永远无法匹配）
     │   │   └── src 是 Object
     │   │       ├── NewObject(path.Join(dstRemote, leaf))
     │   │       ├── 成功 → dstMatch <- dstObject
@@ -642,34 +667,48 @@ CheckFn() ── march.Run(NoTraverse=true)
     │   └── dstMatches 按顺序读回结果 → dstChan
     │
     └── matchListings(srcChan, dstChan)
-        ├── src有dst有(Object) → match → checkIdentical
-        ├── src有dst有(Directory) → match → recurse → 子目录再走 NewObject
-        ├── src有dst无 → srcOnly → '+' / 递归
-        └── dst有src无 → 不会发生（dstChan 只有 src 中的条目）
+        ├── src=Object, dst=Object → match → checkIdentical
+        ├── src=Object, dst=nil    → srcOnly → report('+', MissingOnDst)
+        ├── src=Directory, dst=nil → srcOnly → recurse=true
+        │   └── 新 listDirJob{srcRemote=dir, dstRemote=dir, noDst=true}
+        │       └── NoTraverse 分支不受 noDst 影响，子目录下文件继续 NewObject
+        └── src=nil, dst=* → 不会发生（dstChan 只有 src 中的条目，且目录返回 nil）
 ```
+
+**关键特征**：目录永远不会通过 NewObject 匹配目标目录，而是走 SrcOnly → recurse → 子 job 继续 NoTraverse 流程。
 
 ### 6.3 目标目录不存在时的递归报告
 
 ```
-processJob 处理目录 X
+processJob 处理顶层目录 X（noDst=false，非 NoTraverse）
 │
-├── dstListDir(X) → fs.ErrorDirNotFound
-├── dstChan 为空
+├── dstListDir(X) → fs.ErrorDirNotFound（仅顶层产生此错误）
+├── dstChan 被 dstListDir 所在 goroutine 关闭（dstHasMore=false）
 │
 └── matchListings()
     │
-    ├── 每个 src 条目 → srcOnly
-    │   ├── Object → report('+', MissingOnDst)
-    │   └── Directory → recurse=true
-    │       └── 新 listDirJob{srcRemote=dir, dstRemote=dir, noDst=true}
+    ├── dst 始终为 nil
     │
-    └── 新 job 入队
-        │
-        └── 子目录同样 ErrorDirNotFound → 重复上述流程
-            └── 直到 srcDepth 耗尽或所有文件报告完毕
+    ├── src=Object → srcOnly → report('+', MissingOnDst)
+    └── src=Directory → srcOnly → recurse=true
+        └── 新 listDirJob{srcRemote=dir, dstRemote=dir, noDst=true}
+            │
+            └── processJob 子目录（noDst=true）
+                ├── 第 407 行 !m.NoTraverse && !job.noDst → false
+                ├── 不调用 dstListDir，startedDst=false
+                ├── close(dstChan)（第 492 行）
+                │
+                └── matchListings()
+                    ├── dst=nil → 所有 src 走 srcOnly
+                    │   ├── Object → '+'
+                    │   └── Directory → recurse → 生成 noDst=true 孙目录 job
+                    │       └── 重复此流程（不再调用 dstListDir，不再产生 ErrorDirNotFound）
+                    └── 直到 srcDepth 耗尽或所有文件报告完毕
 ```
 
-**关键特征**：`dstListErr == fs.ErrorDirNotFound` 被静默忽略，不返回错误，允许递归继续。
+**关键特征**：
+- 仅顶层 job 产生 `ErrorDirNotFound`，子 job 因 `noDst=true` 根本不调用 `dstListDir`
+- 子层级通过 `close(dstChan)` 驱动所有 src 走 `srcOnly`，而非通过 ErrorDirNotFound
 
 ### 6.4 CheckSum 模式：清单消费与单向校验
 

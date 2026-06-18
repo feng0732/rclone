@@ -12,10 +12,10 @@ rclone 的 crypt 后端是一个**包装层（Wrapper）**，它不直接存储�
       数据流包装
 ```
 
-核心文件：
-- [cipher.go](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go) - 密码学核心实现
-- [crypt.go](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go) - FS 和 Object 的包装层实现
-- [pkcs7/pkcs7.go](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/pkcs7/pkcs7.go) - PKCS#7 填充
+核心文件（相对路径，基于项目根目录）：
+- `backend/crypt/cipher.go` — 密码学核心实现（密钥派生、文件名加密、内容加密流）
+- `backend/crypt/crypt.go` — FS 和 Object 的包装层实现
+- `backend/crypt/pkcs7/pkcs7.go` — PKCS#7 填充
 
 ---
 
@@ -23,33 +23,33 @@ rclone 的 crypt 后端是一个**包装层（Wrapper）**，它不直接存储�
 
 ### 2.1 Cipher 结构体
 
-[Cipher](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L172-L184) 是加密核心，包含三类密钥：
+`Cipher`（`backend/crypt/cipher.go`）是加密核心，包含三类密钥：
 
 ```go
 type Cipher struct {
-    dataKey   [32]byte      // 内容加密密钥（secretbox 使用）
-    nameKey   [32]byte      // 文件名加密密钥（AES 使用）
-    nameTweak [16]byte      // 文件名加密的调整量（EME 模式使用）
+    dataKey   [32]byte       // 内容加密密钥（NACL secretbox 使用）
+    nameKey   [32]byte       // 文件名加密密钥（AES 使用）
+    nameTweak [16]byte       // 文件名加密的调整量（EME 模式使用）
     block     gocipher.Block // AES cipher 实例
-    mode      NameEncryptionMode // 文件名加密模式
+    mode      NameEncryptionMode
     // ...
 }
 ```
 
 ### 2.2 scrypt 密钥派生
 
-[Key()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L231-L252) 方法使用 **scrypt** 算法从用户密码派生密钥：
+`Key()` 方法（`backend/crypt/cipher.go`）使用 **scrypt** 算法从用户密码派生密钥：
 
 ```go
 func (c *Cipher) Key(password, salt string) (err error) {
     keySize := len(c.dataKey) + len(c.nameKey) + len(c.nameTweak) // 32+32+16 = 80 字节
     // scrypt 参数: N=16384, r=8, p=1
     key, err := scrypt.Key([]byte(password), saltBytes, 16384, 8, 1, keySize)
-    
+
     copy(c.dataKey[:], key[:32])          // 前 32 字节 → 内容加密密钥
     copy(c.nameKey[:], key[32:64])        // 中间 32 字节 → 文件名加密密钥
     copy(c.nameTweak[:], key[64:80])      // 后 16 字节 → EME tweak
-    
+
     c.block, err = aes.NewCipher(c.nameKey[:])
     return err
 }
@@ -61,7 +61,7 @@ func (c *Cipher) Key(password, salt string) (err error) {
 
 ### 3.1 三种加密模式
 
-[NameEncryptionMode](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L80-L87) 定义了三种模式：
+`NameEncryptionMode`（`backend/crypt/cipher.go`）定义了三种模式：
 
 | 模式 | 说明 |
 |------|------|
@@ -71,13 +71,13 @@ func (c *Cipher) Key(password, salt string) (err error) {
 
 ### 3.2 标准加密模式（Standard）
 
-#### 加密流程 - [encryptSegment()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L278-L285)
+#### 加密流程 — `encryptSegment()`（`backend/crypt/cipher.go`）
 
 ```go
 func (c *Cipher) encryptSegment(plaintext string) string {
-    paddedPlaintext := pkcs7.Pad(nameCipherBlockSize, []byte(plaintext))  // PKCS#7 填充到 16 字节倍数
-    ciphertext := eme.Transform(c.block, c.nameTweak[:], paddedPlaintext, eme.DirectionEncrypt)  // EME-AES 加密
-    return c.fileNameEnc.EncodeToString(ciphertext)  // Base32/Base64/Base32768 编码
+    paddedPlaintext := pkcs7.Pad(nameCipherBlockSize, []byte(plaintext)) // PKCS#7 填充到 16 字节倍数
+    ciphertext := eme.Transform(c.block, c.nameTweak[:], paddedPlaintext, eme.DirectionEncrypt) // EME-AES 加密
+    return c.fileNameEnc.EncodeToString(ciphertext) // Base32/Base64/Base32768 编码
 }
 ```
 
@@ -86,19 +86,19 @@ func (c *Cipher) encryptSegment(plaintext string) string {
 - 相同前缀的明文不会产生相同前缀的密文
 - 基于 AES，使用 `nameTweak` 作为调整量
 
-#### 解密流程 - [decryptSegment()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L288-L312)
+#### 解密流程 — `decryptSegment()`（`backend/crypt/cipher.go`）
 
 ```go
 func (c *Cipher) decryptSegment(ciphertext string) (string, error) {
-    rawCiphertext, err := c.fileNameEnc.DecodeString(ciphertext)  // 解码
+    rawCiphertext, err := c.fileNameEnc.DecodeString(ciphertext) // 解码
     // ... 长度校验 ...
-    paddedPlaintext := eme.Transform(c.block, c.nameTweak[:], rawCiphertext, eme.DirectionDecrypt)  // EME-AES 解密
-    plaintext, err := pkcs7.Unpad(nameCipherBlockSize, paddedPlaintext)  // 去填充
+    paddedPlaintext := eme.Transform(c.block, c.nameTweak[:], rawCiphertext, eme.DirectionDecrypt) // EME-AES 解密
+    plaintext, err := pkcs7.Unpad(nameCipherBlockSize, paddedPlaintext) // 去填充
     return string(plaintext), err
 }
 ```
 
-#### 文件名编码方式 - [fileNameEncoding](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L121-L124)
+#### 文件名编码方式 — `fileNameEncoding`（`backend/crypt/cipher.go`）
 
 | 编码方式 | 适用场景 |
 |---------|---------|
@@ -108,7 +108,7 @@ func (c *Cipher) decryptSegment(ciphertext string) (string, error) {
 
 ### 3.3 混淆模式（Obfuscated）
 
-[obfuscateSegment()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L315-L400) 使用简单的字符旋转：
+`obfuscateSegment()`（`backend/crypt/cipher.go`）使用简单的字符旋转：
 
 1. 计算文件名所有字符的 Unicode 码点之和，模 256 得到旋转基数
 2. 加上 `nameKey` 的字节值得到实际旋转量
@@ -117,20 +117,20 @@ func (c *Cipher) decryptSegment(ciphertext string) (string, error) {
 
 这是一种弱加密，仅用于防止文件名被直接识别。
 
-### 3.4 路径分段加密 - [encryptFileName()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L489-L525)
+### 3.4 路径分段加密 — `encryptFileName()`（`backend/crypt/cipher.go`）
 
 ```go
 func (c *Cipher) encryptFileName(in string) string {
-    segments := strings.Split(in, "/")  // 按路径分隔
+    segments := strings.Split(in, "/") // 按路径分隔
     for i := range segments {
         if !c.dirNameEncrypt && i != (len(segments)-1) {
-            continue  // 可配置是否加密目录名
+            continue // 可配置是否加密目录名
         }
         // 处理版本后缀（如 file.txt → 加密部分 + 版本后缀）
         if version.Match(segments[i]) { /* strip version */ }
-        
-        segments[i] = c.encryptSegment(segments[i])  // 每段单独加密
-        
+
+        segments[i] = c.encryptSegment(segments[i]) // 每段单独加密
+
         // 加回版本后缀
     }
     return strings.Join(segments, "/")
@@ -143,58 +143,64 @@ func (c *Cipher) encryptFileName(in string) string {
 
 ## 四、内容加密机制
 
-### 4.1 文件格式
+### 4.1 文件格式与常量
 
 加密后的文件结构：
 
 ```
-+----------------+----------------+----------------+----------------+
-|   Magic (7B)   |   Nonce (24B)  |  Block 1       |  Block 2 ...   |
-|  "RCLONE\x00\x00"  |                | secretbox 加密 |                |
-+----------------+----------------+----------------+----------------+
-        ↑              ↑                  ↑
-    文件头 31 字节    随机数       每个块 64KB 数据 + 16B 认证标签
++-----------------+-----------------+-------------------+-------------------+
+|   Magic (8B)    |   Nonce (24B)   |   Block 1         |   Block 2 ...     |
+|  "RCLONE\x00\x00"  |   初始随机数    | secretbox 加密块   |                   |
++-----------------+-----------------+-------------------+-------------------+
+         ↑                ↑                   ↑
+    文件头 32 字节        随机数        每块: 64KB 明文 + 16B 认证标签
 ```
 
-常量定义见 [cipher.go L32-L41](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L32-L41)：
-- `fileMagicSize = 7` - 魔术字节
-- `fileNonceSize = 24` - nonce 大小（NACL secretbox 要求）
-- `fileHeaderSize = 31` - 文件头总大小
-- `blockDataSize = 64 * 1024` - 每个块的明文大小（64KB）
-- `blockHeaderSize = 16` - secretbox 的认证标签 overhead
-- `blockSize = blockHeaderSize + blockDataSize` - 每个块的密文大小
+常量定义（`backend/crypt/cipher.go` 常量区）：
 
-### 4.2 加密流 - encrypter
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `fileMagic` | `"RCLONE\x00\x00"` | 6 字母 + 2 零字节 = **8 字节** |
+| `fileMagicSize` | `len(fileMagic)` = **8** | 魔术字节长度 |
+| `fileNonceSize` | **24** | NACL secretbox 要求的 nonce 大小 |
+| `fileHeaderSize` | `8 + 24` = **32** | 文件头总大小（magic + nonce） |
+| `blockDataSize` | `64 * 1024` = **65536** | 每个块的明文大小（64KB） |
+| `blockHeaderSize` | `secretbox.Overhead` = **16** | secretbox 认证标签 overhead |
+| `blockSize` | `16 + 65536` = **65552** | 每个块的密文总大小 |
 
-[encrypter](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L681-L691) 实现 `io.Reader` 接口，对输入流进行流式加密：
+> **注意**：`"RCLONE\x00\x00"` 是 8 字节（`R` `C` `L` `O` `N` `E` + `\x00` `\x00`），不是 7 字节。`fileHeaderSize = 8 + 24 = 32` 字节。
+
+### 4.2 加密流 — encrypter
+
+`encrypter`（`backend/crypt/cipher.go`）实现 `io.Reader` 接口，对输入流进行流式加密：
 
 ```go
 type encrypter struct {
-    in       io.Reader     // 底层输入流（明文）
-    c        *Cipher       // 密码器引用
-    nonce    nonce         // 当前块的 nonce，每块递增
+    in       io.Reader          // 底层输入流（明文）
+    c        *Cipher            // 密码器引用
+    nonce    nonce              // 当前块的 nonce，每块递增
     buf      *[blockSize]byte   // 加密输出缓冲区
     readBuf  *[blockDataSize]byte // 明文读取缓冲区
-    bufIndex int           // 当前读取位置
-    bufSize  int           // 缓冲区有效数据大小
+    bufIndex int                // 当前读取位置
+    bufSize  int                // 缓冲区有效数据大小
     // ...
 }
 ```
 
-#### 加密流程 - [encrypter.Read()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L719-L745)
+#### 加密流程 — `encrypter.Read()`（`backend/crypt/cipher.go`）
 
 ```go
 func (fh *encrypter) Read(p []byte) (n int, err error) {
     if fh.bufIndex >= fh.bufSize {
-        // 1. 读取一块明文数据（64KB）
+        // 1. 读取一块明文数据（最多 64KB）
         n, err = readers.ReadFill(fh.in, readBuf[:blockDataSize])
         if n == 0 {
-            return fh.finish(err)  // EOF
+            return fh.finish(err) // EOF
         }
-        // 2. 使用 secretbox 加密（XSalsa20 + Poly1305）
+        // 2. 使用 secretbox 加密（XSalsa20 + Poly1305 认证加密）
         secretbox.Seal((*fh.buf)[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
         fh.bufIndex = 0
-        fh.bufSize = blockHeaderSize + n
+        fh.bufSize = blockHeaderSize + n // 16 + n 字节
         // 3. nonce 递增（每个块用不同 nonce）
         fh.nonce.increment()
     }
@@ -207,52 +213,52 @@ func (fh *encrypter) Read(p []byte) (n int, err error) {
 
 **NACL secretbox** 使用：
 - 算法：XSalsa20 流加密 + Poly1305 消息认证码
-- 提供**认证加密**（authenticated encryption）
-- 每个块有独立的 nonce，nonce 从文件头的初始值递增
+- 提供**认证加密**（authenticated encryption），可检测篡改
+- 每个块有独立的 nonce，nonce 从文件头的初始值逐块递增
 
-### 4.3 解密流 - decrypter
+### 4.3 解密流 — decrypter
 
-[decrypter](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L777-L790) 实现 `io.ReadCloser` + `io.Seeker` 接口：
+`decrypter`（`backend/crypt/cipher.go`）实现 `io.ReadCloser` + `io.Seeker` 接口：
 
 ```go
 type decrypter struct {
-    rc           io.ReadCloser  // 底层输入流（密文）
-    nonce        nonce          // 当前块的 nonce
-    initialNonce nonce          // 初始 nonce（用于 seek）
+    rc           io.ReadCloser   // 底层输入流（密文）
+    nonce        nonce           // 当前块的 nonce
+    initialNonce nonce           // 初始 nonce（用于 seek）
     c            *Cipher
     buf          *[blockSize]byte    // 解密输出缓冲区
     readBuf      *[blockSize]byte    // 密文读取缓冲区
     bufIndex     int
     bufSize      int
-    limit        int64          // 读取限制（用于 Range 请求）
-    open         OpenRangeSeek  // 用于重新打开底层流（seek 时）
+    limit        int64           // 读取限制（用于 Range 请求）
+    open         OpenRangeSeek   // 用于重新打开底层流（seek 时）
 }
 ```
 
-#### 初始化 - [newDecrypter()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L793-L818)
+#### 初始化 — `newDecrypter()`（`backend/crypt/cipher.go`）
 
 ```go
 func (c *Cipher) newDecrypter(rc io.ReadCloser) (*decrypter, error) {
-    // 1. 读取文件头（magic + nonce）
-    readBuf := (*fh.readBuf)[:fileHeaderSize]
+    // 1. 读取文件头（magic + nonce）= 32 字节
+    readBuf := (*fh.readBuf)[:fileHeaderSize] // 32 字节
     n, err := readers.ReadFill(fh.rc, readBuf)
     // 2. 校验魔术字节
-    if !bytes.Equal(readBuf[:fileMagicSize], fileMagicBytes) {
+    if !bytes.Equal(readBuf[:fileMagicSize], fileMagicBytes) { // 前 8 字节
         return nil, ErrorEncryptedBadMagic
     }
-    // 3. 获取初始 nonce
-    fh.nonce.fromBuf(readBuf[fileMagicSize:])
+    // 3. 获取初始 nonce（从第 8 字节开始的 24 字节）
+    fh.nonce.fromBuf(readBuf[fileMagicSize:]) // 偏移 8，读 24 字节
     fh.initialNonce = fh.nonce
     return fh, nil
 }
 ```
 
-#### 解密流程 - [decrypter.Read()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L901-L927)
+#### 解密流程 — `decrypter.Read()`（`backend/crypt/cipher.go`）
 
 ```go
 func (fh *decrypter) Read(p []byte) (n int, err error) {
     if fh.bufIndex >= fh.bufSize {
-        err = fh.fillBuffer()  // 读取并解密一个块
+        err = fh.fillBuffer() // 读取并解密一个块
         if err != nil {
             return 0, fh.finish(err)
         }
@@ -268,77 +274,138 @@ func (fh *decrypter) Read(p []byte) (n int, err error) {
 }
 ```
 
-#### 块解密 - [fillBuffer()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L862-L898)
+#### 块解密 — `fillBuffer()`（`backend/crypt/cipher.go`）
 
 ```go
 func (fh *decrypter) fillBuffer() (err error) {
-    // 1. 读取一个密文块
+    // 1. 读取一个密文块（最多 65552 字节 = 16 + 65536）
     n, err := readers.ReadFill(fh.rc, (*readBuf)[:])
     // 2. secretbox 解密 + 认证
     _, ok := secretbox.Open((*fh.buf)[:0], (*readBuf)[:n], fh.nonce.pointer(), &fh.c.dataKey)
     if !ok {
         if !fh.c.passBadBlocks {
-            return ErrorEncryptedBadBlock  // 认证失败
+            return ErrorEncryptedBadBlock // 认证失败
         }
         // passBadBlocks 模式：用零填充损坏的块
         for i := range (*fh.buf)[:n] { fh.buf[i] = 0 }
     }
-    fh.bufSize = n - blockHeaderSize
-    fh.nonce.increment()  // nonce 递增
+    fh.bufSize = n - blockHeaderSize // 明文大小 = 密文大小 - 16
+    fh.nonce.increment() // nonce 递增
     return nil
 }
 ```
 
 ### 4.4 随机访问（Seek）
 
-[RangeSeek()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L972-L1034) 支持随机访问：
+`RangeSeek()`（`backend/crypt/cipher.go`）支持随机访问：
 
 ```go
 func (fh *decrypter) RangeSeek(ctx context.Context, offset int64, whence int, limit int64) (int64, error) {
     // 1. 计算底层文件的偏移和块号
     underlyingOffset, underlyingLimit, discard, blocks := calculateUnderlying(offset, limit)
-    
-    // 2. 重置 nonce 到目标块
+
+    // 2. 重置 nonce 到目标块（从初始 nonce 开始加 blocks 次）
     fh.nonce = fh.initialNonce
     fh.nonce.add(uint64(blocks))
-    
+
     // 3. 底层流定位（如果支持 RangeSeeker 则直接 seek，否则重新打开）
     if do, ok := fh.rc.(fs.RangeSeeker); ok {
         _, err := do.RangeSeek(ctx, underlyingOffset, 0, underlyingLimit)
     } else {
         _ = fh.rc.Close()
-        rc, err := fh.open(ctx, underlyingOffset, underlyingLimit)  // 重新打开
+        rc, err := fh.open(ctx, underlyingOffset, underlyingLimit) // 重新打开
         fh.rc = rc
     }
-    
+
     // 4. 读取并解密第一块，丢弃块内偏移部分
     err := fh.fillBuffer()
-    fh.bufIndex = int(discard)  // 跳过块内偏移
-    
+    fh.bufIndex = int(discard) // 跳过块内偏移
+
     fh.limit = limit
     return offset, nil
 }
 ```
 
-#### 偏移量换算 - [calculateUnderlying()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L935-L965)
+#### 偏移量换算 — `calculateUnderlying()`（`backend/crypt/cipher.go`）
 
 ```
-明文偏移 → 密文偏移换算：
+明文偏移 → 密文偏移换算原理：
 
 明文:   |  块 0 (64KB)  |  块 1 (64KB)  |  ...
 密文:   |Hdr| 块 0 (64KB+16B) | 块 1 (64KB+16B) | ...
         ↑
-   fileHeaderSize(31B)
+   fileHeaderSize (32B)
 
-blocks = offset / blockDataSize       // 完整块数
-discard = offset % blockDataSize      // 块内偏移
+blocks = offset / blockDataSize        // 完整块数
+discard = offset % blockDataSize       // 块内偏移（需要丢弃的字节数）
 underlyingOffset = fileHeaderSize + blocks * (blockHeaderSize + blockDataSize)
+                  = 32 + blocks * 65552
 ```
+
+**数值校验样例**：
+
+| 明文 offset | blocks | discard | 密文 underlyingOffset | 说明 |
+|------------:|-------:|--------:|---------------------:|------|
+| 0 | 0 | 0 | 32 | 文件开头，跳过 32 字节文件头 |
+| 1 | 0 | 1 | 32 | 第 0 块内偏移 1 字节 |
+| 65535 | 0 | 65535 | 32 | 第 0 块最后一个字节 |
+| 65536 | 1 | 0 | 65584 | 第 1 块起始（32 + 65552） |
+| 65537 | 1 | 1 | 65584 | 第 1 块内偏移 1 字节 |
+| 131072 | 2 | 0 | 131136 | 第 2 块起始（32 + 2×65552） |
+| 70000 | 1 | 4464 | 65584 | 第 1 块内偏移 4464 字节（70000 - 65536） |
+
+> 验证：`65552 = blockHeaderSize + blockDataSize = 16 + 65536` ✓
+> 验证：`65584 = 32 + 65552` ✓
+> 验证：`131136 = 32 + 2 × 65552 = 32 + 131104` ✓
 
 ### 4.5 大小换算
 
-- [EncryptedSize()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L1121-L1128)：明文大小 → 密文大小
-- [DecryptedSize()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/cipher.go#L1131-L1146)：密文大小 → 明文大小
+#### `EncryptedSize()` — 明文大小 → 密文大小（`backend/crypt/cipher.go`）
+
+```go
+func (c *Cipher) EncryptedSize(size int64) int64 {
+    blocks, residue := size/blockDataSize, size%blockDataSize
+    encryptedSize := int64(fileHeaderSize) + blocks*(blockHeaderSize+blockDataSize)
+    if residue != 0 {
+        encryptedSize += blockHeaderSize + residue
+    }
+    return encryptedSize
+}
+```
+
+#### `DecryptedSize()` — 密文大小 → 明文大小（`backend/crypt/cipher.go`）
+
+```go
+func (c *Cipher) DecryptedSize(size int64) (int64, error) {
+    size -= int64(fileHeaderSize) // 先去掉文件头
+    if size < 0 {
+        return 0, ErrorEncryptedFileTooShort
+    }
+    blocks, residue := size/blockSize, size%blockSize // blockSize = 65552
+    decryptedSize := blocks * blockDataSize           // 完整块的明文
+    if residue != 0 {
+        residue -= blockHeaderSize                    // 尾块去掉 16 字节认证头
+        if residue <= 0 {
+            return 0, ErrorEncryptedFileBadHeader
+        }
+    }
+    decryptedSize += residue
+    return decryptedSize, nil
+}
+```
+
+**数值校验样例**：
+
+| 明文大小 | 密文大小（EncryptedSize） | 反向解密（DecryptedSize） | 说明 |
+|---------:|-------------------------:|-------------------------:|------|
+| 0 | 32 | 0 | 空文件只有文件头 |
+| 1 | 49 | 1 | 32 + 16 + 1 = 49 |
+| 100 | 148 | 100 | 32 + 16 + 100 = 148 |
+| 65536 (64KB) | 65584 | 65536 | 32 + 65552 = 65584（刚好 1 块） |
+| 65537 | 65601 | 65537 | 32 + 65552 + 16 + 1 = 65601（1 块 + 1 字节尾块） |
+| 131072 (128KB) | 131136 | 131072 | 32 + 2×65552 = 131136（刚好 2 块） |
+
+> 验证：所有样例的 DecryptedSize(EncryptedSize(x)) == x ✓
 
 ---
 
@@ -346,7 +413,7 @@ underlyingOffset = fileHeaderSize + blocks * (blockHeaderSize + blockDataSize)
 
 ### 5.1 Fs 结构体
 
-[Fs](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L320-L328) 包装底层 `fs.Fs`：
+`Fs`（`backend/crypt/crypt.go`）包装底层 `fs.Fs`：
 
 ```go
 type Fs struct {
@@ -359,9 +426,9 @@ type Fs struct {
 }
 ```
 
-### 5.2 初始化流程 - NewFs()
+### 5.2 初始化流程 — `NewFs()`
 
-[NewFs()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L224-L301) 初始化步骤：
+`NewFs()`（`backend/crypt/crypt.go`）初始化步骤：
 
 1. 解析配置，创建 `Cipher` 实例
 2. 加密根路径，用加密后的路径创建底层 `Fs`
@@ -372,11 +439,11 @@ type Fs struct {
 func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, error) {
     // ... 创建 cipher ...
     remote := opt.Remote
-    
+
     // 先尝试作为文件路径加密
     remotePath := fspath.JoinRootPath(remote, cipher.EncryptFileName(rpath))
     wrappedFs, err = cache.Get(ctx, remotePath)
-    
+
     // 如果不是文件，尝试作为目录加密
     if err != fs.ErrorIsFile {
         remotePath = fspath.JoinRootPath(remote, cipher.EncryptDirName(rpath))
@@ -386,9 +453,9 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 }
 ```
 
-### 5.3 列表操作 - List / ListP
+### 5.3 列表操作 — List / ListP
 
-[ListP()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L439-L457) 是典型的"加密路径调用 → 解密结果返回"模式：
+`ListP()`（`backend/crypt/crypt.go`）是典型的"加密路径调用 → 解密结果返回"模式：
 
 ```go
 func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
@@ -404,44 +471,44 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 }
 ```
 
-条目解密在 [encryptEntries()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L387-L411) 中完成：
+条目解密在 `encryptEntries()`（`backend/crypt/crypt.go`）中完成：
 - 文件对象 → 调用 `DecryptFileName()` 解密文件名
 - 目录对象 → 调用 `DecryptDirName()` 解密目录名
 - 解密失败的条目根据 `strict_names` 配置决定是跳过还是报错
 
-### 5.4 上传操作 - Put / PutStream
+### 5.4 上传操作 — Put / PutStream
 
-[put()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L497-L563) 封装了上传流程：
+`put()`（`backend/crypt/crypt.go`）封装了上传流程：
 
 ```go
-func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
+func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo,
     options []fs.OpenOption, put putFn) (fs.Object, error) {
-    
+
     if f.opt.NoDataEncryption {
         // 不加密数据，直接传递
         return put(ctx, in, f.newObjectInfo(src, nonce{}), options...)
     }
-    
+
     // 1. 包装输入流为加密流
     wrappedIn, encrypter, err := f.cipher.encryptData(in)
-    
+
     // 2. （可选）计算加密数据的 hash
     // 用 TeeReader 同时加密和算 hash
-    
+
     // 3. 调用底层 Put，传入加密后的数据流和 ObjectInfo
     // ObjectInfo 会加密文件名、调整大小
     o, err := put(ctx, wrappedIn, f.newObjectInfo(src, encrypter.nonce), options...)
-    
+
     // 4. 校验 hash（如果启用）
     // ...
-    
-    return f.newObject(o), nil  // 包装返回的 Object
+
+    return f.newObject(o), nil // 包装返回的 Object
 }
 ```
 
 ### 5.5 Object 包装
 
-[Object](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L989-L999) 包装底层 `fs.Object`，透明地解密文件名和内容：
+`Object`（`backend/crypt/crypt.go`）包装底层 `fs.Object`，透明地解密文件名和内容：
 
 ```go
 type Object struct {
@@ -450,32 +517,32 @@ type Object struct {
 }
 ```
 
-关键方法：
-- [Remote()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1015-L1023)：解密文件名后返回
-- [Size()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1026-L1036)：转换为明文大小
-- [Hash()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1040-L1042)：返回不支持（因为加密后 hash 无意义）
-- [Open()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1050-L1088)：返回解密流
-- [Update()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1091-L1097)：加密上传
+关键方法（均在 `backend/crypt/crypt.go`）：
+- `Remote()`：解密文件名后返回
+- `Size()`：转换为明文大小
+- `Hash()`：返回不支持（因为加密后 hash 无意义）
+- `Open()`：返回解密流
+- `Update()`：加密上传
 
 ### 5.6 ObjectInfo 包装
 
-[ObjectInfo](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1143-L1147) 用于上传时的源对象信息：
+`ObjectInfo`（`backend/crypt/crypt.go`）用于上传时的源对象信息：
 
 ```go
 type ObjectInfo struct {
     fs.ObjectInfo
     f     *Fs
-    nonce nonce  // 加密使用的 nonce（用于 hash 计算）
+    nonce nonce // 加密使用的 nonce（用于 hash 计算）
 }
 ```
 
-关键方法：
-- [Remote()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1163-L1165)：加密文件名
-- [Size()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1168-L1177)：转换为密文大小
+关键方法（均在 `backend/crypt/crypt.go`）：
+- `Remote()`：加密文件名
+- `Size()`：转换为密文大小
 
-### 5.7 打开文件 - Object.Open()
+### 5.7 打开文件 — `Object.Open()`
 
-[Open()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L1050-L1088) 是内容解密的入口：
+`Open()`（`backend/crypt/crypt.go`）是内容解密的入口：
 
 ```go
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (rc io.ReadCloser, err error) {
@@ -490,54 +557,57 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (rc io.Read
             openOptions = append(openOptions, option)
         }
     }
-    
+
     // 使用 DecryptDataSeek，传入一个回调函数用于打开底层流
-    rc, err = o.f.cipher.DecryptDataSeek(ctx, 
+    rc, err = o.f.cipher.DecryptDataSeek(ctx,
         func(ctx context.Context, underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
             // 回调：根据计算出的底层偏移和限制打开文件
             // ... 构造 RangeOption ...
             return o.Object.Open(ctx, newOpenOptions...)
         }, offset, limit)
-    
+
     return rc, nil
 }
 ```
 
-### 5.8 目录操作
+### 5.8 目录操作汇总
 
-所有目录操作都遵循**加密路径 → 调用底层 → 返回结果**的模式：
+所有目录操作都遵循**加密路径 → 调用底层 → 返回结果**的模式（均在 `backend/crypt/crypt.go`）：
 
-| 操作 | 加密的内容 | 代码位置 |
-|------|-----------|---------|
-| `Mkdir` | 目录名 | [crypt.go L587-L589](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L587-L589) |
-| `Rmdir` | 目录名 | [crypt.go L625-L627](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L625-L627) |
-| `Purge` | 目录名 | [crypt.go L635-L641](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L635-L641) |
-| `Copy` | 目标文件名 | [crypt.go L652-L666](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L652-L666) |
-| `Move` | 目标文件名 | [crypt.go L677-L691](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L677-L691) |
-| `DirMove` | 源/目标目录名 | [crypt.go L701-L712](file:///d:/fz/0601-2/solo-dogfeeding/code/49-rclone/backend/crypt/crypt.go#L701-L712) |
+| 操作 | 加密的内容 | 说明 |
+|------|-----------|------|
+| `Mkdir` | 目录名 | 创建加密目录 |
+| `Rmdir` | 目录名 | 删除加密目录 |
+| `Purge` | 目录名 | 清空加密目录 |
+| `Copy` | 目标文件名 | 服务端复制（同 remote） |
+| `Move` | 目标文件名 | 服务端移动（同 remote） |
+| `DirMove` | 源/目标目录名 | 目录级服务端移动 |
 
 ---
 
 ## 六、完整调用链示例
 
-### 6.1 下载文件流程
+### 6.1 下载文件流程（带 Range 请求）
 
 ```
-用户调用: fs.Object.Open(ctx)
+用户调用: fs.Object.Open(ctx, &fs.RangeOption{Start: offset, End: end})
     ↓
 crypt.Object.Open(ctx, options)
     ├─ 解析 SeekOption/RangeOption → offset, limit
     └─ cipher.DecryptDataSeek(ctx, openFn, offset, limit)
-        └─ decrypter (实现 ReadSeekCloser)
+        └─ decrypter（实现 ReadSeekCloser 接口）
             ├─ 初始化: newDecrypterSeek()
-            │   ├─ 调用 openFn(ctx, 0, fileHeaderSize) 读取文件头
-            │   ├─ 校验 magic → 读 nonce → 保存 initialNonce
+            │   ├─ 调用 openFn(ctx, 0, 32) 读取文件头（32 字节）
+            │   ├─ 校验 magic（前 8 字节）→ 读 nonce（后 24 字节）→ 保存 initialNonce
             │   └─ 如果 offset > 0，调用 RangeSeek()
+            │       ├─ calculateUnderlying() 计算 blocks, discard, underlyingOffset
+            │       ├─ nonce = initialNonce + blocks
+            │       └─ 重新打开底层流（或直接 seek）到底层偏移
             └─ Read() 时:
-                ├─ fillBuffer() 读取一个密文块
-                ├─ secretbox.Open() 解密 + 认证
+                ├─ fillBuffer() 读取一个密文块（最多 65552 字节）
+                ├─ secretbox.Open() 解密 + 认证（16 字节标签）
                 ├─ nonce 递增
-                └─ 返回明文字节
+                └─ 返回明文字节（最多 65536 字节）
 ```
 
 ### 6.2 上传文件流程
@@ -547,13 +617,13 @@ crypt.Object.Open(ctx, options)
     ↓
 crypt.Fs.put(ctx, in, src, options, f.Fs.Put)
     ├─ cipher.encryptData(in) → encrypter
-    │   └─ 内部有 nonce（随机生成）
+    │   └─ 内部 nonce 随机生成（24 字节）
     ├─ （可选）TeeReader 计算加密数据的 hash
     ├─ newObjectInfo(src, encrypter.nonce)
     │   ├─ Remote() → 加密文件名
-    │   └─ Size() → 加密后大小
+    │   └─ Size() → EncryptedSize(src.Size())
     └─ 底层 Put(ctx, wrappedIn, encryptedObjInfo)
-        └─ 上传加密后的数据流
+        └─ 上传加密后的数据流（文件头 32B + 逐块加密）
 ```
 
 ### 6.3 列目录流程
@@ -578,12 +648,14 @@ crypt.Fs.ListP(ctx, dir, callback)
 
 2. **双重加密体系**：
    - 文件名：EME-AES 确定性加密（保证相同文件名映射一致）
-   - 文件内容：NACL secretbox 流式认证加密（每个块独立 nonce）
+   - 文件内容：NACL secretbox 流式认证加密（每个块独立 nonce，支持 tamper detection）
 
-3. **分块加密**：64KB 一块，支持随机访问（seek 到块边界再解密）
+3. **分块加密**：64KB 一块，每块 16 字节认证标签，支持随机访问（seek 到块边界再解密）。
 
-4. **路径分段加密**：每个路径段单独加密，保持目录树结构
+4. **路径分段加密**：每个路径段单独加密，保持目录树结构。可配置是否加密目录名。
 
-5. **可配置性**：文件名加密模式、目录名加密、数据加密、后缀、编码方式等均可配置
+5. **可配置性**：文件名加密模式（standard/obfuscate/off）、目录名加密、数据加密、后缀、编码方式（base32/base64/base32768）等均可配置。
 
-6. **缓冲区池**：使用 `sync.Pool` 复用加密/解密缓冲区，减少 GC 压力
+6. **缓冲区池**：使用 `sync.Pool` 复用加密/解密缓冲区（`blockSize` = 65552 字节），减少 GC 压力。
+
+7. **随机访问支持**：`decrypter` 实现 `RangeSeeker` 接口，支持 HTTP Range 请求场景。通过 `calculateUnderlying()` 计算底层偏移，重新定位 nonce 即可实现随机读取。

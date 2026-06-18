@@ -487,15 +487,19 @@ ListR 的 `FastListBugFix` 机制展示了对第三方 API 缺陷的优雅处理
 | **通用查询** | list | [drive.go#L999-L1179](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L999-L1179) |
 | **单级列表** | ListP | [drive.go#L2000-L2041](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2000-L2041) |
 | **递归列表** | ListR / listRRunner | [drive.go#L2076-L2332](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2076-L2332) |
-| **条目转换** | itemToDirEntry / newObjectWithInfo | [drive.go#L1642-L1704](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1642-L1704) + [drive.go#L2422-L2447](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2422-L2447) |
-| **单文件查询** | getRemoteInfoWithExport / NewObject | [drive.go#L1708-L1727](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1708-L1727) + [drive.go#L4165-L4201](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L4165-L4201) |
+| **条目转换** | newObjectWithInfo / itemToDirEntry | [drive.go#L1642-L1653](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1642-L1653) + [drive.go#L2422-L2447](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2422-L2447) |
+| **单文件查询** | NewObject / getRemoteInfoWithExport | [drive.go#L1708-L1727](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1708-L1727) + [drive.go#L4165-L4203](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L4165-L4203) |
+| **目录缓存刷新** | DirCacheFlush | [drive.go#L3325-L3329](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3325-L3329) |
+| **目录移动** | DirMove | [drive.go#L3136-L3170](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3136-L3170) |
 | **共享盘列表** | listTeamDrives | [drive.go#L3471-L3491](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3471-L3491) |
-| **共享盘校验** | teamDriveOK | [drive.go#L2961-L2975](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2961-L2975) |
+| **共享盘校验** | teamDriveOK | [drive.go#L2960-L2976](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2960-L2976) |
 | **变更总入口** | ChangeNotify | [drive.go#L3178-L3220](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3178-L3220) |
 | **起始游标** | changeNotifyStartPageToken | [drive.go#L3222-L3236](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3222-L3236) |
 | **变更处理** | changeNotifyRunner | [drive.go#L3238-L3323](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3238-L3323) |
 | **快捷方式解引用** | resolveShortcut | [drive.go#L2391-L2417](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2391-L2417) |
-| **目录叶子查找** | FindLeaf | [drive.go#L1730-L1751](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1730-L1751) |
+| **目录叶子查找** | FindLeaf | [drive.go#L1730-L1753](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1730-L1753) |
+| **dirCache 库核心** | Put / GetInv / FlushDir | [dircache.go#L114-L119](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/lib/dircache/dircache.go#L114-L119) + [dircache.go#L106-L111](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/lib/dircache/dircache.go#L106-L111) + [dircache.go#L147-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/lib/dircache/dircache.go#L147-L171) |
+| **VFS 变更通知** | changeNotify / invalidateDir | [vfs/dir.go#L290-L299](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/vfs/dir.go#L290-L299) + [vfs/dir.go#L274-L284](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/vfs/dir.go#L274-L284) |
 
 ---
 
@@ -623,45 +627,58 @@ notifyFunc("docs/report.docx", EntryObject)
 
 **效果**：VFS 层收到通知后会失效对应路径缓存。下次用户 ls docs 时触发 ListP 重新拉取，就能看到新文件。
 
-#### 场景 3：变更检测遇到移动到未缓存目录
+#### 场景 3：文件移动到未缓存的新目录
 
 文件从 `a/` 移动到 `b/c/`，而 `b/c/` 从未被访问过：
 
 ```
 change = { fileId: fileId, file: { name: "x.txt", parents: [bcId] } }
   ↓
-① 旧路径: dirCache.GetInv(fileId) → ✅ 命中 → "a/x.txt"
-  → 加入 pathsToClear
+① 旧路径: dirCache.GetInv(fileId) → ❌ 永远不命中（文件不在 dirCache 里）★
+  → 不加入 pathsToClear
+  → 旧位置 "a/x.txt" 完全没有通知
   ↓
 ② 新路径: for parent in parents {
-     dirCache.GetInv(bcId) → ❌ 未命中
+     dirCache.GetInv(bcId) → ❌ 未命中（b/c/ 从未被访问过）
      → 跳过，不加入 pathsToClear
    }
   ↓
-只通知了 "a/x.txt"（旧位置失效）
-新位置 "b/c/x.txt" 完全不知道
+结果: 零通知 ★
+用户对这次文件移动完全无感
 ```
 
 **后果**：
-- 旧位置的 VFS 缓存会失效
-- 新位置不会主动通知，用户如果不主动进入 `b/c/` 目录，就看不到文件
-- 只有当用户主动 `ls b/c/` 触发 ListP 后，新位置才会被发现
+- 旧位置 `a/x.txt` 的 VFS 缓存不会被失效（因为不知道旧路径）
+- 新位置 `b/c/x.txt` 也不会有通知
+- 只有当用户主动 `ls a/` 时，才会发现文件不见了
+- 只有当用户主动 `ls b/c/` 时，才会发现文件出现在那里
 
-#### 场景 4：文件被移动到更深的未缓存路径树
+> **关键洞察**：只有**目录**移动时才能通过 `GetInv(dirId)` 找到旧路径。文件移动的旧路径永远查不到，因为文件 ID 根本不在 dirCache 中。
 
-与场景 3 类似，但影响范围更大——整个子树都在盲区。
+#### 场景 4：目录被移动到未缓存的新路径
+
+与场景 3 的文件移动不同，**目录移动能查到旧路径**（因为目录在 dirCache 里）。
 
 ```
 文件夹 docs/ 被移动到 archive/2023/
   ↓
-① dirCache 中所有 docs/ 下的子项 → GetInv 能查到旧路径
-  → 所有旧路径都能被通知失效
+① 旧路径: dirCache.GetInv(docsId) → ✅ 命中 → "docs"
+  → 通知 "docs"（EntryDirectory）
+  → 但 docs/ 下的子文件不在 dirCache 里，它们的旧路径不会被单独通知
+  → 子目录（如 docs/sub/）在 dirCache 里，能被 GetInv 查到吗？
+    → 不能！因为 Google API 只产生 docs/ 本身 1 条 change，
+      子目录不会各自产生 change 事件 ★
   ↓
-② 新父目录 archive/2023/ → 不在缓存中
+② 新路径: GetInv(archive2023Id) → ❌ 未命中（archive/2023/ 从未访问过）
   → 新位置完全不可见
   ↓
 结果: 用户感知到 "docs/ 消失了"，但不知道它去了哪里
 ```
+
+**与文件移动的关键区别**：
+- ✅ 目录移动 → 旧路径能被通知（因为目录 ID 在 dirCache 里）
+- ❌ 文件移动 → 旧路径永远查不到（因为文件 ID 不在 dirCache 里）
+- ❌ 两者的子文件 → 都不会产生独立的 change 事件（Google API 限制）
 
 #### 场景 5：深层目录的孙子文件变更
 
@@ -737,8 +754,10 @@ for _, change := range changeList.Changes {
 **关键点解读**：
 
 1. **旧路径查找不依赖 `change.File`**
-   - 只需要 `change.FileId`
-   - 无论文件是被移到回收站还是永久删除，只要 fileId 在 dirCache 中，就能找到旧路径并发出通知
+   - 只需要 `change.FileId`（注意：Drive API 中"file"是统称，包含文件夹和文件
+   - 如果该 ID 对应的是**目录**且在 dirCache 中 → 能找到旧路径并通知
+   - 如果该 ID 对应的是**文件** → 永远找不到（因为文件不在 dirCache 里）
+   - 无论是移到回收站还是永久删除，不影响旧路径查找（只看 ID，不看 file 内容
 
 2. **永久删除时 `change.File == nil`**
    - 新路径计算块完全跳过（`if change.File != nil` 不进入）
@@ -765,7 +784,8 @@ rclone 处理:
   子文件 report.docx → 没有 change → 不会被通知
   子目录 subdir/ → 没有 change → 不会被通知
   ↓
-dirCache 中 "docs/report.docx"、"docs/subdir/" 等条目 → 仍留在缓存中 ★
+dirCache 中 "docs/"、"docs/subdir/" 等目录条目 → 仍留在缓存中 ★
+（文件不在 dirCache 里，所以不存在文件级别的残留问题）
 ```
 
 **后果**：
@@ -985,9 +1005,11 @@ Changes.List 返回:
     → "docs/2025" 已存在，刷新
     → "docs/2024" 消失了（不再返回，所以 Put 不会发生）
   → 但 dirCache 中 "docs/2024" 这条记录还在吗？
-    → 不在！因为 dirCache 是惰性缓存，列表操作只会 Put 当前存在的项
-    → 已消失的项不会自动从 cache 中删除 ★
-    → 但如果 VFS 做了 diff，会发现少了 2024/ 并删除对应条目
+    → **还在！** ★
+    → dirCache 是只增不改（Put 只添加/覆盖）的惰性缓存
+    → 列表操作只会 Put 当前存在的项，不会主动删除已消失的项
+    → 所以 "docs/2024" → docs2024Id 的映射仍然残留在 cache 和 invCache 中
+    → VFS 层会发现少了 2024/ 并更新 VFS 自己的 items 映射，但 dirCache 不会变
 ```
 
 #### 第 4 步：如果用户之前缓存了 docs/2024/report.docx
@@ -1101,16 +1123,24 @@ Changes.List 返回:
 
 **代码证据**：只有目录才会 Put 进 dirCache
 
-[drive.go#L1670-L1683](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1670-L1683)
+[drive.go#L2422-L2436](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2422-L2436)
 ```go
-// itemToDirEntry 中
-if isDir {
-    d := fs.NewDirCopy(ctx, item.Name, t).SetID(item.Id)
-    // ...
-    // ★ 只有目录才 Put 进 dirCache
-    err = f.dirCache.Put(remote, item.Id)
-    return d, err
-}
+func (f *Fs) itemToDirEntry(ctx context.Context, remote string, item *drive.File) (entry fs.DirEntry, err error) {
+    switch {
+    case item.MimeType == driveFolderType:
+        // cache the directory ID for later lookups
+        f.dirCache.Put(remote, item.Id)  // ★ 只有文件夹类型才 Put 进 dirCache
+        // cache the resource key for later lookups
+        if item.ResourceKey != "" {
+            f.dirResourceKeys.Store(item.Id, item.ResourceKey)
+        }
+        baseObject, err := f.newBaseObject(ctx, remote, item)
+        if err != nil {
+            return nil, err
+        }
+        d := &Directory{baseObject: baseObject}
+        return d, nil
+    // ... 文件类型走另一个分支
 ```
 
 ### 13.2 文件变更路径的完整计算链路
@@ -1121,7 +1151,7 @@ if isDir {
 
 以「外部修改了 `docs/report.docx`」为例，看看 changeNotifyRunner 怎么处理：
 
-[drive.go#L3271-L3308](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3271-L3308)
+[drive.go#L3271-L3303](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3271-L3303)
 
 ```
 change = {
@@ -1223,19 +1253,28 @@ change.File.Parents = [bId]   // 新的父目录
 
 当 rclone 作为操作方移动目录时，会主动清理 dirCache：
 
-[drive.go#L3168](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3168)
-
+**调用点（DirMove 末尾）**：[drive.go#L3168](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3168)
 ```go
-// dircache.FlushDir 的实现
+srcFs.dirCache.FlushDir(srcRemote)  // 移动完成后，清除源路径及所有子目录的缓存
+```
+
+**dircache 中的实现**：[dircache.go#L147-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/lib/dircache/dircache.go#L147-L171)
+```go
 func (dc *DirCache) FlushDir(dir string) {
+    if dir == "" {
+        dc.ResetRoot()  // 根目录特殊处理，重置到初始状态
+        return
+    }
+    dc.cacheMu.Lock()
+
     // 1. 删除目录本身
     ID, ok := dc.cache[dir]
     if ok {
         delete(dc.cache, dir)
         delete(dc.invCache, ID)
     }
-    
-    // 2. ★ 级联删除所有子目录
+
+    // 2. ★ 级联删除所有子目录（通过前缀匹配）
     dir += "/"
     for key, ID := range dc.cache {
         if strings.HasPrefix(key, dir) {
@@ -1243,6 +1282,8 @@ func (dc *DirCache) FlushDir(dir string) {
             delete(dc.invCache, ID)
         }
     }
+
+    dc.cacheMu.Unlock()
 }
 ```
 
@@ -1277,27 +1318,32 @@ change = { fileId: dirId, file: { name: "docs", parents: [newParentId] } }
 [vfs/dir.go#L290-L299](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/vfs/dir.go#L290-L299)
 
 ```go
+// changeNotify invalidates the directory cache for the relativePath
+// passed in.
+//
+// if entryType is a directory it invalidates the parent of the directory too.
 func (d *Dir) changeNotify(relativePath string, entryType fs.EntryType) {
+    defer log.Trace(d.path, "relativePath=%q, type=%v", relativePath, entryType)("")
+    d.mu.RLock()
     absPath := path.Join(d.path, relativePath)
-    
-    // ★ 总是失效父目录
-    d.invalidateDir(vfscommon.FindParent(absPath))
-    
-    // ★ 如果是目录，也失效目录本身
+    d.mu.RUnlock()
+    d.invalidateDir(vfscommon.FindParent(absPath))  // ★ 总是失效父目录
     if entryType == fs.EntryDirectory {
-        d.invalidateDir(absPath)
+        d.invalidateDir(absPath)                      // ★ 目录类型额外失效自身
     }
 }
 ```
 
-`invalidateDir` 的实现：
+`invalidateDir` 的实现：[vfs/dir.go#L274-L284](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/vfs/dir.go#L274-L284)
 ```go
+// invalidateDir invalidates the directory cache for absPath relative to the root
 func (d *Dir) invalidateDir(absPath string) {
-    node := d.vfs.root.cachedNode(absPath)
+    node := d.vfs.root.cachedNode(absPath)  // 从根目录遍历查找节点
     if dir, ok := node.(*Dir); ok {
         dir.mu.Lock()
         if !dir.read.IsZero() {
-            dir.read = time.Time{}   // 标记为过期，下次访问重拉
+            fs.Debugf(dir.path, "invalidating directory cache")
+            dir.read = time.Time{}   // 标记为过期（清零），下次访问重拉
         }
         dir.mu.Unlock()
     }

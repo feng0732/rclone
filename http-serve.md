@@ -605,6 +605,164 @@ type RangeOption struct {
 }
 ```
 
+### 4.3.5 多范围（multipart/byteranges）请求的边界分析
+
+HTTP/1.1 规范（RFC 7233）允许客户端在单个请求中请求多个不连续的字节范围，格式为 `Range: bytes=0-99,200-299,500-`。此时服务器应返回 `206 Partial Content` 状态码，Content-Type 为 `multipart/byteranges; boundary=...`，每个范围作为独立的 body part。
+
+两条路径对多范围请求的支持存在本质差异。
+
+---
+
+#### ▎标准库 ServeContent 的多范围 multipart 响应能力
+
+VFS 路径调用的 `http.ServeContent`（Go 标准库 `net/http/fs.go`）**完整支持多范围请求**。标准库实现细节：
+
+**导入依赖**（标准库 fs.go 第 16 行）：
+```go
+import "mime/multipart"  // 用于构造 multipart 响应
+```
+
+**核心处理逻辑**（标准库 fs.go 第 319-394 行）：
+```go
+ranges, err := parseRange(rangeReq, size)  // 解析出 []httpRange 数组
+
+switch {
+case len(ranges) == 1:
+    // 单范围：设置 Content-Range 头，直接 Seek 后读取
+    w.Header().Set("Content-Range", ra.contentRange(size))
+    content.Seek(ra.start, io.SeekStart)
+    sendSize = ra.length
+
+case len(ranges) > 1:
+    // ── 多范围：构造 multipart/byteranges 响应 ──
+    sendSize = rangesMIMESize(ranges, ctype, size)  // 预计算总大小
+    code = StatusPartialContent
+
+    pr, pw := io.Pipe()
+    mw := multipart.NewWriter(pw)
+    // 关键：设置 multipart Content-Type，带 boundary
+    w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
+    sendContent = pr
+
+    // 通过 goroutine 异步写入各个 part
+    go func() {
+        for _, ra := range ranges {
+            // 每个 part 有独立的 MIME 头，含 Content-Range
+            part, err := mw.CreatePart(ra.mimeHeader(ctype, size))
+            // 对每个范围独立 Seek
+            content.Seek(ra.start, io.SeekStart)
+            // 精确拷贝该范围的长度
+            io.CopyN(part, content, ra.length)
+        }
+        mw.Close()
+        pw.Close()
+    }()
+}
+```
+
+**单范围 vs 多范围响应格式对比**：
+
+| 类型 | 状态码 | Content-Type | 响应头 | Body 格式 |
+|------|-------|-------------|--------|-----------|
+| 单范围 | 206 | `video/mp4` | `Content-Range: bytes 0-99/1000` | 直接 100 字节二进制数据 |
+| 多范围 | 206 | `multipart/byteranges; boundary=3d6b6a416f9b5` | 无 Content-Range 头（在各 part 内） | 各 part 用 boundary 分隔 |
+
+**多范围响应示例**（RFC 7233 规范）：
+```
+HTTP/1.1 206 Partial Content
+Content-Type: multipart/byteranges; boundary=3d6b6a416f9b5
+
+--3d6b6a416f9b5
+Content-Type: video/mp4
+Content-Range: bytes 0-99/1000
+
+[100 bytes data]
+--3d6b6a416f9b5
+Content-Type: video/mp4
+Content-Range: bytes 200-299/1000
+
+[100 bytes data]
+--3d6b6a416f9b5--
+```
+
+**安全防护**（标准库 fs.go 第 338-344 行）：
+```go
+if sumRangesSize(ranges) > size {
+    // 所有请求范围的总字节数超过文件大小 → 可能是攻击
+    ranges = nil  // 降级为完整文件传输（200 OK）
+}
+```
+这是重要的 DoS 防护：恶意客户端可请求 `Range: bytes=0-0,1-1,2-2,...` 产生数千个 part，每个 part 有几十字节开销，放大攻击效果。
+
+---
+
+#### ▎通用对象服务的单范围限制（ParseRangeOption）
+
+通用路径使用 `fs.ParseRangeOption` 解析 Range 头，该函数**明确且强制地只接受单范围**。
+
+**核心限制代码** [open_options.go#L71-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/fs/open_options.go#L71-L81)：
+
+```go
+// ParseRangeOption parses a RangeOption from a Range: header.
+// It only accepts single ranges.   ←── 文档明确说明
+func ParseRangeOption(s string) (po *RangeOption, err error) {
+    const preamble = "bytes="
+    if !strings.HasPrefix(s, preamble) {
+        return nil, errors.New("range: header invalid: doesn't start with " + preamble)
+    }
+    s = s[len(preamble):]
+    if strings.ContainsRune(s, ',') {  // ←── 关键检查：发现逗号直接拒绝
+        return nil, errors.New("range: header invalid: contains multiple ranges which isn't supported")
+    }
+    // ... 后续解析单范围
+}
+```
+
+**设计意图**：
+1. 多数云存储后端（S3、Azure Blob 等）的 Range API 只接受单范围
+2. 多范围场景在实际应用中极为罕见（主要用于某些视频流媒体协议）
+3. 简化实现，减少代码复杂度和攻击面
+4. `RangeOption` 结构体只能存储单一 `Start/End` 对，从数据结构上就不支持多范围
+
+**实际行为**（serve.Object 路径）：
+- 收到 `Range: bytes=0-99,200-299`
+- `ParseRangeOption` 检测到逗号 → 返回 error
+- `serve.Object` [serve.go#L73-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L73-L76) 捕获错误 → 返回 `400 Bad Request`
+- 响应体：`Bad Request`
+
+---
+
+#### ▎两条路径多范围请求行为对比
+
+| 维度 | VFS 路径（http.ServeContent） | 通用对象服务（serve.Object） |
+|------|-----------------------------|---------------------------|
+| 解析器 | 标准库 `parseRange`（内部函数） | rclone `fs.ParseRangeOption` |
+| 多范围支持 | ✅ 完整支持 | ❌ 明确拒绝 |
+| 逗号检测 | 解析为多个独立范围 | 返回 `400 Bad Request` |
+| 响应格式 | `multipart/byteranges` + boundary | N/A（请求被拒绝） |
+| 数据结构 | `[]httpRange` 切片 | 单个 `RangeOption{Start, End}` |
+| 安全防护 | `sumRangesSize > size` 降级为全量 | N/A（提前拒绝） |
+| 状态码（多范围） | `206 Partial Content` | `400 Bad Request` |
+| 适用场景 | 完整 HTTP 文件服务（浏览器下载、视频播放） | 简单对象存储接口（restic 等） |
+
+---
+
+#### ▎VFS 路径 multipart 响应与 rclone 后端的兼容性
+
+需要注意一个重要边界：**标准库通过反复 Seek 实现多范围，但 chunkedreader 的 Seek 成本可能较高**。
+
+```
+多范围请求 (bytes=0-99,500-599)
+    ↓
+http.ServeContent 解析为两个 range
+    ↓
+对第一个 range：content.Seek(0) → 读取 100 字节
+    ↓
+对第二个 range：content.Seek(500) → 读取 100 字节
+```
+
+每次 `Seek` 调用会触发 `ReadFileHandle.seek()`，如果无法通过缓冲区丢弃满足，会调用 `chunkedreader.RangeSeek()` 或甚至关闭重新打开。多范围请求可能导致多次后端连接重建，实际性能可能反而不如客户端发起两次独立的单范围请求。
+
 **Range 边界条件** [http.go#L410-L413](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/cmd/serve/http/http.go#L410-L413)：
 - 未知大小文件（`obj.Size() < 0`）**不能使用 Range**
 - 因为无法计算 `Content-Range` 响应头的总长度
@@ -1031,14 +1189,26 @@ SetHeader (Accept-Ranges, Server)
 
 | 条件 | VFS 句柄路径 | 通用对象服务路径 | 说明 |
 |-----|-------------|-----------------|------|
-| 已知大小 + 正常 Range | ✅ http.ServeContent 处理 | ✅ ParseRangeOption + OpenOption | 两条路径均支持 |
+| 已知大小 + 正常单范围 | ✅ http.ServeContent 处理 | ✅ ParseRangeOption + OpenOption | 两条路径均支持 |
+| 已知大小 + 多范围（逗号分隔） | ✅ multipart/byteranges + goroutine 写各 part | ❌ 400 Bad Request（ParseRangeOption 检测到逗号直接拒绝） | VFS 路径完整支持 RFC 7233 多范围，通用路径从数据结构上就不支持 |
 | 已知大小 + 后缀 Range (bytes=-N) | ✅ http.ServeContent 处理 | ✅ Decode(size) + FixRangeOption 修正 | 均正确 |
 | 未知大小 + 无 Range | ✅ io.Copy + chunked 编码 | ⚠️ io.Copy + Content-Length: -1 | VFS 路径规范，通用路径设非法 CL |
-| 未知大小 + 开放式 Range (bytes=N-) | ❌ 返回 416 | ❌ 206 + Content-Range: `N--2/-1` | 通用路径响应头完全无效 |
-| 未知大小 + 闭合式 Range (bytes=M-N) | ❌ 返回 416 | ❌ `end > -1` 截断 bug，CL 为负 | 通用路径计算出正确 end 后被覆写 |
-| 未知大小 + 后缀 Range (bytes=-N) | ❌ 返回 416 | ❌ Decode(-1) 计算负 offset | 通用路径 offset=-1-N，无意义 |
-| 多范围请求 (逗号分隔) | ❌ http.ServeContent 不支持 | ❌ ParseRangeOption 拒绝 | 两条路径均不支持 |
+| 未知大小 + 单范围 | ❌ 返回 416 | ❌ 206 + Content-Range 无效 | VFS 提前拒绝，通用路径响应头无效 |
+| 未知大小 + 多范围 | ❌ 返回 416 | ❌ 400 Bad Request | 均不支持，但拒绝方式不同 |
+| 多范围总字节 > 文件大小 | ⚠️ 降级为完整 200 响应 | N/A（提前拒绝） | 标准库 DoS 防护 |
 | 未知大小 + SeekEnd | ❌ RangeSeek 返回 ErrorInvalidSeek | 不涉及 | chunkedreader 无法从末尾定位 |
+
+**两条路径的多范围请求处理对比**：
+
+| 处理阶段 | VFS 路径（http.ServeContent） | 通用对象服务路径 |
+|---------|-----------------------------|-----------------|
+| Range 头解析 | 标准库内部 `parseRange` → `[]httpRange` 切片 | `fs.ParseRangeOption` 检测逗号 → error |
+| 数据结构支持 | 切片可存储任意数量范围 | `RangeOption{Start, End}` 只能存一对 |
+| 状态码 | 206 Partial Content | 400 Bad Request |
+| Content-Type | `multipart/byteranges; boundary=...` | text/plain（错误响应） |
+| 响应体 | 各 part 用 boundary 分隔，每 part 含 Content-Range | 错误消息文本 |
+| 安全防护 | `sumRangesSize > size` 降级为全量 | 无（请求已被拒绝） |
+| Seek 行为 | 对每个 range 独立 Seek → `ReadFileHandle.seek()` → 可能触发 chunkedreader 重开 | N/A |
 
 **两条路径的未知大小防护对比**：
 
@@ -1050,9 +1220,9 @@ SetHeader (Accept-Ranges, Server)
 | 无 Range 时传输编码 | ✅ Go 自动 chunked | ❌ CL=-1 非法，依赖客户端 EOF 容错 |
 | 对象打开资源保护 | 有 Range 时不打开句柄 | ❌ 总是打开（即使 Range 无效） |
 
-**VFS 路径 Range 实现链**：`Range 头` → `http.ServeContent` → `ReadSeeker.Seek()` → `ReadFileHandle.seek()` → `chunkedreader.RangeSeek()` → 后端 `Open(ctx)` 完整打开 → 由 chunkedreader 控制范围
+**VFS 路径 Range 实现链**：`Range 头` → `http.ServeContent` → `parseRange` → 单范围走 `Seek()+Read()`，多范围走 `multipart.Writer` + goroutine → `ReadSeeker.Seek()` → `ReadFileHandle.seek()` → `chunkedreader.RangeSeek()` → 后端 `Open(ctx)` 完整打开 → 由 chunkedreader 控制范围
 
-**通用服务路径 Range 实现链**：`Range 头` → `fs.ParseRangeOption()` → `RangeOption.Decode(size)` → `o.Open(ctx, RangeOption)` → 后端直接打开指定范围
+**通用服务路径 Range 实现链**：`Range 头` → `fs.ParseRangeOption()`（逗号检测）→ `RangeOption.Decode(size)` → `o.Open(ctx, RangeOption)` → 后端直接打开指定范围
 
 **serve.Object 已知大小路径才正确的原因**：当 `o.Size() >= 0` 时
 1. [serve.go#L26-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/58-rclone/lib/http/serve/serve.go#L26-L28) 初始化 CL 为正确值（不会被第 94 行覆盖为负数）

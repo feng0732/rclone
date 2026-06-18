@@ -1,167 +1,307 @@
-# S3 后端代码分析报告
-
-rclone 项目中与 S3 相关的代码分为两个独立模块：
-
-| 模块 | 目录 | 角色 | 核心职责 |
-|------|------|------|----------|
-| **S3 客户端后端** | `backend/s3/` | rclone 作为客户端 | 连接外部 S3 兼容存储，实现 `fs.Fs` 统一接口 |
-| **S3 服务端** | `cmd/serve/s3/` | rclone 作为服务端 | 对外提供 S3 兼容 API，通过 VFS 对接 `fs.Fs` |
-
----
-
-# 上篇：S3 客户端后端 (backend/s3/)
+# S3 客户端后端代码分析
 
 ## 一、整体架构
 
-S3 客户端后端基于 **AWS SDK v2 for Go**（`github.com/aws/aws-sdk-go-v2/service/s3`）构建，向上实现 rclone 的 `fs.Fs` 统一后端接口。
+rclone 的 S3 客户端后端位于 `backend/s3/` 目录，基于 **AWS SDK v2 for Go**（`github.com/aws/aws-sdk-go-v2/service/s3`）构建，向上实现 rclone 的 `fs.Fs` 统一后端接口，使 rclone 能够读写任何 S3 兼容存储服务。
 
 ### 架构分层
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                rclone 上层逻辑 (sync/copy 等)        │
-└──────────────────────┬───────────────────────────────┘
-                       │ fs.Fs / fs.Object 统一接口
-┌──────────────────────▼───────────────────────────────┐
-│            S3 客户端后端 (backend/s3/)               │
-│   - Fs: 实现 fs.Fs 接口                               │
-│   - Object: 实现 fs.Object 接口                       │
-│   - list/listP/listR: 列表实现                        │
-│   - Put/Update: 上传实现 (单分片/多分片)               │
-│   - Open: 下载实现                                    │
-│   - pacer: 请求限速与重试                              │
-└──────────────────────┬───────────────────────────────┘
-                       │ AWS SDK v2 S3 Client API
-┌──────────────────────▼───────────────────────────────┐
-│              AWS SDK v2 (service/s3)                 │
-│   - 签名 (v4 / v2 / IBM IAM)                          │
-│   - REST 请求构建                                      │
-│   - 重试机制                                          │
-└──────────────────────┬───────────────────────────────┘
-                       │ HTTP
-┌──────────────────────▼───────────────────────────────┐
-│              S3 兼容存储服务 (AWS/MinIO/...)          │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  rclone 上层逻辑 (sync / copy / ls 等)       │
+└─────────────────────────────┬────────────────────────────────┘
+                              │ fs.Fs / fs.Object 统一接口
+┌─────────────────────────────▼────────────────────────────────┐
+│                 S3 客户端后端 (backend/s3/)                  │
+│                                                               │
+│  Fs (实现 fs.Fs)                                              │
+│    ├─ List / ListP / ListR    → 对象列表                      │
+│    ├─ NewObject               → 获取对象引用                  │
+│    ├─ Put                     → 上传入口                      │
+│    ├─ Mkdir / Rmdir           → 目录 / 桶操作                 │
+│    └─ Copy / Purge 等         → 扩展功能                      │
+│                                                               │
+│  Object (实现 fs.Object)                                      │
+│    ├─ Open                    → 下载 (GetObject)              │
+│    ├─ Update                  → 上传 (PutObject / Multipart)  │
+│    ├─ Remove                  → 删除 (DeleteObject)           │
+│    └─ SetModTime / Hash 等    → 元数据操作                    │
+│                                                               │
+│  Pacer: 令牌桶限流 + 重试                                     │
+│  Provider / Quirks: 多厂商适配                                │
+└─────────────────────────────┬────────────────────────────────┘
+                              │ AWS SDK v2 S3 Client API
+┌─────────────────────────────▼────────────────────────────────┐
+│                 AWS SDK v2 (service/s3)                      │
+│                                                               │
+│  中间件栈 (Middleware Stack):                                 │
+│    Initialize → Serialize → Build →  Signing → Retry → Send  │
+│                                                               │
+│  Signing 阶段签名器:                                          │
+│    - 默认: aws/signer/v4 (Signature v4)                       │
+│    - 可替换: HTTPSignerV4 接口 (v2 / IBM IAM / 自定义)       │
+│                                                               │
+│  Credentials Provider:                                       │
+│    - StaticCredentials                                        │
+│    - EnvCredentials                                           │
+│    - AssumeRole (STS)                                         │
+│    - Anonymous                                                │
+└─────────────────────────────┬────────────────────────────────┘
+                              │ HTTP / HTTPS
+┌─────────────────────────────▼────────────────────────────────┐
+│              S3 兼容存储 (AWS S3 / MinIO / Ceph / ...)       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Provider 适配机制
 
-S3 后端通过 **provider.yaml** 文件定义了数十种 S3 兼容提供商的特性与 quirk，在 [providers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/providers.go) 中加载：
+S3 后端通过 **provider.yaml** 文件定义数十种 S3 兼容提供商的特性与 quirk，在 [providers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/providers.go) 中加载：
 
-- `Provider` 结构体：定义每个提供商的 region、endpoint、ACL、storage class、SSE 等配置选项
-- `Quirks` 结构体：定义各提供商的行为差异（列表版本、路径风格、URL 编码、ETag 是否为 MD5 等）
-- 所有 provider 配置通过 `embed.FS` 内嵌在 `provider/*.yaml` 文件中
+- **`Provider` 结构体**：定义每个提供商的 region、endpoint、ACL、storage class、SSE 等配置选项
+- **`Quirks` 结构体**：定义行为差异（列表版本、路径风格、URL 编码、ETag 是否为 MD5、是否支持 multipart 等）
+- 所有 provider 配置通过 `embed.FS` 内嵌在 `provider/*.yaml` 文件中，通过 `loadProvider(name)` 按名查找
 
 ---
 
-## 二、认证配置与请求签名
+## 二、认证配置与签名注入
 
-### 2.1 认证配置入口
+### 2.1 认证配置项
 
-认证相关选项定义在 [backend/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L89-L200)，主要包括：
+认证相关配置定义在 [s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L89-L200) 的 Options 结构体中，主要包括：
 
 | 配置项 | 说明 |
 |--------|------|
-| `env_auth` | 是否从运行时环境获取凭证（环境变量 / EC2/ECS 元数据） |
+| `provider` | S3 提供商类型（AWS / MinIO / Ceph / IBMCOS 等） |
+| `env_auth` | 是否从环境 / EC2 元数据 / 配置文件加载凭证 |
 | `access_key_id` | AWS Access Key ID |
 | `secret_access_key` | AWS Secret Access Key |
 | `session_token` | 会话令牌（临时凭证） |
 | `region` | 区域 |
-| `endpoint` | S3 API 端点（S3 兼容存储必填） |
-| `role_arn` | 需扮演的 IAM Role ARN |
+| `endpoint` | 自定义 S3 API 端点 |
+| `role_arn` | 需扮演的 IAM Role ARN（STS AssumeRole） |
 | `role_session_name` | Role 会话名称 |
-| `provider` | S3 提供商类型（AWS/MinIO/Ceph 等） |
+| `role_external_id` | Role External ID |
+| `profile` | AWS 配置文件 profile 名 |
+| `v2_auth` | 是否使用 S3 v2 签名（兼容老 S3） |
+| `ibm_api_key` + `ibm_service_instance_id` | IBM COS IAM 认证 |
 
-### 2.2 客户端创建流程
+### 2.2 客户端创建与签名注入总览
 
-核心函数：[s3Connection](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1475-L1629)
+核心入口函数为 `s3Connection`，定义在 [s3.go:1475-1629](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1475-L1629)：
 
 ```go
 func s3Connection(ctx context.Context, opt *Options, client *http.Client) (
     s3Client *s3.Client, provider *Provider, err error)
 ```
 
-**执行流程**：
+整个过程可分为 **凭证准备 → 签名器注入 → SDK 客户端创建** 三个阶段：
 
 ```
-1. 初始化静态凭证
-   └─► credentials.StaticCredentialsProvider{AccessKeyID, SecretAccessKey, SessionToken}
+阶段 1: 凭证准备 (Credentials Provider)
+    │
+    ├─► 默认: StaticCredentialsProvider{AccessKeyID, SecretAccessKey, SessionToken}
+    │
+    ├─► env_auth + key 为空
+    │    └─► awsconfig.LoadDefaultConfig()
+    │         从环境变量 / 共享配置文件 / EC2 Instance Profile 加载
+    │
+    ├─► IBMCOS + v2_auth
+    │    └─► NoOpCredentialsProvider (mock 凭证，实际用 IAM token)
+    │
+    ├─► key 都为空（非 env_auth）
+    │    └─► aws.AnonymousCredentials (匿名)
+    │
+    └─► role_arn 非空
+         └─► sts.NewFromConfig(baseConfig)
+         └─► stscreds.NewAssumeRoleProvider(stsClient, roleARN, options)
+         └─► aws.NewCredentialsCache(...) 包装缓存
 
-2. 凭证来源分支判断
-   ├─ env_auth=true + key 为空
-   │    └─► awsconfig.LoadDefaultConfig()
-   │         从环境变量 / 共享配置文件 / IAM 角色加载
-   │
-   ├─ IBMCOS + V2Auth
-   │    └─► NoOpCredentialsProvider (使用 IBM IAM signer)
-   │
-   ├─ access_key 与 secret_key 都为空
-   │    └─► aws.AnonymousCredentials (匿名访问)
-   │
-   └─ 其余情况：使用静态凭证
+阶段 2: 签名器注入 (Signer Injection)
+    │
+    ├─► 默认: 使用 SDK 内置 aws/signer/v4 (Signature v4)
+    │
+    ├─► v2_auth 或 region == "other-v2-signature"
+    │    └─► HTTPSignerV4 = &v2Signer{opt: opt}
+    │         (替换为 S3 v2 签名实现)
+    │
+    └─► IBMCOS + ibm_api_key + ibm_instance_id
+         └─► HTTPSignerV4 = &IbmIamSigner{...}
+              (替换为 IBM IAM token 认证)
 
-3. Assume Role 处理（如 role_arn 非空）
-   └─► sts.NewFromConfig(awsConfig)
-   └─► stscreds.NewAssumeRoleProvider(stsClient, roleARN)
-   └─► aws.NewCredentialsCache(...) 包装缓存
-
-4. 加载 Provider 配置与 Quirks
-   └─► loadProvider(opt.Provider)
-   └─► setQuirks(opt, provider)
-
-5. 配置 S3 Client Options
-   ├─► UsePathStyle (路径风格 / 虚拟主机风格)
-   ├─► UseAccelerate / UseDualStack / UseARNRegion
-   ├─► BaseEndpoint (自定义端点)
-   └─► RequestChecksumCalculation (数据完整性校验)
-
-6. 签名器替换（如使用 v2 签名或 IBM IAM）
-   ├─► v2Signer (S3 v2 签名)
-   └─► IbmIamSigner (IBM IAM 认证)
-
-7. 创建 s3.Client
-   └─► s3.NewFromConfig(awsConfig, options...)
+阶段 3: 创建 s3.Client
+    └─► s3.NewFromConfig(awsConfig, options...)
+         将凭证和签名器装配进 SDK 中间件栈
 ```
 
-### 2.3 签名机制
+### 2.3 签名器接口：HTTPSignerV4
 
-| 签名方式 | 触发条件 | 实现位置 |
-|---------|---------|---------|
-| **AWS Signature v4** (默认) | 默认情况 | AWS SDK v2 内置 |
-| **S3 v2 签名** | `v2_auth=true` 或 `region=other-v2-signature` | [v2sign.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go) |
-| **IBM IAM 签名** | `provider=IBMCOS` + `ibm_api_key` / `ibm_instance_id` | [ibm_signer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go) |
-| **匿名** | access_key 和 secret_key 都为空 | `aws.AnonymousCredentials` |
-
-**签名器注入点**：
+AWS SDK v2 允许通过 `s3.Options.HTTPSignerV4` 字段替换默认的 v4 签名器。该接口定义（SDK 内部）签名方法签名为：
 
 ```go
-// s3Connection 中通过 HTTPSignerV4 选项替换默认签名器
-options = append(options, func(s3Opt *s3.Options) {
-    s3Opt.HTTPSignerV4 = &v2Signer{opt: opt}  // 或 &IbmIamSigner{...}
-})
+SignHTTP(ctx context.Context, credentials aws.Credentials, req *http.Request,
+    payloadHash string, service string, region string, signingTime time.Time,
+    optFns ...func(*v4signer.SignerOptions)) error
 ```
 
-### 2.4 Pacer 限流与重试
+rclone 自定义了两种签名器实现：
 
-每个 `Fs` 实例持有一个 `*fs.Pacer`，基于令牌桶算法对 S3 API 调用进行限速和重试：
+#### v2Signer — S3 v2 签名
 
-- **初始配置**：`pacer.NewS3(pacer.MinSleep(minSleep))`
-- **重试策略**：SDK 自身已有重试，pacer 再额外提供 2 次重试（主要用于列表 XML 解析错误回退）
-- **使用方式**：`f.pacer.Call(func() (bool, error) { ... })` 包裹所有 S3 API 调用
+[v2sign.go:44-53](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go#L44-L53)
+
+```go
+type v2Signer struct { opt *Options }
+
+func (v2 *v2Signer) SignHTTP(ctx context.Context, credentials aws.Credentials,
+    req *http.Request, payloadHash string, service string, region string,
+    signingTime time.Time, optFns ...func(*v4signer.SignerOptions)) error {
+
+    date := time.Now().UTC().Format(time.RFC1123)
+    req.Header.Set("Date", date)
+    // 1. 收集需要签名的头部 (content-md5, content-type, x-amz-*)
+    // 2. 收集需要签名的 URL 参数 (acl, uploadId, versionId 等 s3ParamsToSign)
+    // 3. 构造签名字符串: "HTTP_METHOD\nmd5\ncontentType\ndate\ncanonicalizedAmzHeaders\ncanonicalizedResource"
+    // 4. HMAC-SHA1 签名: base64(hmac(secret, stringToSign))
+    // 5. 设置 Authorization 头: "AWS accessKey:signature"
+}
+```
+
+#### IbmIamSigner — IBM IAM Token 认证
+
+[ibm_signer.go:19-42](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go#L19-L42)
+
+```go
+type IbmIamSigner struct {
+    APIKey      string
+    InstanceID  string
+    IAMEndpoint string
+    Auth        Authenticator
+}
+
+func (signer *IbmIamSigner) SignHTTP(...) error {
+    authenticator := &core.IamAuthenticator{ApiKey: signer.APIKey, URL: signer.IAMEndpoint}
+    token, _ := authenticator.GetToken()       // 调用 IAM 接口获取 token
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("ibm-service-instance-id", signer.InstanceID)
+    return nil
+}
+```
+
+> 注意：IBM IAM 模式下，凭证 provider 使用 `NoOpCredentialsProvider`（mock 凭证），因为实际认证是通过 IAM token 在 SignHTTP 中完成的。
+
+### 2.4 签名器注入代码
+
+签名器通过 `s3.Options` 的 `HTTPSignerV4` 字段注入，注入位置在 [s3Connection 函数](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1601-L1612)：
+
+```go
+if opt.V2Auth || opt.Region == "other-v2-signature" {
+    if opt.Provider == "IBMCOS" && opt.IBMAPIKey != "" && opt.IBMInstanceID != "" {
+        // IBM IAM 签名
+        options = append(options, func(s3Opt *s3.Options) {
+            s3Opt.HTTPSignerV4 = &IbmIamSigner{
+                APIKey: opt.IBMAPIKey,
+                InstanceID: opt.IBMInstanceID,
+                IAMEndpoint: opt.IBMIAMEndpoint,
+            }
+        })
+    } else {
+        // S3 v2 签名
+        options = append(options, func(s3Opt *s3.Options) {
+            s3Opt.HTTPSignerV4 = &v2Signer{opt: opt}
+        })
+    }
+}
+```
+
+最终通过 `s3.NewFromConfig(awsConfig, options...)` 将签名器装配进 SDK。
+
+### 2.5 签名中间件在请求中的位置
+
+AWS SDK v2 的每个 API 请求都经过一个中间件栈（Middleware Stack），签名发生在 **Signing 阶段**：
+
+```
+请求发起
+   │
+   ▼
+Initialize 中间件   ← 设置默认值、验证参数
+   │
+   ▼
+Serialize 中间件    ← 将输入结构体序列化为 HTTP 请求
+   │
+   ▼
+Build 中间件        ← 构建完整 HTTP 请求 (URL + Headers + Body)
+   │
+   ▼
+【Signing 中间件】  ← ★ 调用 HTTPSignerV4.SignHTTP() 进行签名 ★
+   │                  - 从 CredentialsProvider 获取凭证
+   │                  - 计算签名 (v4 / v2 / IAM token)
+   │                  - 将签名写入 Authorization 头
+   │
+   ▼
+Retry 中间件        ← 失败重试逻辑
+   │
+   ▼
+Send 中间件         ← 通过 http.Client 发送请求
+   │
+   ▼
+响应返回
+```
+
+**关键点**：签名发生在 Build 之后、Retry 之前，每次重试都会重新签名（因为时间戳会变化）。
+
+### 2.6 请求修复中间件 (fixupRequest)
+
+除了签名器替换，rclone 还通过 `fixupRequest` 函数在 Signing 阶段前后插入自定义中间件，处理特定厂商的兼容性问题：
+
+[fixupRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1392-L1458)
+
+```go
+func fixupRequest(o *s3.Options, opt *Options) {
+    // 在 Signing 之前：删除 Accept-Encoding 头（避免参与签名）
+    fixup := FinalizeMiddlewareFunc("FixupRequest",
+        func(ctx, in, next) {
+            if !opt.SignAcceptEncoding.Value {
+                ignored := make(map[string]string)
+                for _, h := range []string{"Accept-Encoding"} {
+                    ignored[h] = req.Header.Get(h)
+                    req.Header.Del(h)    // 签名前移除，不参与签名
+                }
+                ctx = 保存 ignored 到 ctx
+            }
+            if !opt.UseXID.Value { /* 删除 x-id URL 参数 */ }
+            return next.HandleFinalize(ctx, in)
+        })
+
+    // 在 Signing 之后：恢复 Accept-Encoding 头
+    restore := FinalizeMiddlewareFunc("FixupRequestRestoreHeaders",
+        func(ctx, in, next) {
+            if !opt.SignAcceptEncoding.Value {
+                从 ctx 取出 ignored, 恢复到 req.Header
+            }
+            return next.HandleFinalize(ctx, in)
+        })
+
+    // 插入到中间件栈
+    stack.Finalize.Insert(fixup, "Signing", middleware.Before)
+    stack.Finalize.Insert(restore, "Signing", middleware.After)
+}
+```
+
+**用途**：Google Cloud Storage 等厂商修改 Accept-Encoding 头会破坏 v2 签名，因此在签名前临时移除、签名后恢复。
 
 ---
 
-## 三、对象列表 (List) 接入分析
+## 三、对象列表 (List) — 签名与实现
 
 ### 3.1 接口映射
 
-| `fs.Fs` 接口 | S3 后端实现 | 底层 S3 API |
-|-------------|-------------|------------|
-| `List(ctx, dir)` | `Fs.List` → `list.WithListP` → `Fs.ListP` | ListObjectsV2 |
-| `ListP(ctx, dir, callback)` | `Fs.ListP` → `Fs.listDir` | ListObjectsV2 (单页) |
-| `ListR(ctx, dir, callback)` | `Fs.ListR` → `Fs.list(recurse=true)` | ListObjectsV2 (递归/不分隔符) |
+| `fs.Fs` 接口 | S3 后端实现 | 底层 S3 API | 签名方式 |
+|-------------|-------------|------------|---------|
+| `List(ctx, dir)` | `Fs.List` → `list.WithListP` → `Fs.ListP` | ListObjectsV2 | Signing 中间件自动签名 |
+| `ListP(ctx, dir, callback)` | `Fs.ListP` → `Fs.listDir` → `Fs.list` | ListObjectsV2（带 delimiter） | 同上 |
+| `ListR(ctx, dir, callback)` | `Fs.ListR` → `Fs.list(recurse=true)` | ListObjectsV2（无 delimiter） | 同上 |
 
-### 3.2 核心列表函数 List
+### 3.2 List 入口
 
 [Fs.List](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2654-L2656)
 
@@ -171,7 +311,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 }
 ```
 
-`List` 直接委托给 `list.WithListP`，后者调用 `ListP` 来实现单级目录列表。
+`list.WithListP` 是通用工具函数，通过调用 `ListP`（分页列表）收集全量结果。
 
 ### 3.3 ListP — 非递归列表
 
@@ -182,87 +322,96 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
     bucket, directory := f.split(dir)
     if bucket == "" {
         // 根目录：列出所有 bucket
-        entries, err := f.listBuckets(ctx)     // 调用 ListBuckets API
+        entries, err := f.listBuckets(ctx)     // ListBuckets API
         for _, entry := range entries { list.Add(entry) }
     } else {
         // 指定 bucket：列出目录
-        err := f.listDir(ctx, bucket, directory, ..., list.Add)
+        err := f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", list.Add)
     }
     return list.Flush()
 }
 ```
 
-### 3.4 listDir — 目录列表实现
+### 3.4 list — 核心分页列表循环
 
-[Fs.listDir](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2597-L2652)
+[Fs.list](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2387-L2577) 是最核心的列表实现，所有 List 变体最终都调用它。
 
-`listDir` 内部调用核心的 `list` 函数，传入 `recurse=false`（带 delimiter）。
-
-### 3.5 list — 核心分页列表循环
-
-[Fs.list](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2387-L2577) 是最核心的列表实现。
-
-**输入参数** `listOpt`：
-
-| 字段 | 含义 |
-|------|------|
-| `bucket` | S3 bucket 名称 |
-| `directory` | 目录前缀（映射到 S3 prefix） |
-| `prefix` | 额外前缀过滤 |
-| `recurse` | 是否递归（决定是否使用 delimiter） |
-| `addBucket` | 返回条目的 remote 是否包含 bucket 名 |
-| `withVersions` | 是否列出版本 |
-| `versionAt` | 指定时间点的版本 |
-
-**执行流程**：
+**签名参与的完整调用链**：
 
 ```
-1. 构造 ListObjectsV2Input
-   ├─► Bucket
-   ├─► Delimiter = "/" (仅当非递归时)
-   ├─► Prefix = directory
-   └─► MaxKeys = ListChunk (默认 1000)
-
-2. 选择列表实现 bucketLister
-   ├─► 版本化列表 → newVersionsList
-   ├─► ListVersion=1 → newV1List (ListObjects v1)
-   └─► 默认 → newV2List (ListObjects v2)
-
-3. 分页循环
-   for {
-       pacer.Call() {
-           resp, versionIDs, err = listBucket.List(ctx)
-           // 如遇 XML 语法错误且未启用 URL 编码，自动重试启用 URL 编码
-       }
-       
-       // 处理 CommonPrefixes (目录)
-       for _, commonPrefix := range resp.CommonPrefixes {
-           remote = URL 解码 + Enc.ToStandardPath 处理
-           fn(remote, object, nil, isDirectory=true)
-       }
-       
-       // 处理 Contents (文件)
-       for i, object := range resp.Contents {
-           remote = URL 解码 + Enc.ToStandardPath 处理
-           // 识别目录标记：以 / 结尾且 size=0
-           isDirectory = (remote 以 / 结尾 && size==0)
-           fn(remote, object, versionIDs[i], isDirectory)
-       }
-       
-       if !resp.IsTruncated { break }
-   }
-
-4. 空目录检测（DirectoryMarkers 模式）
-   如 foundItems==0 且 directory 非空，通过 HeadObject 检测目录标记是否存在
+上层调用 Fs.list(ctx, listOpt{...}, callback)
+   │
+   ├─► 1. 构造 ListObjectsV2Input
+   │     Bucket / Delimiter / Prefix / MaxKeys (ListChunk)
+   │
+   ├─► 2. 选择 bucketLister 实现
+   │     ├─ 版本化列表 → newVersionsList
+   │     ├─ ListVersion=1 → newV1List (ListObjects v1)
+   │     └─ 默认 → newV2List (ListObjects v2)
+   │
+   ├─► 3. 分页循环
+   │     for {
+   │         ┌──────────────────────────────────────────────┐
+   │         │  f.pacer.Call(func() (bool, error) {        │
+   │         │                                              │
+   │         │    listBucket.URLEncodeListings(...)         │
+   │         │                                              │
+   │         │    resp, versionIDs, err = listBucket.List(ctx)
+   │         │         │                                   │
+   │         │         └─► 最终调用 s3.Client.ListObjectsV2 │
+   │         │              (进入 SDK 中间件栈)              │
+   │         │                                              │
+   │         │    // 遇 XML 语法错误自动重试 URL 编码        │
+   │         │    if err 是 xml.SyntaxError && !urlEncode { │
+   │         │      urlEncodeListings = true                │
+   │         │      return true, err   // 触发 pacer 重试  │
+   │         │    }                                        │
+   │         │                                              │
+   │         │    return f.shouldRetry(ctx, err)            │
+   │         │  })                                          │
+   │         └──────────────────────────────────────────────┘
+   │         │
+   │         ▼
+   │     SDK 内部: ListObjectsV2
+   │         │
+   │         ├─► Initialize 中间件
+   │         ├─► Serialize 中间件
+   │         ├─► Build 中间件
+   │         ├─► Signing 中间件  ◄─── 【签名发生在这里】
+   │         │      └─► 从 CredentialsProvider 取凭证
+   │         │      └─► 调用 HTTPSignerV4.SignHTTP()
+   │         │      └─► 计算签名，写入 Authorization 头
+   │         ├─► Retry 中间件
+   │         └─► Send 中间件 → HTTP 请求发出
+   │
+   ├─► 4. 处理 CommonPrefixes (目录)
+   │     URL 解码 → Enc.ToStandardPath → 前缀裁剪 → 回调 fn(..., isDirectory=true)
+   │
+   ├─► 5. 处理 Contents (文件)
+   │     URL 解码 → Enc.ToStandardPath → 识别目录标记 → 回调 fn(..., isDirectory=false)
+   │
+   └─► 6. if !resp.IsTruncated { break }
 ```
 
-**关键实现细节**：
+### 3.5 Pacer 与签名的关系
 
-- **URL 编码列表**：部分 S3 兼容存储支持在响应中 URL 编码对象键，以避免特殊字符导致 XML 解析错误。遇到 `xml.SyntaxError` 时自动重试启用 URL 编码。
-- **目录标记识别**：S3 没有原生目录概念，以 `/` 结尾且大小为 0 的对象被视为"目录标记"（directory marker）。
-- **编码转换**：所有对象键经过 `f.opt.Enc.ToStandardPath(remote)` 处理，将 S3 端的编码转换为 rclone 内部标准路径。
+每个列表请求都包裹在 `f.pacer.Call()` 中：
 
-### 3.6 itemToDirEntry — 条目类型转换
+- **pacer** 负责令牌桶限速（避免触发 S3 限流）和有限次数的重试
+- **SDK 内部**也有自己的重试机制（`RetryMaxAttempts`）
+- **两层重试的签名**：每次重试（不论是 pacer 层还是 SDK 层）都会重新进入 Signing 中间件，重新计算签名（因为签名中的时间戳会过期）
+
+### 3.6 目录标记识别
+
+S3 没有原生目录概念，rclone 通过 **目录标记**（directory marker）模拟目录：
+
+```go
+// 识别逻辑：以 "/" 结尾 且 size == 0
+isDirectory := (remote == "" || strings.HasSuffix(remote, "/")) &&
+    object.Size != nil && *object.Size == 0
+```
+
+识别出的目录标记会被转换为 `fs.Directory` 条目，文件则转换为 `*Object`（实现 `fs.Object`），通过 `itemToDirEntry` 函数完成转换：
 
 [Fs.itemToDirEntry](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2580-L2594)
 
@@ -270,25 +419,30 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 func (f *Fs) itemToDirEntry(ctx context.Context, remote string,
     object *types.Object, versionID *string, isDirectory bool) (fs.DirEntry, error) {
     if isDirectory {
-        return fs.NewDir(remote, time.Time{}).SetSize(size), nil  // → fs.Directory
+        return fs.NewDir(remote, time.Time{}).SetSize(size), nil   // fs.Directory
     }
-    return f.newObjectWithInfo(ctx, remote, object, versionID)  // → *Object (fs.Object)
+    return f.newObjectWithInfo(ctx, remote, object, versionID)    // *Object
 }
 ```
 
+### 3.7 列表中的编码处理
+
+- **URL 编码**：部分 S3 兼容存储支持 URL 编码对象键响应，避免特殊字符破坏 XML。遇到 `xml.SyntaxError` 时自动切换到 URL 编码重试。
+- **路径编码**：所有对象键经过 `f.opt.Enc.ToStandardPath(remote)` 转换，将 S3 端的转义字符还原为 rclone 内部标准路径表示。
+
 ---
 
-## 四、上传路径接入分析
+## 四、上传 (Put) — 签名与实现
 
 ### 4.1 接口映射
 
-| `fs.Fs` / `fs.Object` 接口 | S3 后端实现 | 底层 S3 API |
-|--------------------------|-------------|------------|
-| `Fs.Put(ctx, in, src)` | `Fs.Put` → `Object.Update` | PutObject / MultipartUpload |
-| `Object.Update(ctx, in, src)` | `Object.Update` | 同上 |
-| `Fs.Mkdir(ctx, dir)` | `Fs.Mkdir` → 检测 bucket / 创建目录标记 | CreateBucket / PutObject (空对象) |
+| `fs.Fs` / `fs.Object` 接口 | S3 后端实现 | 底层 S3 API | 签名方式 |
+|--------------------------|-------------|------------|---------|
+| `Fs.Put(ctx, in, src)` | `Fs.Put` → `Object.Update` | PutObject / CreateMultipartUpload + UploadPart | Signing 中间件自动签名 |
+| `Object.Update(ctx, in, src)` | 调度单分片/多分片上传 | 同上 | 同上 |
+| `Fs.Mkdir(ctx, dir)` | bucket 检测 / 目录标记 | CreateBucket / PutObject (空对象) | 同上 |
 
-### 4.2 Fs.Put — 上传入口
+### 4.2 Put 入口
 
 [Fs.Put](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2764-L2771)
 
@@ -300,9 +454,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo,
 }
 ```
 
-`Put` 创建一个临时 `Object`，然后调用 `Update` 完成实际上传。
+`Put` 创建一个临时 `Object`，然后委托给 `Object.Update` 完成实际上传。
 
-### 4.3 Object.Update — 上传调度器
+### 4.3 Object.Update — 上传调度
 
 [Object.Update](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L5022-L5105)
 
@@ -328,58 +482,54 @@ func (o *Object) Update(ctx context.Context, in io.Reader,
         }
     }
 
-    // 上传后处理：HEAD 校验 / ETag 校验 / Object Lock 等
+    // 上传后处理
+    if o.fs.opt.NoHead && size >= 0 {
+        // 不做 HEAD，根据上传响应构造元数据
+    } else {
+        head, err = o.headObject(ctx)     // 调用 HeadObject 校验
+    }
     o.setMetaData(head)
     return err
 }
 ```
 
 **上传模式决策**：
-- **未知大小** (`size < 0`) → 多分片上传
-- **大小 >= UploadCutoff** → 多分片上传（默认 200MB）
-- **大小 < UploadCutoff** → 单分片上传
+- **size < 0**（未知大小）→ 多分片上传
+- **size >= UploadCutoff**（默认 200MB）→ 多分片上传
+- **size < UploadCutoff** → 单分片上传
 
 ### 4.4 prepareUpload — 上传准备
 
 [Object.prepareUpload](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4807-L4936)
 
-构造 `s3.PutObjectInput` 请求，设置所有上传相关参数：
+构造 `s3.PutObjectInput` 请求对象，设置所有上传参数：
 
 ```
 1. 确保父目录/bucket 存在 → mkdirParent()
-
 2. 构造 PutObjectInput
    ├─► Bucket, Key
    ├─► ACL (访问控制列表)
-   ├─► StorageClass (存储层级，从 src.GetTier() 获取)
-   │
-   ├─► 元数据处理
+   ├─► StorageClass (从 src.GetTier() 获取)
+   ├─► 元数据映射
    │    ├─► cache-control → CacheControl
    │    ├─► content-disposition → ContentDisposition
    │    ├─► content-encoding → ContentEncoding
-   │    ├─► content-language → ContentLanguage
    │    ├─► content-type → ContentType
    │    ├─► x-amz-tagging → Tagging
    │    ├─► mtime → 覆盖源 ModTime
-   │    ├─► object-lock-* → ObjectLockMode/RetainUntilDate/LegalHoldStatus
+   │    ├─► object-lock-* → ObjectLockMode/RetainUntilDate/LegalHold
    │    └─► 其余 → Metadata (x-amz-meta-*)
-   │
-   ├─► mtime 元数据 → Metadata[metaMtime]
-   │
+   ├─► metaMtime (mtime 元数据，用于 SetModTime)
    ├─► MD5 校验
-   │    ├─► 计算 MD5 (src.Hash(ctx, hash.MD5))
-   │    ├─► ContentMD5 = base64(MD5) (完整性校验)
-   │    └─► 多分片/SSE 时：Metadata[metaMD5Hash] = base64(MD5)
-   │
-   ├─► ContentType (如未设置则自动检测)
+   │    ├─► ContentMD5 = base64(MD5)
+   │    └─► 多分片/SSE 时: Metadata[metaMD5Hash] = base64(MD5)
+   ├─► ContentType (自动检测)
    ├─► ContentLength
-   ├─► RequestPayer (requester_pays)
-   │
-   └─► 服务端加密 (SSE)
-        ├─► ServerSideEncryption (SSE-S3 / SSE-KMS)
-        ├─► SSEKMSKeyId (KMS 密钥 ID)
-        └─► SSECustomer* (SSE-C 客户提供密钥)
+   ├─► RequestPayer
+   └─► SSE (ServerSideEncryption / SSEKMSKeyId / SSECustomer*)
 ```
+
+> **注意**：`prepareUpload` 阶段只构造请求结构体，**还没有签名也没有发出请求**。
 
 ### 4.5 单分片上传 — uploadSinglepartPutObject
 
@@ -387,52 +537,127 @@ func (o *Object) Update(ctx context.Context, in io.Reader,
 
 ```go
 func (o *Object) uploadSinglepartPutObject(ctx context.Context,
-    req *s3.PutObjectInput, size int64, in io.Reader) (...) {
+    req *s3.PutObjectInput, size int64, in io.Reader) (
+    etag string, lastModified time.Time, versionID *string, err error) {
 
     req.Body = io.NopCloser(in)
-    // 无符号 payload 模式（避免 seek body）
+
+    // 无符号 payload 模式：替换签名中间件，不计算 payload hash
     if o.fs.opt.UseUnsignedPayload.Value {
-        // 用 SwapComputePayloadSHA256ForUnsignedPayloadMiddleware 替换
+        options = append(options, s3.WithAPIOptions(
+            v4signer.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
+        ))
     }
+
     // 单分片不重试（Reader 只能读一次）
-    resp, err = o.fs.c.PutObject(ctx, req, options...)
+    options = append(options, func(s3opt *s3.Options) {
+        s3opt.RetryMaxAttempts = 1
+    })
+
+    var resp *s3.PutObjectOutput
+    err = o.fs.pacer.CallNoRetry(func() (bool, error) {
+        resp, err = o.fs.c.PutObject(ctx, req, options...)
+        return o.fs.shouldRetry(ctx, err)
+    })
+
     return *resp.ETag, time.Now(), resp.VersionId, nil
 }
 ```
 
-**替代方案 — 预签名 URL 上传**：
+**签名参与的调用链**（单分片 SDK 方式）：
+
+```
+uploadSinglepartPutObject
+   │
+   ├─► req.Body = io.NopCloser(in)      包装 reader
+   │
+   ├─► 可选: SwapComputePayloadSHA256ForUnsignedPayloadMiddleware
+   │       (替换签名中间件，不计算 payload hash，避免 seek body)
+   │
+   └─► o.fs.c.PutObject(ctx, req, options...)
+         │
+         ├─► Initialize 中间件
+         ├─► Serialize 中间件
+         ├─► Build 中间件
+         │      └─► 将 Body 流式化
+         ├─► Signing 中间件  ◄─── 【签名发生在这里】
+         │      ├─► 计算 payload hash (如果启用)
+         │      │    注意：流式 reader 无法 seek，所以
+         │      │    - 普通模式：需要先把 body 全读一遍算 hash
+         │      │    - UnsignedPayload 模式：跳过 payload hash
+         │      └─► 计算 v4/v2/IAM 签名
+         │      └─► 写入 Authorization 头
+         ├─► Retry 中间件 (被设为 1 次，即不重试)
+         └─► Send 中间件 → 发送 HTTP PUT 请求
+```
+
+**关键问题**：
+- 单分片上传如果使用 `io.Reader`（不可 seek），SDK 默认的 payload hash 计算会要求读取整个 body 两次（一次算 hash，一次发送）。
+- **UnsignedPayload 模式**通过 `SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` 替换签名中间件，跳过 payload SHA256 计算，改为使用 `UNSIGNED-PAYLOAD` 标识，避免 seek 问题。
+
+### 4.6 预签名 URL 上传 — uploadSinglepartPresignedRequest
+
+除了 SDK 直接上传，rclone 还支持预签名 URL 上传方式：
+
 [uploadSinglepartPresignedRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4738-L4796)
-使用 `s3.NewPresignClient` 生成预签名 URL，然后用原生 `http.Client` 发送 PUT 请求。
 
-### 4.6 多分片上传 — uploadMultipart
+```go
+func (o *Object) uploadSinglepartPresignedRequest(ctx context.Context,
+    req *s3.PutObjectInput, size int64, in io.Reader) (...) {
 
-当文件大小超过 `UploadCutoff` 或大小未知时，使用多分片上传：
+    // 1. 用 SDK 生成预签名 URL (包含签名)
+    putReq, err := s3.NewPresignClient(o.fs.c).PresignPutObject(ctx, req,
+        s3.WithPresignExpires(15*time.Minute))
+    //    └─► 内部同样走 Signing 中间件，生成预签名 URL
+    //         签名参数放在 URL query 中 (X-Amz-Signature 等)
+
+    // 2. 用原生 http.Client 发送 PUT 请求
+    httpReq, _ := http.NewRequestWithContext(ctx, "PUT", putReq.URL, in)
+    httpReq.Header = putReq.SignedHeader
+    httpReq.ContentLength = size
+
+    resp, err := o.fs.srv.Do(httpReq)   // 原生 HTTP 客户端，不走 SDK 中间件
+    // ... 解析响应
+}
+```
+
+**预签名方式的特点**：
+- 签名在 `PresignPutObject` 阶段一次性完成（生成带签名的 URL）
+- 实际上传使用原生 `http.Client`，**不再经过 SDK 签名中间件**
+- 签名有效期 15 分钟
+
+### 4.7 多分片上传 — uploadMultipart
+
+当文件较大（>= UploadCutoff）或大小未知时，使用多分片上传：
 
 1. **CreateMultipartUpload** — 初始化分片上传，获取 UploadID
 2. **UploadPart** — 并发上传各个分片（受 `--transfers` 控制）
 3. **CompleteMultipartUpload** — 合并所有分片
 
-多分片还支持 `OpenChunkWriter` 接口（`fs.ChunkWriter`），允许上层按分片流式写入。
+每个分片的 UploadPart 请求都独立经过 SDK 中间件栈，**每个分片都会单独签名**。
 
-### 4.7 上传后处理
+多分片还通过 `OpenChunkWriter` 接口（`fs.ChunkWriter`）支持流式写入。
+
+### 4.8 上传后处理
 
 Update 函数在上传完成后进行：
 
-- **HEAD 校验**（除非 `--no-head`）：调用 `headObject` 获取对象元数据，确认上传成功
+- **HEAD 校验**（默认）：调用 `headObject` 获取对象元数据，确认上传成功
+- **跳过 HEAD**（`--no-head`）：直接根据上传响应构造元数据
 - **ETag 校验**（多分片 + `--use-multipart-etag`）：比较期望 ETag 与实际 ETag
-- **Object Lock 设置**（如启用）：通过 PutObjectRetention / PutObjectLegalHold 设置
+- **Object Lock 设置**（如启用）：通过 PutObjectRetention / PutObjectLegalHold 单独 API 设置
 
 ---
 
-## 五、下载路径接入分析
+## 五、下载 (Open) — 签名与实现
 
 ### 5.1 接口映射
 
-| `fs.Object` 接口 | S3 后端实现 | 底层 S3 API |
-|-----------------|-------------|------------|
-| `Object.Open(ctx, options...)` | `Object.Open` | GetObject |
-| `Object.Hash(ctx, type)` | 从元数据读取 / 计算 | HeadObject |
-| `Fs.NewObject(ctx, remote)` | `Fs.NewObject` → `headObject` | HeadObject |
+| `fs.Object` 接口 | S3 后端实现 | 底层 S3 API | 签名方式 |
+|-----------------|-------------|------------|---------|
+| `Object.Open(ctx, options...)` | `Object.Open` | GetObject | Signing 中间件自动签名 |
+| `Object.Hash(ctx, type)` | 从缓存读取 / headObject | HeadObject | 同上 |
+| `Fs.NewObject(ctx, remote)` | `headObject` | HeadObject | 同上 |
 
 ### 5.2 Object.Open — 下载入口
 
@@ -467,16 +692,20 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
     }
 
     // 3. 调用 GetObject (pacer 限流重试)
-    resp, err = o.fs.c.GetObject(ctx, &req, s3.WithAPIOptions(APIOptions...))
+    var resp *s3.GetObjectOutput
+    err = o.fs.pacer.Call(func() (bool, error) {
+        resp, err = o.fs.c.GetObject(ctx, &req, s3.WithAPIOptions(APIOptions...))
+        return o.fs.shouldRetry(ctx, err)
+    })
 
-    // 4. 处理大小（从 ContentLength 或 ContentRange 解析）
+    // 4. 解析大小 (ContentLength 或 ContentRange)
     size := resp.ContentLength
     if resp.ContentRange != nil { /* 解析 total size */ }
 
-    // 5. 更新本地元数据
+    // 5. 更新本地元数据缓存
     o.setMetaData(&head)
 
-    // 6. gzip 解压处理（如需要）
+    // 6. gzip 解压处理
     if content-encoding == "gzip" && o.fs.opt.Decompress {
         return readers.NewGzipReader(resp.Body)
     }
@@ -485,615 +714,188 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 }
 ```
 
-### 5.3 Range 请求支持
+### 5.3 签名参与的完整调用链
+
+```
+Object.Open(ctx, options...)
+   │
+   ├─► 构造 GetObjectInput (Bucket, Key, VersionId, Range, SSE-C, ...)
+   ├─► fs.FixRangeOption(options, o.bytes)   规范化范围
+   │
+   ├─► o.fs.pacer.Call(func() {              限速 + 重试
+   │     │
+   │     └─► o.fs.c.GetObject(ctx, &req, ...)
+   │           │
+   │           ├─► Initialize 中间件
+   │           ├─► Serialize 中间件
+   │           │     └─► 将 Range / SSE-C 等转为 HTTP 头
+   │           ├─► Build 中间件
+   │           ├─► Signing 中间件  ◄─── 【签名发生在这里】
+   │           │      ├─► 从 CredentialsProvider 获取凭证
+   │           │      ├─► 对请求头 + 规范 URL 计算签名字符串
+   │           │      ├─► 调用 HTTPSignerV4.SignHTTP()
+   │           │      └─► 写入 Authorization: AWS4-HMAC-SHA256 ...
+   │           ├─► Retry 中间件
+   │           └─► Send 中间件 → GET 请求发出
+   │
+   ├─► 解析响应: ContentLength / ContentRange / ETag / Last-Modified / Metadata
+   ├─► o.setMetaData(&head)    更新本地缓存
+   └─► 返回 resp.Body (io.ReadCloser)
+```
+
+### 5.4 Range 请求支持
 
 S3 后端原生支持字节范围请求：
 
-- **`fs.RangeOption`** / **`fs.SeekOption`** → 转换为 HTTP `Range` 头
-- `fs.FixRangeOption(options, o.bytes)` — 规范化范围（处理负数偏移等）
-- 返回的 `resp.Body` 已是范围数据，长度由 `Content-Range` 响应头确定
+- **`fs.RangeOption`** / **`fs.SeekOption`** → 转换为 HTTP `Range: bytes=start-end` 头
+- `fs.FixRangeOption(options, o.bytes)` — 规范化范围（处理负数偏移、边界检查）
+- 响应通过 `Content-Range` 头确定实际返回范围和总大小
 
-### 5.4 元数据缓存
+签名时，Range 头作为请求头的一部分参与签名计算。
 
-`Object` 结构体缓存了对象元数据（`meta`、`mimeType`、`md5`、`lastModified` 等），避免重复调用 HeadObject：
+### 5.5 元数据缓存
 
-- **列表时填充**：List 返回的 `Contents` 包含 Key、Size、LastModified、ETag
-- **Open 时更新**：GetObject 响应头包含完整元数据
-- **主动获取**：`readMetaData()` → `headObject()` 调用 HeadObject API
+`Object` 结构体缓存了对象元数据，避免重复调用 HeadObject：
 
-### 5.5 NewObject — 获取对象引用
+| 缓存字段 | 类型 | 何时填充 |
+|---------|------|---------|
+| `md5` | `string` | List 响应 / Open 响应 / headObject |
+| `bytes` | `int64` | List 响应 / Open 响应 / headObject |
+| `lastModified` | `time.Time` | List 响应 / Open 响应 / headObject |
+| `meta` | `map[string]string` | Open 响应 / headObject |
+| `mimeType` | `string` | Open 响应 / headObject |
 
-`Fs.NewObject(ctx, remote)` 通过 `headObject` 获取对象元数据并构造 `*Object`，对应 `fs.Fs.NewObject` 统一接口。
+- **列表时**：List 返回的 `Contents` 包含 Key、Size、LastModified、ETag → 部分填充
+- **Open 时**：GetObject 响应头包含完整元数据 → 全量更新
+- **主动获取**：`readMetaData()` → `headObject()` → HeadObject API
+
+### 5.6 自定义下载 URL (download_url)
+
+如果配置了 `--s3-download-url`（如 CloudFront CDN），下载走独立路径：
+
+- 使用 `downloadFromURL` 方法
+- 通过原生 HTTP 客户端访问 CDN URL
+- **可能绕过 S3 签名**（取决于 CDN 配置）
 
 ---
 
-## 六、关键数据结构
+## 六、Pacer 限流与重试
 
-### 6.1 Fs 结构体
+### 6.1 Pacer 作用
 
-[backend/s3/s3.go:Fs](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1156-L1174)
+每个 `Fs` 实例持有一个 `*fs.Pacer`，基于令牌桶算法对 S3 API 调用进行限速和统一的重试逻辑：
+
+- **初始配置**：`pacer.NewS3(pacer.MinSleep(minSleep))` — S3 专属的 pacer 配置
+- **重试次数**：pacer 层重试 2 次（主要用于列表 XML 解析错误回退、特殊错误重试）
+- **SDK 层重试**：SDK 自身也有重试机制（由 `RetryMaxAttempts` 控制，默认由 `LowLevelRetries` 配置）
+
+### 6.2 shouldRetry — 重试决策
+
+[Fs.shouldRetry](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1276-L1343)
+
+该函数判断错误是否需要重试，处理了大量 S3 特定的错误码：
+
+- 5xx 错误 → 重试
+- 429 SlowDown / TooManyRequests → 退避重试
+- RequestTimeout / OperationAborted / InternalError → 重试
+- 特殊的 403（请求过期）→ 重试（时钟漂移）
+- 等等
+
+> 每次重试都会重新进入 SDK 中间件栈，签名也会**重新计算**（因为签名中的时间戳会更新）。
+
+---
+
+## 七、关键数据结构
+
+### 7.1 Fs 结构体
+
+[s3.go:1156-1174](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1156-L1174)
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
 | `name` | `string` | 远程名称 |
-| `root` | `string` | 根路径（bucket + 前缀） |
+| `root` | `string` | 根路径（bucket + 目录前缀） |
 | `opt` | `Options` | 解析后的配置选项 |
 | `ci` | `*fs.ConfigInfo` | 全局配置 |
-| `c` | `*s3.Client` | AWS SDK S3 客户端 |
+| `c` | `*s3.Client` | AWS SDK S3 客户端（含签名器） |
 | `rootBucket` | `string` | root 中的 bucket 部分 |
 | `rootDirectory` | `string` | root 中的目录前缀部分 |
 | `cache` | `*bucket.Cache` | bucket 存在性缓存 |
 | `pacer` | `*fs.Pacer` | API 调用限速与重试 |
 | `srv` | `*http.Client` | 原生 HTTP 客户端（预签名上传用） |
 | `srvRest` | `*rest.Client` | REST 客户端 |
-| `etagIsNotMD5` | `bool` | ETag 是否非 MD5（SSE-KMS/SSE-C/目录桶） |
+| `etagIsNotMD5` | `bool` | ETag 是否非 MD5（SSE-KMS / SSE-C / 目录桶） |
 | `features` | `*fs.Features` | 可选功能集 |
 
-### 6.2 Object 结构体
+### 7.2 Object 结构体
 
-[backend/s3/s3.go:Object](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1177-L1202)
+[s3.go:1177-1202](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1177-L1202)
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
 | `fs` | `*Fs` | 所属 Fs 实例 |
 | `remote` | `string` | 远程路径 |
-| `md5` | `string` | MD5 哈希 |
+| `md5` | `string` | MD5 哈希（从 ETag 来） |
 | `bytes` | `int64` | 对象大小 |
 | `lastModified` | `time.Time` | 最后修改时间 |
-| `meta` | `map[string]string` | 元数据（小写 key） |
+| `meta` | `map[string]string` | 用户元数据（小写 key） |
 | `mimeType` | `string` | MIME 类型 |
 | `versionID` | `*string` | 版本 ID（版本化 bucket） |
 | `storageClass` | `*string` | 存储层级 |
-| `cacheControl` 等 | `*string` | 其他系统元数据 |
+| `cacheControl` 等 | `*string` | 系统元数据 |
 | `objectLock*` | `*string / *time.Time` | Object Lock 相关 |
 
 ---
 
-## 七、统一后端接口调用汇总
+## 八、统一后端接口调用汇总
 
-| `fs.Fs` / `fs.Object` 方法 | S3 客户端实现 | 底层 S3 API |
-|---------------------------|-------------|------------|
-| `Fs.Name()` | `f.name` | - |
-| `Fs.Root()` | `f.root` | - |
-| `Fs.String()` | 格式化 bucket/root | - |
-| `Fs.Precision()` | 通常为 1ns | - |
-| `Fs.Hashes()` | MD5 (如 ETag 是 MD5) | - |
-| `Fs.Features()` | `f.features` | - |
-| **`Fs.List(ctx, dir)`** | `list.WithListP` → `ListP` | ListObjectsV2 |
-| **`Fs.ListP(ctx, dir, cb)`** | `f.listDir()` → `f.list(recurse=false)` | ListObjectsV2 |
-| **`Fs.ListR(ctx, dir, cb)`** | `f.list(recurse=true)` | ListObjectsV2 |
-| **`Fs.NewObject(ctx, r)`** | `headObject` | HeadObject |
-| **`Fs.Put(ctx, in, src)`** | `Object.Update` | PutObject / Multipart |
-| `Fs.Mkdir(ctx, dir)` | bucket 检测 + 目录标记 | CreateBucket / PutObject |
-| `Fs.Rmdir(ctx, dir)` | 删除 bucket / 目录标记 | DeleteBucket / DeleteObject |
-| **`Object.Open(ctx, opts)`** | `s3.Client.GetObject` | GetObject |
-| **`Object.Update(ctx, in, src)`** | 单分片 / 多分片上传 | PutObject / Multipart |
-| **`Object.Remove(ctx)`** | `s3.Client.DeleteObject` | DeleteObject |
-| `Object.SetModTime(ctx, t)` | Copy 自身 (更新元数据) | CopyObject |
-| `Object.Hash(ctx, type)` | 读取缓存 / headObject | HeadObject |
-| `Object.Storable()` | `true` | - |
-| `Object.MimeType(ctx)` | 读取缓存 / headObject | HeadObject |
-| `Fs.Copy(ctx, dst, src)` | server-side copy | CopyObject |
-| `Fs.Purge(ctx, dir)` | 批量删除 | DeleteObjects |
-| `Fs.OpenChunkWriter(...)` | 多分片写入器 | CreateMultipartUpload + UploadPart |
+下表列出 S3 客户端后端对 `fs.Fs` / `fs.Object` 统一接口的实现，以及签名如何参与每个 API 调用。
 
----
+### 8.1 fs.Fs 接口
 
-# 下篇：S3 服务端 (cmd/serve/s3/)
+| 方法 | 实现位置 | 底层 S3 API | 签名方式 |
+|------|---------|------------|---------|
+| `Name()` | [Fs.Name](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1240-L1242) | - | - |
+| `Root()` | [Fs.Root](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1245-L1247) | - | - |
+| `String()` | [Fs.String](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1250-L1257) | - | - |
+| `Precision()` | [Fs.Precision](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1260-L1262) | - | - |
+| `Hashes()` | [Fs.Hashes](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1265-L1273) | - | - |
+| `Features()` | 由 `features` 字段提供 | - | - |
+| **`List(ctx, dir)`** | [Fs.List](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2654-L2656) | ListObjectsV2 | SDK Signing 中间件 |
+| **`ListP(ctx, dir, cb)`** | [Fs.ListP](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2671-L2695) | ListObjectsV2 | SDK Signing 中间件 |
+| **`ListR(ctx, dir, cb)`** | [Fs.ListR](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2713-L2761) | ListObjectsV2 | SDK Signing 中间件 |
+| **`NewObject(ctx, r)`** | [Fs.NewObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2634-L2651) | HeadObject | SDK Signing 中间件 |
+| **`Put(ctx, in, src)`** | [Fs.Put](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2764-L2771) | PutObject / Multipart | SDK Signing 中间件 |
+| `Mkdir(ctx, dir)` | [Fs.Mkdir](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3234-L3271) | CreateBucket / PutObject | SDK Signing 中间件 |
+| `Rmdir(ctx, dir)` | [Fs.Rmdir](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3288-L3317) | DeleteBucket / DeleteObject | SDK Signing 中间件 |
+| `Copy(ctx, dst, src)` | [Fs.Copy](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3407-L3544) | CopyObject / UploadPartCopy | SDK Signing 中间件 |
+| `Purge(ctx, dir)` | - | DeleteObjects | SDK Signing 中间件 |
+| `OpenChunkWriter(...)` | [Fs.OpenChunkWriter](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4427-L4536) | CreateMultipartUpload + UploadPart | SDK Signing 中间件 |
 
-## 八、整体架构概览
+### 8.2 fs.Object 接口
 
-S3 服务端通过 `gofakes3` 库解析 S3 协议，再通过 VFS 层接入 rclone 的 `fs.Fs` 统一后端接口，从而让任何 rclone 支持的存储都能对外提供 S3 API。
-
-### 核心架构分层
-
-```
-┌──────────────────────────────────────────────────────┐
-│               S3 HTTP 请求 (外部客户端)                │
-└──────────────────────┬───────────────────────────────┘
-                       │
-┌──────────────────────▼───────────────────────────────┐
-│              gofakes3 (S3 协议解析层)                  │
-│   github.com/rclone/gofakes3                          │
-│   - 解析 S3 v4 签名认证                                │
-│   - 处理 S3 REST API 路由                              │
-│   - 定义 gofakes3.Backend 后端接口                     │
-└──────────────────────┬───────────────────────────────┘
-                       │ gofakes3.Backend 接口
-┌──────────────────────▼───────────────────────────────┐
-│            s3Backend (cmd/serve/s3/backend.go)        │
-│   实现 gofakes3.Backend 接口                           │
-│   对接 VFS 虚拟文件系统                                │
-└──────────────────────┬───────────────────────────────┘
-                       │ VFS 接口
-┌──────────────────────▼───────────────────────────────┐
-│                    VFS 层 (vfs/)                      │
-│   - *vfs.VFS    虚拟文件系统实例                       │
-│   - vfs.Node    文件/目录节点抽象                      │
-│   - vfs.Dir     目录实现                               │
-│   - vfs.File    文件实现                               │
-└──────────────────────┬───────────────────────────────┘
-                       │ fs.Fs / fs.Object 接口
-┌──────────────────────▼───────────────────────────────┐
-│              统一后端抽象层 (fs/)                      │
-│   - fs.Fs      文件系统接口（所有后端必须实现）         │
-│   - fs.Object  对象接口                                │
-│   - fs.DirEntry 目录条目接口                           │
-└──────────────────────┬───────────────────────────────┘
-                       │
-┌──────────────────────▼───────────────────────────────┐
-│              具体后端实现 (backend/*)                 │
-│   backend/local/  backend/s3/  backend/sftp/ ...     │
-└──────────────────────────────────────────────────────┘
-```
+| 方法 | 实现位置 | 底层 S3 API | 签名方式 |
+|------|---------|------------|---------|
+| `Fs() / Remote() / ModTime() / Size()` | 字段直接返回 | - | - |
+| **`Open(ctx, opts)`** | [Object.Open](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4301-L4400) | GetObject | SDK Signing 中间件 |
+| **`Update(ctx, in, src)`** | [Object.Update](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L5022-L5105) | PutObject / Multipart | SDK Signing 中间件 |
+| **`Remove(ctx)`** | [Object.Remove](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L5108-L5129) | DeleteObject | SDK Signing 中间件 |
+| `SetModTime(ctx, t)` | [Object.SetModTime](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3918-L3941) | CopyObject (复制自身更新元数据) | SDK Signing 中间件 |
+| `Hash(ctx, type)` | [Object.Hash](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3944-L3990) | 缓存 / HeadObject | SDK Signing 中间件 |
+| `Storable()` | 返回 `true` | - | - |
+| `MimeType(ctx)` | [Object.MimeType](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3993-L4013) | 缓存 / HeadObject | SDK Signing 中间件 |
+| `Metadata(ctx)` | [Object.Metadata](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4016-L4065) | 缓存 / HeadObject | SDK Signing 中间件 |
 
 ---
 
-## 九、统一后端接口定义（回顾）
-
-所有 rclone 后端必须实现 `fs.Fs` 接口，定义在 [fs/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/types.go#L17-L59)。
-
-### 9.1 核心接口 `fs.Fs`
-
-```go
-type Fs interface {
-    Info
-    List(ctx context.Context, dir string) (entries DirEntries, error)
-    NewObject(ctx context.Context, remote string) (Object, error)
-    Put(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) (Object, error)
-    Mkdir(ctx context.Context, dir string) error
-    Rmdir(ctx context.Context, dir string) error
-}
-```
-
-### 9.2 对象接口 `fs.Object`
-
-```go
-type Object interface {
-    ObjectInfo
-    SetModTime(ctx context.Context, t time.Time) error
-    Open(ctx context.Context, options ...OpenOption) (io.ReadCloser, error)
-    Update(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) error
-    Remove(ctx context.Context) error
-}
-```
-
-### 9.3 VFS 层抽象
-
-VFS (Virtual File System) 在 `fs.Fs` 之上提供类 POSIX 文件系统语义：
-
-- **`*vfs.VFS`**：虚拟文件系统根实例，持有 `fs.Fs`
-- **`vfs.Node`**：节点接口（文件/目录统一抽象）
-- **`*vfs.Dir`**：目录实现，对应 `fs.Directory`
-- **`*vfs.File`**：文件实现，对应 `fs.Object`
-
-VFS 关键方法：
-
-| 方法 | 说明 |
-|------|------|
-| `VFS.Stat(path)` | 获取路径对应的 Node |
-| `VFS.Create(path)` | 创建文件并返回写句柄 |
-| `VFS.Mkdir(path, mode)` | 创建目录 |
-| `VFS.Remove(path)` | 删除文件或空目录 |
-| `VFS.Chtimes(path, atime, mtime)` | 修改时间戳 |
-| `Dir.ReadDirAll()` | 读取目录下所有条目 |
-| `File.Open(flags)` | 打开文件获取读写句柄 |
-
----
-
-## 十、认证流程接入分析
-
-### 10.1 认证配置入口
-
-认证相关配置定义在 [cmd/serve/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/s3.go#L24-L46)：
-
-```go
-var OptionsInfo = fs.Options{{
-    Name:    "auth_key",
-    Default: []string{},
-    Help:    "Set key pair for v4 authorization: access_key_id,secret_access_key",
-}, ...}.Add(httplib.ConfigInfo).Add(httplib.AuthConfigInfo)
-```
-
-支持两种认证模式：
-1. **静态 Key 认证**：通过 `--auth_key` 配置 access_key_id,secret_access_key 对
-2. **动态代理认证**：通过 `--auth-proxy` 调用外部程序动态生成后端
-
-### 10.2 静态 Key 认证流程
-
-**初始化阶段** — [server.go:newServer](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L47-L116)
-
-```go
-// 1. 解析 auth_key 配置
-if len(opt.AuthKey) == 0 {
-    fs.Logf("serve s3", "No auth provided so allowing anonymous access")
-} else {
-    w.s3Secret = getAuthSecret(opt.AuthKey)  // 提取 secret key
-}
-
-// 2. 将 access_key -> secret_key 映射表传给 gofakes3
-authList, err := authlistResolver(opt.AuthKey)  // 解析为 map[string]string
-w.faker = gofakes3.New(
-    newBackend(w),
-    gofakes3.WithV4Auth(authList),   // 启用 S3 v4 签名验证
-    gofakes3.WithIntegrityCheck(true),
-)
-```
-
-**请求阶段**：gofakes3 内部自动处理 `Authorization` 头的 S3 v4 签名校验，与注册的 authList 比对。无需 s3Backend 介入。
-
-### 10.3 动态代理认证流程
-
-当配置 `--auth-proxy` 时，启用代理认证，实现位于 [server.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L91-L102)：
-
-```go
-if proxy.Opt.AuthProxy != "" {
-    w.proxy = proxy.New(ctx, proxyOpt, vfsOpt)
-    // 两层中间件包装 handler
-    w.handler = proxyAuthMiddleware(w.handler, w)
-    w.handler = authPairMiddleware(w.handler, w)
-}
-```
-
-#### 中间件 1: proxyAuthMiddleware — 动态获取 VFS
-
-[server.go:179-192](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L179-L192)
-
-```go
-func proxyAuthMiddleware(next http.Handler, ws *Server) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        accessKey, _ := parseAccessKeyID(r)           // 从 Authorization 头解析 access_key
-        value, err := ws.auth(accessKey)              // 调用代理获取 VFS
-        if value != nil {
-            r = r.WithContext(context.WithValue(r.Context(), ctxKeyID, value))
-        }
-        next.ServeHTTP(w, r)
-    })
-}
-```
-
-#### Proxy 后端动态生成
-
-代理实现位于 [cmd/serve/proxy/proxy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/proxy/proxy.go)：
-
-```
-HTTP 请求到达
-    │
-    ▼
-parseAccessKeyID(r) 提取 access_key
-    │
-    ▼
-proxy.Call(user=accessKey, auth=accessKey, isPublicKey=false)
-    │
-    ├─► 缓存命中？直接返回缓存的 *vfs.VFS
-    │
-    └─► 缓存未命中：
-         ├─► 执行外部代理程序，通过 STDIN 传入 {"user": accessKey, "pass": accessKey}
-         ├─► 读取 STDOUT JSON，包含 {"type": "s3", "_root": "/path", "endpoint": "...", ...}
-         ├─► 通过 fs.Find("s3") 查找后端注册信息
-         ├─► 调用 fsInfo.NewFs() 创建具体 fs.Fs 实例
-         └─► 包装为 *vfs.VFS，存入缓存
-```
-
-#### s3Backend 获取 VFS
-
-[server.go:getVFS](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L118-L133)
-
-```go
-func (w *Server) getVFS(ctx context.Context) (VFS *vfs.VFS, err error) {
-    if w._vfs != nil {         // 静态模式：直接使用初始化时创建的 VFS
-        return w._vfs, nil
-    }
-    value := ctx.Value(ctxKeyID) // 代理模式：从 request context 取出中间件注入的 VFS
-    VFS, ok := value.(*vfs.VFS)
-    return VFS, nil
-}
-```
-
----
-
-## 十一、对象列表 (List) 接入分析
-
-### 11.1 S3 列表接口映射
-
-| S3 API | gofakes3.Backend 方法 | s3Backend 实现 |
-|--------|----------------------|----------------|
-| ListBuckets | `ListBuckets(ctx)` | 列出根目录下的一级子目录作为桶 |
-| ListObjectsV2 | `ListBucket(ctx, bucket, prefix, page)` | 递归/非递归列出指定前缀下的对象 |
-
-### 11.2 ListBuckets — 列出所有桶
-
-[backend.go:ListBuckets](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L51-L72)
-
-```go
-func (b *s3Backend) ListBuckets(ctx context.Context) ([]gofakes3.BucketInfo, error) {
-    _vfs, err := b.s.getVFS(ctx)
-    dirEntries, err := getDirEntries("/", _vfs)   // 读取根目录
-    var response []gofakes3.BucketInfo
-    for _, entry := range dirEntries {
-        if entry.IsDir() {                         // 只取目录作为 bucket
-            response = append(response, gofakes3.BucketInfo{...})
-        }
-    }
-    return response, nil
-}
-```
-
-**调用链**：
-```
-ListBuckets(ctx)
-    └─► getVFS(ctx)                       获取 VFS 实例
-    └─► getDirEntries("/", _vfs)
-            └─► VFS.Stat("/")             验证根目录存在且为目录
-            └─► Dir.ReadDirAll()          读取所有子条目 (底层调用 fs.Fs.List)
-```
-
-### 11.3 ListBucket — 列出桶内对象
-
-[backend.go:ListBucket](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L75-L108)
-
-```go
-func (b *s3Backend) ListBucket(ctx context.Context, bucket string,
-    prefix *gofakes3.Prefix, page gofakes3.ListBucketPage) (*gofakes3.ObjectList, error) {
-
-    _vfs, err := b.s.getVFS(ctx)
-    _, err = _vfs.Stat(bucket)                    // 验证 bucket 存在
-    path, remaining := prefixParser(prefix)       // 解析 prefix → (目录路径, 文件名前缀)
-
-    err = b.entryListR(_vfs, bucket, path, remaining, prefix.HasDelimiter, response)
-    return b.pager(response, page)                // 分页处理
-}
-```
-
-#### 递归列表 entryListR
-
-[list.go:11-51](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/list.go#L11-L51)：
-
-```go
-func (b *s3Backend) entryListR(_vfs *vfs.VFS, bucket, fdPath, name string,
-    addPrefix bool, response *gofakes3.ObjectList) error {
-
-    dirEntries, err := getDirEntries(fp, _vfs)   // 读取当前目录
-    for _, entry := range dirEntries {
-        if !strings.HasPrefix(object, name) { continue }  // 文件名前缀过滤
-
-        if entry.IsDir() {
-            if addPrefix {
-                response.AddPrefix(objectPath + "/")    // 有 delimiter：返回 CommonPrefix
-            } else {
-                b.entryListR(_vfs, bucket, ..., false, response)  // 无 delimiter：递归
-            }
-        } else {
-            response.Add(&gofakes3.Content{...})  // 文件条目
-        }
-    }
-    return nil
-}
-```
-
-#### 分页处理 pager
-
-[pager.go:10-66](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/pager.go#L10-L66)：
-
-1. 按字母顺序排序 CommonPrefixes 和 Contents
-2. 如果有 Marker，跳过已列出的条目
-3. 按 MaxKeys（默认 1000）截断列表
-4. 如果有截断，设置 `IsTruncated=true` 和 `NextMarker`
-
----
-
-## 十二、上传路径接入分析
-
-### 12.1 上传接口映射
-
-| S3 API | gofakes3.Backend 方法 | s3Backend 实现 |
-|--------|----------------------|----------------|
-| CreateBucket | `CreateBucket(ctx, name)` | VFS.Mkdir 创建目录 |
-| PutObject | `PutObject(ctx, bucket, object, meta, reader, size)` | VFS.Create + io.Copy |
-| CopyObject | `CopyObject(ctx, src, dst, meta)` | GetObject + PutObject |
-
-### 12.2 PutObject — 简单上传
-
-[backend.go:PutObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L299-L369)
-
-```go
-func (b *s3Backend) PutObject(ctx context.Context, bucketName, objectName string,
-    meta map[string]string, input io.Reader, size int64) (result gofakes3.PutObjectResult, err error) {
-
-    _vfs, err := b.s.getVFS(ctx)
-    _, err = _vfs.Stat(bucketName)                     // 验证 bucket 存在
-
-    fp := path.Join(bucketName, objectName)
-    objectDir := path.Dir(fp)
-
-    // 1. 确保父目录存在（递归创建）
-    if objectDir != "." { mkdirRecursive(objectDir, _vfs) }
-
-    // 2. 创建文件 + 流式拷贝
-    f, err := _vfs.Create(fp)
-    if _, err := io.Copy(f, input); err != nil {
-        _ = f.Close(); _ = _vfs.Remove(fp)   // 出错清理
-    }
-    f.Close()
-
-    // 3. 存储元数据 + 设置修改时间
-    b.meta.Store(fp, meta)
-    if val, ok := meta["X-Amz-Meta-Mtime"]; ok {
-        _vfs.Chtimes(fp, ti, ti)
-    }
-    return result, nil
-}
-```
-
-#### VFS.Create → fs.Fs.Put 调用链
-
-```
-VFS.Create(fp)
-    └─► Dir.Create(leaf)                   目录内创建文件
-            └─► vfs.NewWriteFileHandle(...)
-                    └─► 数据写入时最终调用:
-                        fs.Fs.Put(ctx, reader, objectInfo)   ← 统一后端接口
-```
-
-### 12.3 Multipart Upload（分片上传）
-
-s3Backend 实现了 `gofakes3.MultipartBackend` 接口，支持两种模式：
-
-1. **流式模式（默认）**：分片数据直接流式传到后端，不落盘
-2. **内存缓冲模式**（`--disable-multipart-streaming`）：分片先在内存缓冲，完成后一次性上传
-
----
-
-## 十三、下载路径接入分析
-
-### 13.1 下载接口映射
-
-| S3 API | gofakes3.Backend 方法 | s3Backend 实现 |
-|--------|----------------------|----------------|
-| HeadObject | `HeadObject(ctx, bucket, object)` | VFS.Stat 获取元数据 |
-| GetObject | `GetObject(ctx, bucket, object, rangeReq)` | VFS.Stat + File.Open + Range |
-
-### 13.2 HeadObject — 获取对象元数据
-
-[backend.go:HeadObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L120-L166)
-
-```go
-func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName string) (*gofakes3.Object, error) {
-    _vfs, err := b.s.getVFS(ctx)
-    node, err := _vfs.Stat(path.Join(bucketName, objectName))
-    fobj := node.DirEntry().(fs.Object)
-    hash := getFileHashByte(fobj, b.s.etagHashType)   // 取 ETag
-
-    meta := map[string]string{
-        "Last-Modified": formatHeaderTime(node.ModTime()),
-        "Content-Type":  fs.MimeType(context.Background(), fobj),
-    }
-    // 合并用户自定义元数据（从 sync.Map 中取出）
-    if val, ok := b.meta.Load(fp); ok { maps.Copy(meta, val.(map[string]string)) }
-
-    return &gofakes3.Object{
-        Name:     objectName,
-        Hash:     hash,
-        Metadata: meta,
-        Size:     node.Size(),
-        Contents: noOpReadCloser{},
-    }, nil
-}
-```
-
-### 13.3 GetObject — 下载对象（含 Range）
-
-[backend.go:GetObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L169-L242)
-
-```go
-func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string,
-    rangeRequest *gofakes3.ObjectRangeRequest) (obj *gofakes3.Object, err error) {
-
-    _vfs, err := b.s.getVFS(ctx)
-    node, err := _vfs.Stat(fp)
-    file := node.(*vfs.File)
-
-    // 1. 打开文件获取可读流
-    in, err := file.Open(os.O_RDONLY)
-
-    // 2. 处理 Range 请求
-    rnge, err := rangeRequest.Range(size)
-    if rnge != nil {
-        in.Seek(rnge.Start, io.SeekStart)
-        rdr = limitReadCloser(in, in.Close, rnge.Length)
-    }
-
-    // 3. 构造元数据 + ETag
-    hash := getFileHashByte(fobj, b.s.etagHashType)
-
-    return &gofakes3.Object{
-        Name:     objectName,
-        Hash:     hash,
-        Size:     size,
-        Range:    rnge,
-        Contents: rdr,
-    }, nil
-}
-```
-
-#### ETag 哈希计算 getFileHash
-
-[utils.go:48-87](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go#L48-L87)：
-
-```go
-func getFileHash(node any, hashType hash.Type) string {
-    switch b := node.(type) {
-    case vfs.Node:
-        fsObj, ok := b.DirEntry().(fs.Object)
-        if ok {
-            o = fsObj
-            hash, _ := o.Hash(context.Background(), hashType)  // ← 统一后端接口
-            return hash
-        }
-        // 上传中文件：打开文件手动计算哈希
-    }
-}
-```
-
----
-
-## 十四、关键数据结构（服务端）
-
-### 14.1 Server 结构体
-
-[server.go:Server](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go#L33-L44)
-
-| 字段 | 类型 | 用途 |
-|------|------|------|
-| `server` | `*httplib.Server` | 底层 HTTP 服务器 |
-| `opt` | `Options` | 服务配置 |
-| `f` | `fs.Fs` | 底层统一后端（静态模式） |
-| `_vfs` | `*vfs.VFS` | VFS 实例（静态模式） |
-| `faker` | `*gofakes3.GoFakeS3` | gofakes3 S3 协议引擎 |
-| `proxy` | `*proxy.Proxy` | 认证代理（代理模式） |
-| `s3Secret` | `string` | S3 签名密钥 |
-| `etagHashType` | `hash.Type` | ETag 使用的哈希算法 |
-
-### 14.2 s3Backend 结构体
-
-[backend.go:s3Backend](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go#L29-L40)
-
-| 字段 | 类型 | 用途 |
-|------|------|------|
-| `s` | `*Server` | 回指 Server 实例 |
-| `meta` | `*sync.Map` | 对象自定义元数据缓存 |
-| `multipartUploads` | `sync.Map` | 进行中的分片上传 |
-
----
-
-## 十五、关键文件索引
-
-### 客户端后端 (backend/s3/)
+## 九、关键文件索引
 
 | 文件 | 职责 |
 |------|------|
-| [backend/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go) | S3 客户端主文件：Fs/Object 定义、NewFs、List、Put、Open 等 |
+| [backend/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go) | S3 客户端主文件：Fs/Object 定义、NewFs、List、Put、Open、认证连接等 |
 | [backend/s3/providers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/providers.go) | Provider 配置加载与 Quirks 定义 |
-| [backend/s3/v2sign.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go) | S3 v2 签名实现 |
-| [backend/s3/ibm_signer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go) | IBM IAM 签名实现 |
+| [backend/s3/v2sign.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go) | S3 v2 签名实现 (HTTPSignerV4 接口) |
+| [backend/s3/ibm_signer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go) | IBM IAM Token 签名实现 (HTTPSignerV4 接口) |
 | [backend/s3/setfrom.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/setfrom.go) | 结构体字段拷贝工具（代码生成） |
-
-### 服务端 (cmd/serve/s3/)
-
-| 文件 | 职责 |
-|------|------|
-| [cmd/serve/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/s3.go) | CLI 命令注册、Options 定义 |
-| [cmd/serve/s3/server.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/server.go) | Server 构造、认证中间件、VFS 获取 |
-| [cmd/serve/s3/backend.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/backend.go) | s3Backend 实现：CRUD、桶操作、Copy |
-| [cmd/serve/s3/list.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/list.go) | 递归对象列表 entryListR |
-| [cmd/serve/s3/pager.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/pager.go) | S3 列表分页逻辑 |
-| [cmd/serve/s3/utils.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/s3/utils.go) | 辅助函数：哈希、目录操作、前缀解析 |
-
-### 统一接口与基础设施
-
-| 文件 | 职责 |
-|------|------|
-| [fs/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/types.go) | 统一后端接口定义 (Fs, Object, Directory) |
-| [fs/pacer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/pacer.go) | Pacer 限流与重试 |
-| [vfs/vfs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/vfs/vfs.go) | VFS 虚拟文件系统核心定义 |
-| [cmd/serve/proxy/proxy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/cmd/serve/proxy/proxy.go) | 动态认证代理 |
+| [fs/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/types.go) | 统一后端接口定义 (Fs / Object / Directory) |
+| [fs/pacer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/pacer.go) | Pacer 限流与重试抽象 |

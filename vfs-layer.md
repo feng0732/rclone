@@ -234,6 +234,8 @@ func (fh *WriteFileHandle) openPending() (err error) {
 
 **Close 流程**（`vfs/write.go#L187-L213`）：关闭 `pipeWriter` → 阻塞等待 `result` channel（即上传完成）→ `setObject` 更新目录中的对象引用。若上传失败且对象为 nil，调用 `File.Remove()` 清理虚拟条目。
 
+**Flush 与 Release**：`Flush()`（`vfs/write.go#L237-L258`）和 `Release()`（`vfs/write.go#L265-L280`）都会调用 `close()`——**直传句柄的 Flush 是同步的，会阻塞等待上传完成**。FUSE 层 `Flush` 对应 `close()` 系统调用，`Release` 对应文件描述符最终释放。由于 `close()` 内部等待 `<-fh.result`，直传写入的用户体验是「close 要等上传」而非「秒存」。
+
 ### 2.5 RWFileHandle：读写句柄
 
 结构体定义于 `vfs/read_write.go#L18-L31`，是唯一支持完整随机读写的句柄。所有读写都落到 `vfscache.Item` 代表的本地磁盘文件。
@@ -266,6 +268,8 @@ func newRWFileHandle(d *Dir, f *File, flags int) (fh *RWFileHandle, err error) {
 
 **关闭流程**：`close()`（`vfs/read_write.go#L156-L180`）→ `item.Close(setObject)`，由 Item 内部决定同步/异步写回（见第四章）。
 
+**Flush 与 Release**：`Flush()`（`vfs/read_write.go#L192-L198`）仅调用 `updateSize()` 同步文件大小到 File 对象，**不触发任何写回或关闭操作，立即返回**。`Release()`（`vfs/read_write.go#L204-L217`）调用 `close()` → `item.Close(setObject)`，此时若 `WriteBack>0`（默认），`_actualClose()` 仅将脏项入队写回后返回，**不等待上传完成**。用户感知的是「close 立即返回，后台延迟写回」。
+
 ### 2.6 三种句柄对比
 
 | 特性 | ReadFileHandle | WriteFileHandle | RWFileHandle |
@@ -276,6 +280,8 @@ func newRWFileHandle(d *Dir, f *File, flags int) (fh *RWFileHandle, err error) {
 | Truncate | 不适用 | 仅打开时 | 任意时刻 |
 | 打开延迟 | 低 | 低 | 可能高（需下载） |
 | 内存占用 | `ChunkSize×流数` | 上传缓冲 | 低（仅 fd） |
+| Flush 语义 | 校验哈希 | **同步阻塞等待上传** | 仅 `updateSize()`，立即返回 |
+| Release 语义 | 关闭流 | 同 Flush（关闭 pipe） | 入队写回，不等待上传 |
 | 适用场景 | 大文件顺序读、流媒体 | 一次性写新文件 | 数据库、随机修改 |
 
 ---
@@ -654,7 +660,10 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
    该 `vAddFile` 虚拟标记的最终清理发生在**下一次目录从后端读取时**：
    - 若后端列表已包含同名文件：`_readDirFromEntries()`（`vfs/dir.go#L732-L787`）→ `mv.add()`（`vfs/dir.go#L681-L696`）命中 `case vAddFile`，调用 `_deleteVirtual(name)`（`vfs/dir.go#L596-L607`）清除虚拟标记，条目升级为「真实条目」。
    - 若后端列表尚未出现该文件：由每次 List 前的 `_purgeVirtual()`（`vfs/dir.go#L620-L659`）负责清理——仅当写入已完成（`!f.writingInProgress()`）且未被缓存使用时才删除虚拟标记；否则保留。
-6. 挂载层 `flush` 立即返回，用户感知「秒存」；后台 `WaitForWriters()`（`vfs/vfs.go#L434-L464`）在卸载前等待所有写回完成。
+6. 挂载层的 Flush 与 Release 语义因句柄类型而异，**并非统一「立即返回」**：
+   - **Write 句柄（Pipe 直传）**：`Flush()`（`vfs/write.go#L237-L258`）调用 `close()` → 关闭 `pipeWriter` → 阻塞等待 `<-fh.result`（即远端上传完成）→ `setObject`。**Flush 会同步阻塞直到上传成功或失败**，用户感知的是「写完即存，但 close 要等上传」。
+   - **RW 句柄（磁盘缓存写入）**：`Flush()`（`vfs/read_write.go#L192-L198`）仅调用 `updateSize()` 同步本地文件大小到 File 对象，**不做任何写回操作，立即返回**。`Release()`（`vfs/read_write.go#L204-L217`）调用 `close()` → `item.Close(setObject)`，此时因 `WriteBack>0`（默认 5s），`_actualClose()` 将脏项入队 `writeback.Add()` 后即返回——**Release 入队写回但不等待上传完成**。用户感知的是「close 立即返回，后台延迟写回」。
+   - 卸载时 `WaitForWriters()`（`vfs/vfs.go#L434-L464`）等待所有写回完成，保证数据不丢。
 
 ### 5.4 典型场景：随机读写（如 SQLite）
 
@@ -670,14 +679,14 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
 打开文件（File.Open）        目录缓存（Dir）              写回策略（vfscache）
    │ 选择最优句柄              │ 维持合并视图                 │ 脏标记 + 延迟上传
    │                           │                             │
-   ├── Read: 流式不落盘 ───────┤ 读路径命中缓存，少调 List ──┤ 关闭后异步回写
-   ├── Write: Pipe 直传 ──────┤ 本地修改即时可见(virtual) ──┤ 上传成功 setObject→addObject→vAddFile
-   └── RW: 本地缓存文件 ──────┤ 写时 addObject 注入目录 ────┤ reload 恢复未传数据
+   ├── Read: 流式不落盘 ───────┤ 读路径命中缓存，少调 List ──┤ (不适用)
+   ├── Write: Pipe 直传 ──────┤ 本地修改即时可见(virtual) ──┤ Flush 同步阻塞等上传；Release 同 Flush
+   └── RW: 本地缓存文件 ──────┤ 写时 addObject 注入目录 ────┤ Flush 仅 updateSize；Release 入队写回不等待
                                                               │
                           配额/年龄清理保护本地磁盘不爆 ───────┘
 ```
 
-三者通过 `CachePath`、虚拟条目、`storeFn` 回调紧密耦合：打开文件决定数据落点，目录缓存保证可见性与一致性，写回策略保证持久性与磁盘可控。写回完成通过 `File.setObject → Dir.addObject` 将条目注入目录并标记 `vAddFile`，待下次后端 List 时由 `mv.add()` 升级为真实条目。
+三者通过 `CachePath`、虚拟条目、`storeFn` 回调紧密耦合：打开文件决定数据落点，目录缓存保证可见性与一致性，写回策略保证持久性与磁盘可控。**直传写入**的 Flush 同步阻塞直到上传完成，用户 close 时感知等待；**缓存写入**的 Flush 仅更新大小，Release 入队写回后立即返回，用户 close 时感知「秒存但后台未同步」。写回完成通过 `File.setObject → Dir.addObject` 将条目注入目录并标记 `vAddFile`，待下次后端 List 时由 `mv.add()` 升级为真实条目。
 
 ---
 

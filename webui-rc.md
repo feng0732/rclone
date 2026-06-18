@@ -505,21 +505,110 @@ return rc.Params{
 }, nil
 ```
 
-**job/stop** - 停止任务 [job.go](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L455-L482)
+#### ✅ job/stop 取消等待语义深度分析
 
+**Stop 函数定义** [job.go#L310-L315](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L310-L315)
+
+在 `NewJob` 中创建 Stop 闭包，捕获 `cancel` 和 `ctx`：
 ```go
-func rcJobStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-    job := running.Get(jobID)
-    job.mu.Lock()
-    defer job.mu.Unlock()
-    job.Stop()   // 内部执行 cancel(); <-ctx.Done(); 阻塞到取消完成
-    return nil, nil
+ctx, cancel := context.WithCancel(ctx)
+stop := func() {
+    cancel()                      // ① 发送取消信号
+    // Wait for cancel to propagate before returning.
+    <-ctx.Done()                  // ② 阻塞等待，直到 ctx 完全取消
 }
 ```
 
-**job/stopgroup** - 按分组停止 [job.go](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L484-L513)
+| 步骤 | 代码 | 语义 |
+|------|------|------|
+| ① | `cancel()` | 向 context 发送取消信号，所有监听 `ctx.Done()` 的 goroutine 收到通知 |
+| ② | `<-ctx.Done()` | **同步阻塞**，直到 `ctx` 被标记为已取消（即 cancel 被调用且所有子 context 感知到） |
 
-遍历所有 jobs，按 `Group` 字段匹配，逐一调用 `Stop()`。
+**返回承诺**：`Stop()` 返回时，`ctx` 已经处于取消状态，任何后续检查 `ctx.Err() != nil` 都会返回 `context.Canceled`。
+
+---
+
+**rcJobStop 调用实现** [job.go#L467-L482](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L467-L482)
+
+```go
+func rcJobStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+    jobID, err := in.GetInt64("jobid")
+    job := running.Get(jobID)
+    if job == nil { return errors.New("job not found") }
+    
+    job.mu.Lock()       // ⚠️ 先获取 job.mu 锁
+    defer job.mu.Unlock()
+    out = make(rc.Params)
+    job.Stop()          // ⚠️ 在持有锁的情况下调用 Stop()，会阻塞
+    return out, nil
+}
+```
+
+**rcGroupStop 调用实现** [job.go#L496-L513](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L496-L513)
+
+```go
+func rcGroupStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+    group, _ := in.GetString("_group")
+    running.mu.RLock()
+    defer running.mu.RUnlock()
+    for _, job := range running.jobs {
+        if job.Group == group {
+            job.mu.Lock()      // 同样先获取锁
+            job.Stop()         // 阻塞等待取消完成
+            job.mu.Unlock()
+        }
+    }
+}
+```
+
+---
+
+**⚠️ 死锁风险分析（当前代码存在缺陷）**
+
+**完整调用链**：
+
+```
+Goroutine A (rcJobStop 请求)       Goroutine B (job.run 后台执行)
+         |                                      |
+         ▼                                      |
+job.mu.Lock()  (获得锁)                         |
+         |                                      |
+         ▼                                      |
+job.Stop()                                     |
+    |                                          |
+    ├─ cancel() ───────────────────────────────┼───────────→ ① 发送取消信号
+    |                                          ▼
+    └─ <-ctx.Done() (阻塞等待)              fn(ctx, in) 检测到取消
+                                               |
+                                               ▼
+                                         fn 返回 error
+                                               |
+                                               ▼
+                                         job.finish(out, err)
+                                               |
+                                               ▼
+                                         job.mu.Lock()  (等待锁...)
+                                               ║
+                                               ║ 🔒 死锁！
+                                               ║
+                                        A 持有 job.mu 等待 ctx.Done()
+                                        B 需要 job.mu 才能 finish()
+                                        双方互相等待，永久阻塞
+```
+
+**死锁根源**：
+1. `rcJobStop` 在持有 `job.mu` 的情况下调用 `job.Stop()`
+2. `job.Stop()` 的 `<-ctx.Done()` 需等待任务 goroutine 完成 `fn` 并执行 `finish()`
+3. `job.finish()` 第一行就是 `job.mu.Lock()` [job.go#L57](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L57)
+4. 但 `job.mu` 正被 `rcJobStop` 持有 → **经典死锁**
+
+**验证死锁所需条件**（全部满足）：
+- ✅ 互斥：`job.mu` 是互斥锁，同一时间只能一个持有
+- ✅ 持有并等待：A 持有 `job.mu`，同时等待 B 完成
+- ✅ 不可抢占：无法强制 A 释放 `job.mu`
+- ✅ 循环等待：A → 等待 B finish → 等待 A 释放锁 → A
+
+---
 
 **job/batch** - 批量并发执行 [job.go](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L594-L758)
 
@@ -563,7 +652,7 @@ func (jobs *Jobs) Expire() {
 
     for ID, job := range jobs.jobs {
         job.mu.Lock()
-        // 条件：已完成 且 (当前时间 - EndTime) 超过 JobExpireDuration
+        // ⚠️ 精确删除条件：严格大于 >
         if job.Finished && now.Sub(job.EndTime) > time.Duration(jobs.opt.JobExpireDuration) {
             delete(jobs.jobs, ID)
         }
@@ -574,7 +663,7 @@ func (jobs *Jobs) Expire() {
     if len(jobs.jobs) != 0 {
         // 还有任务（运行中 / 未到保留期的已完成）→ 继续调度
         time.AfterFunc(time.Duration(jobs.opt.JobExpireInterval), jobs.Expire)
-        jobs.expireRunning = true    // 理论上已经是 true
+        jobs.expireRunning = true
     } else {
         // 全部清理干净 → 停止定时器，等待下次 kickExpire
         jobs.expireRunning = false
@@ -582,21 +671,56 @@ func (jobs *Jobs) Expire() {
 }
 ```
 
-**清理生命周期示例（默认参数）**：
+#### ✅ 精确删除条件分析
+
+**核心代码** [job.go#L170](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L170)：
+```go
+now.Sub(job.EndTime) > time.Duration(jobs.opt.JobExpireDuration)
+```
+
+| 条件 | 运算符 | 含义 |
+|------|--------|------|
+| `job.Finished` | 布尔 | 必须已完成（运行中的任务不会被删） |
+| `now.Sub(job.EndTime) > JobExpireDuration` | **`>` 严格大于** | 已完成时长必须严格超过保留时长 |
+
+**⚠️ 边界条件：刚好达到保留时长时不删除**
+
+```go
+// 假设 JobExpireDuration = 60s
+now.Sub(job.EndTime) == 60s  // 60 > 60 ? false → 不删除
+now.Sub(job.EndTime) == 60.000000001s  // > 60 ? true → 删除
+```
+
+**测试用例印证** [job_test.go#L68](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job_test.go#L68)：
+```go
+// 测试特意设置为 -JobExpireDuration -60s，确保 > 条件成立
+job.EndTime = time.Now().Add(-time.Duration(rc.Opt.JobExpireDuration) - 60*time.Second)
+```
+
+#### ✅ 清理生命周期示例（默认参数，带边界分析）
 
 ```
 T=0s    job1 启动（runningIds=[1]，expireRunning=false）
-T=5s    job1 完成 → kickExpire() → 定时器启动，10s 后执行 Expire
+T=5s    job1 完成 → EndTime=5s
+        → kickExpire() → 定时器启动，10s 后执行 Expire
         expireRunning=true
-T=15s   Expire 执行：检查 job1.EndTime(5s) + 60s = 65s > 15s
-        → 不删除；jobs 非空，再调度 10s
-T=25s   Expire 执行：同上，仍不删除；继续调度
+
+T=15s   Expire 执行：now=15s
+        now - EndTime = 10s
+        10s > 60s ? false → 不删除
+        jobs 非空，再调度 10s
+
+T=25s   Expire 执行：20s > 60s ? false → 不删除
 ...
-T=65s   Expire 执行：job1 满足 EndTime(5s)+60s=65s ≤ 65s
-        → delete job1；jobs 空 → expireRunning=false，不再调度
-T=70s   job2 完成 → kickExpire() → 重新启动定时器，10s 后 Expire
+T=65s   Expire 执行：60s > 60s ? false → ❗️ 还不删除！
+T=75s   Expire 执行：70s > 60s ? true → ✅ 终于删除
+        → jobs 空 → expireRunning=false，不再调度
+
+T=70s   job2 完成 → kickExpire() → 重新启动定时器
         expireRunning=true
 ```
+
+**注意**：由于检查间隔是 10 秒（`JobExpireInterval`），实际删除时间总是比保留时长多出 0~10 秒。
 
 ### 4.5 OnFinish 回调与跨模块集成
 

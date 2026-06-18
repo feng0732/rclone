@@ -462,10 +462,16 @@ opts.ExtraHeaders["Destination"] = destinationURL.String()  // 目标：真实�
 - 收到 **423 LOCKED**：标记 `wasLocked=true`，指数退避（5s→10s→20s…）等待合并
 - 423 后再收到 **404**：视为合并成功（Nextcloud 合并完成后删除虚拟 .file）
 
-**覆盖语义结论**：
-- MOVE 的 Destination 就是最终目标路径
-- 代码中**未显式设置 `Overwrite: T`**，但 Nextcloud 的 chunking 协议中，此 MOVE 操作**默认会覆盖目标**
-- 如果目标已存在且非空，Nextcloud 服务端会以合并结果覆盖原文件
+**覆盖语义结论—— 分两层看**：
+
+**A. rclone 代码侧事实**：
+- MOVE 的 `Destination` 就是最终目标路径
+- 代码中**未显式设置 `Overwrite` 头**（对比：[copyOrMove()](backend/webdav/webdav.go#L1154-L1206) 中 COPY/MOVE 显式设了 `Overwrite: T`）
+- 未设 `Overwrite` 头时，按 WebDAV 规范（RFC 4918 §9.9）默认 `Overwrite: T`
+
+**B. 服务端行为推断**：
+- Nextcloud 的 chunking 协议中，此 MOVE 操作预期会覆盖目标
+- 但 Nextcloud 版本差异可能导致行为不同，rclone 代码未做额外保障
 
 ---
 
@@ -540,11 +546,18 @@ func (o *Object) CreateUploader(ctx context.Context, u *Upload, options ...fs.Op
 }
 ```
 
-**同名覆盖的代码级结论（创建阶段）**：
-- **不做存在性预检**：创建会话前不会 PROPFIND 检查目标路径是否已有同名文件
-- **不设条件头**：POST 请求中没有 `If-None-Match` 等防止覆盖的条件头
-- **文件名只在 Metadata 中传递**：`Upload-Metadata: filename <base64(fn)>`，服务端据此决定最终路径
-- **覆盖决策权完全在 OCIS 服务端**：OCIS 在上传完成（PATCH 全部写完后）组装文件时，如果检测到同名冲突，默认策略为**覆盖写入**——与 rclone 其他上传方式保持一致
+**同名覆盖结论（创建阶段）—— 分两层看**：
+
+**A. rclone 代码侧事实（可从代码直接确认）**：
+- **不做存在性预检**：`CreateUploader` 内不调用 `NewObject()` / `readMetaDataForPath()` 检查目标路径是否已有同名文件
+- **不设条件头**：POST 请求的 `ExtraHeaders` 中没有 `If-None-Match`、`Overwrite` 或任何防止覆盖的条件头
+- **文件名仅通过 Metadata 传递**：`Upload-Metadata: filename <base64(fn)>`，rclone 自身不参与目标路径冲突判定
+- **PATCH 阶段同样无冲突控制**：[uploadChunk()](backend/webdav/tus-uploader.go#L57-L105) 只设 `Upload-Offset` / `Tus-Resumable` / `filetype`，无任何条件头
+
+**B. 服务端行为推断（不可从 rclone 代码确认）**：
+- TUS 协议规范本身**未定义同名冲突的处理策略**——POST 创建上传会话和 PATCH 传输数据块都与最终文件路径无关
+- 同名冲突发生在 OCIS 服务端**将上传会话组装为最终文件**时，具体策略（覆盖 / 拒绝 / 版本化）由 OCIS 实现，rclone 代码无法观测
+- 目前社区经验表明 OCIS 默认为覆盖写入，但这是**服务端行为推断**，不是 rclone 代码保证的语义
 
 #### 4.5.3 步骤 2：数据上传主循环 — Uploader.Upload()
 
@@ -675,8 +688,8 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 | 服务端 COPY 文件 | COPY | `Overwrite: T` 头 | 强制覆盖 |
 | 服务端 MOVE 文件 | MOVE | `Overwrite: T` 头 | 强制覆盖 |
 | 服务端 MOVE 目录 | MOVE | `Overwrite: T` + 预检 DirNotEmpty | 强制覆盖（但先检查目标不存在） |
-| Nextcloud 分块合并 | MOVE | 未显式设 Overwrite，依赖服务端默认 | **隐式覆盖**目标路径 |
-| TUS 上传（infinitescale） | POST + PATCH | 不做预检，无 If-None-Match，由服务端完成时决定 | **隐式覆盖**（OCIS 默认策略） |
+| Nextcloud 分块合并 | MOVE | 未显式设 Overwrite（RFC 4918 默认 `Overwrite: T`）；服务端实际行为依赖 Nextcloud 实现 | **代码侧**：未主动控制覆盖；**服务端推断**：预期覆盖 |
+| TUS 上传（infinitescale） | POST + PATCH | 不做预检，无 If-None-Match/Overwrite；TUS 协议未定义同名冲突策略 | **代码侧**：rclone 不参与冲突判定；**服务端推断**：OCIS 组装文件时决定（社区经验为覆盖） |
 | SetModTime 修正 | PROPPATCH | N/A | 只修改 DAV 属性，不覆盖文件内容 |
 
 ### 4.8 失败清理策略

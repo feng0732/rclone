@@ -101,25 +101,52 @@ URL 模板 (中国版): https://{Endpoint}/drives/{driveID}/root/children('@a1')
 
 ### 2.1 上传策略选择
 
-[Object.Update()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2694-L2728) 根据文件大小选择上传方式：
+[Object.Update()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2694-L2728) 根据文件大小与 `UploadCutoff` 配置选择上传方式：
+
+```go
+// 核心判断逻辑（第 2708-2713 行）
+if size > 0 && size >= int64(o.fs.opt.UploadCutoff) {
+    info, err = o.uploadMultipart(ctx, in, src, options...)   // 分片上传
+} else if size >= 0 {
+    info, err = o.uploadSinglepart(ctx, in, src, options...)  // 单次上传
+} else {
+    return errors.New("unknown-sized upload not supported")    // 不支持未知大小
+}
+```
+
+相关常量与配置（均在 [onedrive.go](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L46-L65) 顶部声明）：
+
+| 名称 | 值 | 说明 |
+|---|---|---|
+| `maxSinglePartSize` | 4 MiB | 单次上传的硬上限，`uploadSinglepart` 内部校验 size ≤ 4 MiB |
+| `defaultChunkSize` | 10 MiB | 分片上传的默认片大小 |
+| `chunkSizeMultiple` | 320 KiB | 分片大小必须是此值的整数倍 |
+| `UploadCutoff` | **默认 -1（禁用）** | 分片上传触发阈值，配置定义见[第 143-155 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L143-L155)，`Default: fs.SizeSuffix(-1)` |
+
+**UploadCutoff 默认值的含义**：
+
+`UploadCutoff` 默认为 `fs.SizeSuffix(-1)`，即 -1 字节。[checkUploadCutoff()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1066-L1071) 仅校验 `cs > maxSinglePartSize` 时报错，-1 通过校验。由于判断条件为 `size > 0 && size >= int64(UploadCutoff)`，当 UploadCutoff = -1 时，任何正数 size 都满足 `size >= -1`，因此**默认配置下所有 size > 0 的文件都走分片上传**，只有 size == 0（空文件）才走单次上传。
+
+源码注释也印证了这一点（[第 2646-2647 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2646-L2647)）：
 
 ```
-size >= UploadCutoff (默认 10 MiB) 且 size > 0  →  uploadMultipart（分片上传）
-0 <= size < UploadCutoff                           →  uploadSinglepart（单次上传）
-size < 0                                           →  报错，不支持未知大小
+// Update the content of a remote file within 4 MiB size in one single request
+// (currently only used when size is exactly 0)
 ```
 
-相关常量：
-- `UploadCutoff`：默认 10 MiB，最大不超过 4 MiB（`maxSinglePartSize`）
-- `ChunkSize`：分片大小，默认 10 MiB，必须是 320 KiB 的整数倍
+**禁用 UploadCutoff 的原因**：OneDrive for Business 上，单次上传后设置 modTime 会创建新版本，导致存储空间翻倍。详见 [GitHub #1716](https://github.com/rclone/rclone/issues/1716)。
+
+**用户自定义 UploadCutoff 时**：若用户设置了正值（如 4 MiB），则 `size < UploadCutoff` 的小文件走 singlepart，`size >= UploadCutoff` 的大文件走 multipart。但 UploadCutoff 不能超过 `maxSinglePartSize`（4 MiB），否则 [checkUploadCutoff()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L1066-L1071) 会报错。
 
 ### 2.2 分片上传流程
 
-[Object.uploadMultipart()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2593-L2644)
+[Object.uploadMultipart()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2591-L2644)
+
+前置检查：`size <= 0` 直接报错（[第 2596-2597 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2596-L2597)），multipart 不支持未知大小和空文件。
 
 ```
 1. createUploadSession  →  获取 uploadURL
-2. 循环 uploadFragment  →  逐片上传
+2. 循环 uploadFragment  →  逐片上传，片大小 = min(remaining, ChunkSize)
 3. 最后一片返回 200/201 →  上传完成，获得完整 Item
 4. setMetaData          →  更新 Object 元数据
 5. updateMetadata       →  如果有权限元数据，额外更新
@@ -131,8 +158,8 @@ size < 0                                           →  报错，不支持未知
 
 - 调用 `o.fs.newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")` 构建请求 URL
 - **注意**：这里 `newOptsCallWithPath` 依赖 dircache 查找目标文件所在目录的 ID，然后基于该 ID 构建创建上传会话的 URL
-- 请求体可包含 `item` 字段（如 FileSystemInfo），在会话创建时一并设置元数据
-- 返回 `CreateUploadResponse`，核心字段是 `UploadURL`（后续分片上传的目标地址）
+- 请求体为 [api.CreateUploadRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/api/types.go#L359-L361)，内含 `item` 字段（如 FileSystemInfo），在会话创建时一并设置元数据
+- 返回 [api.CreateUploadResponse](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/api/types.go#L364-L368)，核心字段是 `UploadURL`（后续分片上传的目标地址）和 `NextExpectedRanges`
 
 #### 2.2.2 分片上传
 
@@ -147,7 +174,7 @@ Body: chunk data
 ```
 
 - 使用 `o.fs.unAuth`（无认证客户端）发送，因为 uploadURL 自带临时认证
-- **416 错误恢复**：收到 `416 Range Not Satisfiable` 时，调用 `getPosition()` 查询服务端期望的偏移量，计算 skip 值后重试当前分片
+- **416 错误恢复**：收到 `416 Range Not Satisfiable` 时，调用 [getPosition()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2486-L2514) 查询服务端期望的偏移量（GET uploadURL，解析 `NextExpectedRanges`），计算 skip 值后重试当前分片
 - **404 错误恢复**：上传会话可能存在最终一致性延迟，等待 5 秒后重试
 - 上传完成时服务端返回 `200` 或 `201`，响应体为完整的 `api.Item`
 
@@ -155,16 +182,17 @@ Body: chunk data
 
 [Object.cancelUploadSession()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2577-L2589)
 
-- 通过 `atexit.OnError` 注册，上传失败时自动 DELETE uploadURL
+- 通过 `atexit.OnError` 注册（[第 2609-2615 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2609-L2615)），上传失败时自动 DELETE uploadURL
 - 防止孤立的上传会话占用资源
 
 ### 2.3 单次上传
 
-[Object.uploadSinglepart()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2649-L2689)
+[Object.uploadSinglepart()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2646-L2689)
 
-- 适用于小文件（< UploadCutoff，上限 4 MiB）
+- 默认配置下仅用于 **size == 0 的空文件**（源码注释明确说明 "currently only used when size is exactly 0"）
+- 内部硬校验：`size < 0 || size > int64(maxSinglePartSize)` 时直接报错（[第 2651-2652 行](file:///d:/fz/0601-2/solo-dogfeeding/code/44-rclone/backend/onedrive/onedrive.go#L2651-L2652)），即单次上传上限为 4 MiB
 - 调用 `o.fs.newOptsCallWithPath(ctx, o.remote, "PUT", "/content")` 构建请求
-- 上传完成后需要额外调用 `fetchAndUpdateMetadata` 设置 modTime（因为单次上传不会自动携带修改时间）
+- 上传完成后需要额外调用 `fetchAndUpdateMetadata` 设置 modTime（因为单次上传不会自动携带修改时间，设置 modTime 会创建新版本）
 
 ---
 
@@ -290,9 +318,10 @@ OneDrive 后端实现了两个方法：
     │
     ├─ 步骤 3: Object.Update(ctx, in, src)
     │       │
-    │       └─ size >= UploadCutoff → uploadMultipart
-    │               │
-    │               ├─ createUploadSession
+    │       ├─ size > 0 && size >= UploadCutoff → uploadMultipart
+    │       │   （默认 UploadCutoff=-1，即所有 size>0 都走此路径）
+    │       │       │
+    │       │       ├─ createUploadSession
     │               │       └─ newOptsCallWithPath(ctx, o.remote, "POST", "/createUploadSession")
     │               │           │
     │               │           ├─ dirCache.FindPath(ctx, remote, false)  ← 再次依赖缓存
@@ -342,6 +371,6 @@ Object.readMetaData(ctx)
 ### 4.6 设计要点
 
 1. **缓存驱动定位**：dircache 是 drive item 定位的"第一选择器"。命中缓存走 ID+Path 模式（支持共享文件夹），未命中则 fallback 到 RootPath 模式
-2. **上传会话与缓存解耦**：createUploadSession 依赖缓存定位目标路径，但获取 uploadURL 后的分片上传完全脱离缓存，直接使用 URL 上传
+2. **上传会话与缓存解耦**：createUploadSession 依赖缓存定位目标路径，但获取 uploadURL 后的分片上传完全脱离缓存，直接使用 URL 上传。默认配置下（UploadCutoff = -1），所有 size > 0 的文件都走 multipart 路径，singlepart 仅用于空文件
 3. **缓存是增量构建的**：从 NewFs 的 FindRoot 开始，通过列表操作逐步填充。首次操作可能触发多次 API 调用来逐级查找目录，后续操作可复用缓存快速定位
 4. **OneNote 文件特殊处理**：FindLeaf 遇到 OneNote 文件时报错（因为它看起来像文件夹但不是），createUploadSession 遇到 `nameAlreadyExists` 错误时提示可能是 OneNote 文件

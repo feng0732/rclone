@@ -55,7 +55,7 @@ rclone 的 S3 客户端后端位于 `backend/s3/` 目录，基于 **AWS SDK v2 f
 
 ### Provider 适配机制
 
-S3 后端通过 **provider.yaml** 文件定义数十种 S3 兼容提供商的特性与 quirk，在 [providers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/providers.go) 中加载：
+S3 后端通过 **provider.yaml** 文件定义数十种 S3 兼容提供商的特性与 quirk，在 [providers.go](backend/s3/providers.go) 中加载：
 
 - **`Provider` 结构体**：定义每个提供商的 region、endpoint、ACL、storage class、SSE 等配置选项
 - **`Quirks` 结构体**：定义行为差异（列表版本、路径风格、URL 编码、ETag 是否为 MD5、是否支持 multipart 等）
@@ -67,7 +67,7 @@ S3 后端通过 **provider.yaml** 文件定义数十种 S3 兼容提供商的特
 
 ### 2.1 认证配置项
 
-认证相关配置定义在 [s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L89-L200) 的 Options 结构体中，主要包括：
+认证相关配置定义在 [s3.go](backend/s3/s3.go#L89-L200) 的 Options 结构体中，主要包括：
 
 | 配置项 | 说明 |
 |--------|------|
@@ -87,7 +87,7 @@ S3 后端通过 **provider.yaml** 文件定义数十种 S3 兼容提供商的特
 
 ### 2.2 客户端创建与签名注入总览
 
-核心入口函数为 `s3Connection`，定义在 [s3.go:1475-1629](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1475-L1629)：
+核心入口函数为 `s3Connection`，定义在 [s3.go:1475-1629](backend/s3/s3.go#L1475-L1629)：
 
 ```go
 func s3Connection(ctx context.Context, opt *Options, client *http.Client) (
@@ -147,7 +147,7 @@ rclone 自定义了两种签名器实现：
 
 #### v2Signer — S3 v2 签名
 
-[v2sign.go:44-53](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go#L44-L53)
+[v2sign.go:44-53](backend/s3/v2sign.go#L44-L53)
 
 ```go
 type v2Signer struct { opt *Options }
@@ -168,7 +168,7 @@ func (v2 *v2Signer) SignHTTP(ctx context.Context, credentials aws.Credentials,
 
 #### IbmIamSigner — IBM IAM Token 认证
 
-[ibm_signer.go:19-42](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go#L19-L42)
+[ibm_signer.go:19-42](backend/s3/ibm_signer.go#L19-L42)
 
 ```go
 type IbmIamSigner struct {
@@ -191,7 +191,7 @@ func (signer *IbmIamSigner) SignHTTP(...) error {
 
 ### 2.4 签名器注入代码
 
-签名器通过 `s3.Options` 的 `HTTPSignerV4` 字段注入，注入位置在 [s3Connection 函数](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1601-L1612)：
+签名器通过 `s3.Options` 的 `HTTPSignerV4` 字段注入，注入位置在 [s3Connection 函数](backend/s3/s3.go#L1601-L1612)：
 
 ```go
 if opt.V2Auth || opt.Region == "other-v2-signature" {
@@ -253,7 +253,7 @@ Send 中间件         ← 通过 http.Client 发送请求
 
 除了签名器替换，rclone 还通过 `fixupRequest` 函数在 Signing 阶段前后插入自定义中间件，处理特定厂商的兼容性问题：
 
-[fixupRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1392-L1458)
+[fixupRequest](backend/s3/s3.go#L1392-L1458)
 
 ```go
 func fixupRequest(o *s3.Options, opt *Options) {
@@ -303,7 +303,7 @@ func fixupRequest(o *s3.Options, opt *Options) {
 
 ### 3.2 List 入口
 
-[Fs.List](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2654-L2656)
+[Fs.List](backend/s3/s3.go#L2654-L2656)
 
 ```go
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
@@ -315,7 +315,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 ### 3.3 ListP — 非递归列表
 
-[Fs.ListP](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2671-L2695)
+[Fs.ListP](backend/s3/s3.go#L2671-L2695)
 
 ```go
 func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
@@ -334,7 +334,7 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 
 ### 3.4 list — 核心分页列表循环
 
-[Fs.list](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2387-L2577) 是最核心的列表实现，所有 List 变体最终都调用它。
+[Fs.list](backend/s3/s3.go#L2387-L2577) 是最核心的列表实现，所有 List 变体最终都调用它。
 
 **签名参与的完整调用链**：
 
@@ -413,7 +413,7 @@ isDirectory := (remote == "" || strings.HasSuffix(remote, "/")) &&
 
 识别出的目录标记会被转换为 `fs.Directory` 条目，文件则转换为 `*Object`（实现 `fs.Object`），通过 `itemToDirEntry` 函数完成转换：
 
-[Fs.itemToDirEntry](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2580-L2594)
+[Fs.itemToDirEntry](backend/s3/s3.go#L2580-L2594)
 
 ```go
 func (f *Fs) itemToDirEntry(ctx context.Context, remote string,
@@ -444,7 +444,7 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string,
 
 ### 4.2 Put 入口
 
-[Fs.Put](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2764-L2771)
+[Fs.Put](backend/s3/s3.go#L2764-L2771)
 
 ```go
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo,
@@ -458,7 +458,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo,
 
 ### 4.3 Object.Update — 上传调度
 
-[Object.Update](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L5022-L5105)
+[Object.Update](backend/s3/s3.go#L5022-L5105)
 
 ```go
 func (o *Object) Update(ctx context.Context, in io.Reader,
@@ -500,7 +500,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader,
 
 ### 4.4 prepareUpload — 上传准备
 
-[Object.prepareUpload](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4807-L4936)
+[Object.prepareUpload](backend/s3/s3.go#L4807-L4936)
 
 构造 `s3.PutObjectInput` 请求对象，设置所有上传参数：
 
@@ -533,7 +533,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader,
 
 ### 4.5 单分片上传 — uploadSinglepartPutObject
 
-[Object.uploadSinglepartPutObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4704-L4735)
+[Object.uploadSinglepartPutObject](backend/s3/s3.go#L4704-L4735)
 
 ```go
 func (o *Object) uploadSinglepartPutObject(ctx context.Context,
@@ -599,7 +599,7 @@ uploadSinglepartPutObject
 
 除了 SDK 直接上传，rclone 还支持预签名 URL 上传方式：
 
-[uploadSinglepartPresignedRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4738-L4796)
+[uploadSinglepartPresignedRequest](backend/s3/s3.go#L4738-L4796)
 
 ```go
 func (o *Object) uploadSinglepartPresignedRequest(ctx context.Context,
@@ -661,7 +661,7 @@ Update 函数在上传完成后进行：
 
 ### 5.2 Object.Open — 下载入口
 
-[Object.Open](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4301-L4400)
+[Object.Open](backend/s3/s3.go#L4301-L4400)
 
 ```go
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
@@ -791,7 +791,7 @@ S3 后端原生支持字节范围请求：
 
 ### 6.2 shouldRetry — 重试决策
 
-[Fs.shouldRetry](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1276-L1343)
+[Fs.shouldRetry](backend/s3/s3.go#L1276-L1343)
 
 该函数判断错误是否需要重试，处理了大量 S3 特定的错误码：
 
@@ -809,7 +809,7 @@ S3 后端原生支持字节范围请求：
 
 ### 7.1 Fs 结构体
 
-[s3.go:1156-1174](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1156-L1174)
+[s3.go:1156-1174](backend/s3/s3.go#L1156-L1174)
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
@@ -829,7 +829,7 @@ S3 后端原生支持字节范围请求：
 
 ### 7.2 Object 结构体
 
-[s3.go:1177-1202](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1177-L1202)
+[s3.go:1177-1202](backend/s3/s3.go#L1177-L1202)
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
@@ -855,36 +855,36 @@ S3 后端原生支持字节范围请求：
 
 | 方法 | 实现位置 | 底层 S3 API | 签名方式 |
 |------|---------|------------|---------|
-| `Name()` | [Fs.Name](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1240-L1242) | - | - |
-| `Root()` | [Fs.Root](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1245-L1247) | - | - |
-| `String()` | [Fs.String](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1250-L1257) | - | - |
-| `Precision()` | [Fs.Precision](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1260-L1262) | - | - |
-| `Hashes()` | [Fs.Hashes](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L1265-L1273) | - | - |
+| `Name()` | [Fs.Name](backend/s3/s3.go#L1240-L1242) | - | - |
+| `Root()` | [Fs.Root](backend/s3/s3.go#L1245-L1247) | - | - |
+| `String()` | [Fs.String](backend/s3/s3.go#L1250-L1257) | - | - |
+| `Precision()` | [Fs.Precision](backend/s3/s3.go#L2944-L2946) | - | - |
+| `Hashes()` | [Fs.Hashes](backend/s3/s3.go#L3233-L3235) | - | - |
 | `Features()` | 由 `features` 字段提供 | - | - |
-| **`List(ctx, dir)`** | [Fs.List](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2654-L2656) | ListObjectsV2 | SDK Signing 中间件 |
-| **`ListP(ctx, dir, cb)`** | [Fs.ListP](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2671-L2695) | ListObjectsV2 | SDK Signing 中间件 |
-| **`ListR(ctx, dir, cb)`** | [Fs.ListR](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2713-L2761) | ListObjectsV2 | SDK Signing 中间件 |
-| **`NewObject(ctx, r)`** | [Fs.NewObject](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2634-L2651) | HeadObject | SDK Signing 中间件 |
-| **`Put(ctx, in, src)`** | [Fs.Put](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L2764-L2771) | PutObject / Multipart | SDK Signing 中间件 |
-| `Mkdir(ctx, dir)` | [Fs.Mkdir](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3234-L3271) | CreateBucket / PutObject | SDK Signing 中间件 |
-| `Rmdir(ctx, dir)` | [Fs.Rmdir](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3288-L3317) | DeleteBucket / DeleteObject | SDK Signing 中间件 |
-| `Copy(ctx, dst, src)` | [Fs.Copy](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3407-L3544) | CopyObject / UploadPartCopy | SDK Signing 中间件 |
-| `Purge(ctx, dir)` | - | DeleteObjects | SDK Signing 中间件 |
-| `OpenChunkWriter(...)` | [Fs.OpenChunkWriter](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4427-L4536) | CreateMultipartUpload + UploadPart | SDK Signing 中间件 |
+| **`List(ctx, dir)`** | [Fs.List](backend/s3/s3.go#L2654-L2656) | ListObjectsV2 | SDK Signing 中间件 |
+| **`ListP(ctx, dir, cb)`** | [Fs.ListP](backend/s3/s3.go#L2671-L2695) | ListObjectsV2 | SDK Signing 中间件 |
+| **`ListR(ctx, dir, cb)`** | [Fs.ListR](backend/s3/s3.go#L2713-L2761) | ListObjectsV2 | SDK Signing 中间件 |
+| **`NewObject(ctx, r)`** | [Fs.NewObject](backend/s3/s3.go#L2051-L2053) | HeadObject | SDK Signing 中间件 |
+| **`Put(ctx, in, src)`** | [Fs.Put](backend/s3/s3.go#L2764-L2771) | PutObject / Multipart | SDK Signing 中间件 |
+| `Mkdir(ctx, dir)` | [Fs.Mkdir](backend/s3/s3.go#L2845-L2852) | CreateBucket / PutObject | SDK Signing 中间件 |
+| `Rmdir(ctx, dir)` | [Fs.Rmdir](backend/s3/s3.go#L2911-L2941) | DeleteBucket / DeleteObject | SDK Signing 中间件 |
+| `Copy(ctx, dst, src)` | [Fs.Copy](backend/s3/s3.go#L3164-L3230) | CopyObject / UploadPartCopy | SDK Signing 中间件 |
+| `Purge(ctx, dir)` | [Fs.Purge](backend/s3/s3.go#L3923-L3925) | DeleteObjects | SDK Signing 中间件 |
+| `OpenChunkWriter(...)` | [Fs.OpenChunkWriter](backend/s3/s3.go#L4427-L4536) | CreateMultipartUpload + UploadPart | SDK Signing 中间件 |
 
 ### 8.2 fs.Object 接口
 
 | 方法 | 实现位置 | 底层 S3 API | 签名方式 |
 |------|---------|------------|---------|
 | `Fs() / Remote() / ModTime() / Size()` | 字段直接返回 | - | - |
-| **`Open(ctx, opts)`** | [Object.Open](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4301-L4400) | GetObject | SDK Signing 中间件 |
-| **`Update(ctx, in, src)`** | [Object.Update](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L5022-L5105) | PutObject / Multipart | SDK Signing 中间件 |
-| **`Remove(ctx)`** | [Object.Remove](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L5108-L5129) | DeleteObject | SDK Signing 中间件 |
-| `SetModTime(ctx, t)` | [Object.SetModTime](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3918-L3941) | CopyObject (复制自身更新元数据) | SDK Signing 中间件 |
-| `Hash(ctx, type)` | [Object.Hash](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3944-L3990) | 缓存 / HeadObject | SDK Signing 中间件 |
+| **`Open(ctx, opts)`** | [Object.Open](backend/s3/s3.go#L4301-L4400) | GetObject | SDK Signing 中间件 |
+| **`Update(ctx, in, src)`** | [Object.Update](backend/s3/s3.go#L5022-L5105) | PutObject / Multipart | SDK Signing 中间件 |
+| **`Remove(ctx)`** | [Object.Remove](backend/s3/s3.go#L5108-L5129) | DeleteObject | SDK Signing 中间件 |
+| `SetModTime(ctx, t)` | [Object.SetModTime](backend/s3/s3.go#L4158-L4185) | CopyObject (复制自身更新元数据) | SDK Signing 中间件 |
+| `Hash(ctx, type)` | [Object.Hash](backend/s3/s3.go#L3974-L3990) | 缓存 / HeadObject | SDK Signing 中间件 |
 | `Storable()` | 返回 `true` | - | - |
-| `MimeType(ctx)` | [Object.MimeType](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L3993-L4013) | 缓存 / HeadObject | SDK Signing 中间件 |
-| `Metadata(ctx)` | [Object.Metadata](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go#L4016-L4065) | 缓存 / HeadObject | SDK Signing 中间件 |
+| `MimeType(ctx)` | [Object.MimeType](backend/s3/s3.go#L5246-L5253) | 缓存 / HeadObject | SDK Signing 中间件 |
+| `Metadata(ctx)` | [Object.Metadata](backend/s3/s3.go#L5283-L5324) | 缓存 / HeadObject | SDK Signing 中间件 |
 
 ---
 
@@ -892,10 +892,10 @@ S3 后端原生支持字节范围请求：
 
 | 文件 | 职责 |
 |------|------|
-| [backend/s3/s3.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/s3.go) | S3 客户端主文件：Fs/Object 定义、NewFs、List、Put、Open、认证连接等 |
-| [backend/s3/providers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/providers.go) | Provider 配置加载与 Quirks 定义 |
-| [backend/s3/v2sign.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/v2sign.go) | S3 v2 签名实现 (HTTPSignerV4 接口) |
-| [backend/s3/ibm_signer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/ibm_signer.go) | IBM IAM Token 签名实现 (HTTPSignerV4 接口) |
-| [backend/s3/setfrom.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/backend/s3/setfrom.go) | 结构体字段拷贝工具（代码生成） |
-| [fs/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/types.go) | 统一后端接口定义 (Fs / Object / Directory) |
-| [fs/pacer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/41-rclone/fs/pacer.go) | Pacer 限流与重试抽象 |
+| [backend/s3/s3.go](backend/s3/s3.go) | S3 客户端主文件：Fs/Object 定义、NewFs、List、Put、Open、认证连接等 |
+| [backend/s3/providers.go](backend/s3/providers.go) | Provider 配置加载与 Quirks 定义 |
+| [backend/s3/v2sign.go](backend/s3/v2sign.go) | S3 v2 签名实现 (HTTPSignerV4 接口) |
+| [backend/s3/ibm_signer.go](backend/s3/ibm_signer.go) | IBM IAM Token 签名实现 (HTTPSignerV4 接口) |
+| [backend/s3/setfrom.go](backend/s3/setfrom.go) | 结构体字段拷贝工具（代码生成） |
+| [fs/types.go](fs/types.go) | 统一后端接口定义 (Fs / Object / Directory) |
+| [fs/pacer.go](fs/pacer.go) | Pacer 限流与重试抽象 |

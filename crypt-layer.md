@@ -65,13 +65,221 @@ func (c *Cipher) Key(password, salt string) (err error) {
 
 | 模式 | 说明 |
 |------|------|
-| `NameEncryptionOff` | 不加密，仅添加 `.bin` 后缀（可配置） |
-| `NameEncryptionStandard` | 标准加密，使用 EME-AES |
+| `NameEncryptionOff` | 不加密，仅添加后缀（默认 `.bin`，可配置） |
+| `NameEncryptionStandard` | 标准加密，使用 EME-AES + PKCS#7 |
 | `NameEncryptionObfuscated` | 简单混淆，字符旋转 |
 
-### 3.2 标准加密模式（Standard）
+### 3.2 四个公开方法 — 模式分流与跳过规则
 
-#### 加密流程 — `encryptSegment()`（`backend/crypt/cipher.go`）
+文件名加密的对外入口是四个公开方法（均在 `backend/crypt/cipher.go`）。每个方法首先做**模式分流**和**目录名跳过判断**，再决定是否进入实际加密/解密路径。
+
+#### `EncryptFileName(in)` — 加密文件路径
+
+```go
+func (c *Cipher) EncryptFileName(in string) string {
+    if c.mode == NameEncryptionOff {
+        return in + c.encryptedSuffix // off 模式：原文件名 + 后缀（如 .bin）
+    }
+    return c.encryptFileName(in) // standard/obfuscate 模式：逐段处理
+}
+```
+
+| 模式 | 行为 | 后缀 |
+|------|------|------|
+| `Off` | **不加密**，直接在末尾追加 `encryptedSuffix` | 追加 `.bin`（或自定义后缀） |
+| `Standard` | 逐段 EME-AES 加密 | 不追加后缀 |
+| `Obfuscated` | 逐段字符旋转混淆 | 不追加后缀 |
+
+#### `DecryptFileName(in)` — 解密文件路径
+
+```go
+func (c *Cipher) DecryptFileName(in string) (string, error) {
+    if c.mode == NameEncryptionOff {
+        // off 模式：剥掉后缀，并校验剩余是否合法
+        remainingLength := len(in) - len(c.encryptedSuffix)
+        if remainingLength == 0 || !strings.HasSuffix(in, c.encryptedSuffix) {
+            return "", ErrorNotAnEncryptedFile
+        }
+        decrypted := in[:remainingLength]
+        // 如果去掉后缀后整个名字看起来像个版本号（如 v1.2.3），则拒绝
+        if version.Match(decrypted) {
+            _, unversioned := version.Remove(decrypted)
+            if unversioned == "" {
+                return "", ErrorNotAnEncryptedFile
+            }
+        }
+        return decrypted, nil
+    }
+    return c.decryptFileName(in) // standard/obfuscate 模式：逐段解密
+}
+```
+
+| 模式 | 行为 | 后缀处理 |
+|------|------|---------|
+| `Off` | **剥掉** `encryptedSuffix`，返回剩余部分 | 校验后缀必须存在，否则报 `ErrorNotAnEncryptedFile` |
+| `Standard` | 逐段 EME-AES 解密 | 不涉及后缀 |
+| `Obfuscated` | 逐段字符旋转反混淆 | 不涉及后缀 |
+
+> **特殊校验**：`Off` 模式下若剥掉后缀后整串看起来像版本字符串（如 `1.2.3`），返回错误。防止把版本号误判为文件名。
+
+#### `EncryptDirName(in)` — 加密目录路径
+
+```go
+func (c *Cipher) EncryptDirName(in string) string {
+    if c.mode == NameEncryptionOff || !c.dirNameEncrypt {
+        return in // 两种情况都跳过：off 模式 或 关闭目录名加密
+    }
+    return c.encryptFileName(in)
+}
+```
+
+| 条件 | 行为 | 后缀 |
+|------|------|------|
+| `mode == Off` | **不加密**，返回原目录名 | **不**追加后缀（与文件名不同！） |
+| `dirNameEncrypt == false` | **不加密**，返回原目录名 | 不追加后缀 |
+| 其他（standard/obfuscate + dirNameEncrypt=true） | 逐段加密 | 不追加后缀 |
+
+> **注意不对称**：`EncryptDirName` 在 `Off` 模式下**不追加** `.bin` 后缀，但 `EncryptFileName` 在 `Off` 模式下**会追加** `.bin` 后缀。这是区分目录与文件的关键。
+
+#### `DecryptDirName(in)` — 解密目录路径
+
+```go
+func (c *Cipher) DecryptDirName(in string) (string, error) {
+    if c.mode == NameEncryptionOff || !c.dirNameEncrypt {
+        return in, nil // off 或关闭目录名加密：原样返回
+    }
+    return c.decryptFileName(in)
+}
+```
+
+| 条件 | 行为 |
+|------|------|
+| `mode == Off` 或 `dirNameEncrypt == false` | **原样返回**，不做任何处理 |
+| 其他 | 逐段解密 |
+
+### 3.3 内部逐段处理 — `encryptFileName` / `decryptFileName`
+
+公开方法分流后，standard 和 obfuscate 模式都进入内部逐段处理（`backend/crypt/cipher.go`）。
+
+#### 加密：`encryptFileName()`
+
+```go
+func (c *Cipher) encryptFileName(in string) string {
+    segments := strings.Split(in, "/") // 按 "/" 切分路径
+    for i := range segments {
+        // 跳过规则：若关闭目录名加密 且 当前段不是最后一段（即非文件名段）
+        if !c.dirNameEncrypt && i != (len(segments)-1) {
+            continue // 目录段保持原样
+        }
+
+        // 版本处理：只在最后一段（文件名）做版本剥离
+        hasVersion := false
+        var t time.Time
+        if i == (len(segments)-1) && version.Match(segments[i]) {
+            t, s := version.Remove(segments[i])
+            if s != segments[i] {
+                segments[i] = s
+                hasVersion = true
+            }
+        }
+
+        // 模式分流（standard vs obfuscate）
+        if c.mode == NameEncryptionStandard {
+            segments[i] = c.encryptSegment(segments[i])
+        } else {
+            segments[i] = c.obfuscateSegment(segments[i])
+        }
+
+        // 版本回填：加密/混淆后再加回版本字符串
+        if hasVersion {
+            segments[i] = version.Add(segments[i], t)
+        }
+    }
+    return strings.Join(segments, "/")
+}
+```
+
+#### 解密：`decryptFileName()`
+
+```go
+func (c *Cipher) decryptFileName(in string) (string, error) {
+    segments := strings.Split(in, "/")
+    for i := range segments {
+        // 跳过规则：同加密方向
+        if !c.dirNameEncrypt && i != (len(segments)-1) {
+            continue
+        }
+
+        // 版本处理：同加密方向，只在最后段剥离
+        hasVersion := false
+        var t time.Time
+        if i == (len(segments)-1) && version.Match(segments[i]) {
+            t, s := version.Remove(segments[i])
+            if s != segments[i] {
+                segments[i] = s
+                hasVersion = true
+            }
+        }
+
+        // 模式分流
+        var err error
+        if c.mode == NameEncryptionStandard {
+            segments[i], err = c.decryptSegment(segments[i])
+        } else {
+            segments[i], err = c.deobfuscateSegment(segments[i])
+        }
+        if err != nil {
+            return "", err
+        }
+
+        // 版本回填
+        if hasVersion {
+            segments[i] = version.Add(segments[i], t)
+        }
+    }
+    return strings.Join(segments, "/"), nil
+}
+```
+
+### 3.4 分段跳过规则的真值表
+
+`dirNameEncrypt` 开关 + 当前段是否为最后一段，共同决定该段是否被加密：
+
+| `dirNameEncrypt` | 当前段 | 是否加密/解密 | 说明 |
+|:---:|:---:|:---:|------|
+| `true` | 任意段 | ✅ 加密 | 目录名也加密 |
+| `false` | 最后一段（文件名） | ✅ 加密 | 仅文件名加密 |
+| `false` | 中间段（目录名） | ❌ 跳过 | 目录名保持原样 |
+
+> **关键**：`dirNameEncrypt` 只在 standard/obfuscate 模式下有效；off 模式下 `EncryptDirName` 直接返回原样。
+
+### 3.5 后缀规则
+
+后缀（`encryptedSuffix`）由 `setEncryptedSuffix()`（`backend/crypt/cipher.go`）设置，初始默认值 `".bin"`（`newCipher` 中赋值）：
+
+| 配置值 | 结果 `encryptedSuffix` | 说明 |
+|--------|----------------------|------|
+| `".bin"`（默认） | `".bin"` | 标准后缀 |
+| `".txt"` 等自定义 | `".txt"` | 自定义后缀 |
+| 不以 `.` 开头（如 `txt`） | `.txt`（自动补点） | 触发 `ErrorSuffixMissingDot` 日志后补齐 |
+| `"none"` | `""` | 空后缀（path 长度敏感时可用） |
+
+后缀**仅在 `Off` 模式下**通过 `EncryptFileName` 追加；目录名即使在 `Off` 模式下也不追加。standard/obfuscate 模式下根本不使用后缀（加密段已经不可读）。
+
+### 3.6 版本字符串处理
+
+`version` 包（`lib/version`）支持类似 `file-2024-01-01.txt` 的时间戳版本后缀。处理规则：
+
+1. **只在最后一段（文件名）处理**，目录段不处理版本。
+2. 加密前：用 `version.Match()` 检测，`version.Remove()` 剥离版本字符串得到基础名和时间戳。
+3. 加密/混淆**基础名**。
+4. 加密后：用 `version.Add()` 把版本字符串重新附加到加密后的结果上。
+
+这样版本信息**保持明文可读**，但基础文件名仍被加密。解密方向对称执行。
+
+### 3.7 标准加密段 — `encryptSegment` / `decryptSegment`
+
+`encryptSegment()`（`backend/crypt/cipher.go`）：
 
 ```go
 func (c *Cipher) encryptSegment(plaintext string) string {
@@ -81,24 +289,24 @@ func (c *Cipher) encryptSegment(plaintext string) string {
 }
 ```
 
-**EME (ECB-Mix-ECB)** 是一种宽块加密模式，特点：
-- **确定性加密**：相同明文 → 相同密文（保证文件名一致性）
-- 相同前缀的明文不会产生相同前缀的密文
-- 基于 AES，使用 `nameTweak` 作为调整量
-
-#### 解密流程 — `decryptSegment()`（`backend/crypt/cipher.go`）
+`decryptSegment()`（`backend/crypt/cipher.go`）：
 
 ```go
 func (c *Cipher) decryptSegment(ciphertext string) (string, error) {
     rawCiphertext, err := c.fileNameEnc.DecodeString(ciphertext) // 解码
-    // ... 长度校验 ...
+    // ... 长度校验（必须是 16 的倍数、≤2048 字节）...
     paddedPlaintext := eme.Transform(c.block, c.nameTweak[:], rawCiphertext, eme.DirectionDecrypt) // EME-AES 解密
     plaintext, err := pkcs7.Unpad(nameCipherBlockSize, paddedPlaintext) // 去填充
     return string(plaintext), err
 }
 ```
 
-#### 文件名编码方式 — `fileNameEncoding`（`backend/crypt/cipher.go`）
+**EME (ECB-Mix-ECB)** 是一种宽块加密模式：
+- **确定性加密**：相同明文 → 相同密文（保证文件名一致性，便于去重和定位）
+- 相同前缀的明文不会产生相同前缀的密文（避免泄漏目录结构）
+- 基于 AES，使用 `nameTweak` 作为调整量
+
+### 3.8 文件名编码方式 — `fileNameEncoding`（`backend/crypt/cipher.go`）
 
 | 编码方式 | 适用场景 |
 |---------|---------|
@@ -106,38 +314,17 @@ func (c *Cipher) decryptSegment(ciphertext string) (string, error) {
 | `base64` | 大小写敏感的 remote，文件名更短 |
 | `base32768` | 按 Unicode 字符计数长度的 remote（如 OneDrive、Dropbox） |
 
-### 3.3 混淆模式（Obfuscated）
+### 3.9 混淆模式段 — `obfuscateSegment` / `deobfuscateSegment`
 
 `obfuscateSegment()`（`backend/crypt/cipher.go`）使用简单的字符旋转：
 
 1. 计算文件名所有字符的 Unicode 码点之和，模 256 得到旋转基数
 2. 加上 `nameKey` 的字节值得到实际旋转量
 3. 对不同类型的字符（数字、字母、Latin-1、Unicode）应用不同的旋转规则
-4. 格式：`旋转量.混淆后的文本`
+4. 格式：`旋转量.混淆后的文本`（前缀的数字便于反混淆时还原旋转量）
+5. 非 UTF-8 字符串直接加 `!.` 前缀，不旋转
 
-这是一种弱加密，仅用于防止文件名被直接识别。
-
-### 3.4 路径分段加密 — `encryptFileName()`（`backend/crypt/cipher.go`）
-
-```go
-func (c *Cipher) encryptFileName(in string) string {
-    segments := strings.Split(in, "/") // 按路径分隔
-    for i := range segments {
-        if !c.dirNameEncrypt && i != (len(segments)-1) {
-            continue // 可配置是否加密目录名
-        }
-        // 处理版本后缀（如 file.txt → 加密部分 + 版本后缀）
-        if version.Match(segments[i]) { /* strip version */ }
-
-        segments[i] = c.encryptSegment(segments[i]) // 每段单独加密
-
-        // 加回版本后缀
-    }
-    return strings.Join(segments, "/")
-}
-```
-
-**关键点**：每个路径段单独加密，保证目录结构仍然是树形的。
+这是一种弱加密，仅用于防止文件名被直接识别，**不能提供真正的机密性**。
 
 ---
 

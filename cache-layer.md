@@ -1,151 +1,112 @@
-# rclone Cache 缓存层深度分析
+# rclone Cache 与 ChangeNotify 精确关系分析
 
-## 一、整体架构与三层缓存
+## 一、ChangeNotify 触发瞬间：两条失效路径的精确行为
 
-| 层级 | 代码位置 | 职责 |
-|------|---------|------|
-| L1 通用 KV | [lib/cache/cache.go](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/lib/cache/cache.go) | 基于 TTL 的通用 KV，支持 Pin/Unpin 引用计数，供上层复用 |
-| L2 Fs 实例缓存 | [fs/cache/cache.go](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/fs/cache/cache.go) | 缓存 `fs.Fs` 后端实例，避免重复初始化，内置 L1，通过 `cache.Get()` 获取已存在的 Fs |
-| L3 Backend Cache | [backend/cache/](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/) | **本文核心**：独立的 fs.Fs 装饰器后端，包装任意 remote，提供元数据缓存 + 数据块(chunk)缓存 + 写缓冲 |
+### 1.1 receiveChangeNotify 入口代码
 
-本文聚焦 **L3 Backend Cache**（即 `backend/cache` 包），重点厘清 **通知失效、普通元数据命中、remote 透传**三者之间的判断边界。
+[cache.go#L819-L860](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L819-L860)
+
+```go
+func (f *Fs) receiveChangeNotify(forgetPath string, entryType fs.EntryType) {
+    f.notifyChangeUpstream(forgetPath, entryType) // 先通知 VFS 等上游
+
+    var cd *Directory
+    if entryType == fs.EntryObject {
+        co := NewObject(f, forgetPath)
+        _ = f.cache.GetObject(co)                        // 从 DB 读出当前对象
+        _ = f.cache.ExpireObject(co, true)               // 路径 A-1：对象级持久化失效
+        cd = NewDirectory(f, cleanPath(path.Dir(co.Remote())))
+    } else {
+        cd = NewDirectory(f, forgetPath)
+    }
+    _ = f.cache.ExpireDir(cd)                            // 路径 A-2：目录级持久化失效（递归祖先）
+
+    f.notifiedMu.Lock()
+    defer f.notifiedMu.Unlock()
+    f.notifiedRemotes[forgetPath] = true                 // 路径 B-1：对象/目录本身标记
+    f.notifiedRemotes[cd.Remote()] = true                // 路径 B-2：父目录标记
+}
+```
+
+**两条路径同时触发，各自独立运作，不互相依赖：**
 
 ---
 
-## 二、核心数据结构
+## 二、路径 A：持久化时间戳失效（CacheTs 回拨 + Bolt DB 写回）
 
-### 2.1 Fs：缓存后端主体（装饰器）
+### 2.1 ExpireObject：对象级持久化失效
 
-[cache.go#L319-L340](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L319-L340)
+[storage_persistent.go#L428-L436](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/storage_persistent.go#L428-L436)
 
 ```go
-type Fs struct {
-    fs.Fs                           // 嵌入底层 remote，实现透传
-    wrapper   fs.Fs                 // 上层包装者（如 crypt）
-    name      string
-    root      string
-    opt       Options               // 配置参数
-    features  *fs.Features
-    cache     *Persistent           // 持久化存储（Bolt DB + 文件系统）
-    tempFs    fs.Fs                 // 临时写目录（可选，对应 tmp_upload_path）
-    rateLimiter   *rate.Limiter     // RPS 限速
-    plexConnector *plexConnector    // Plex 集成
-    backgroundRunner *backgroundWriter // 后台上传协程
-    cleanupChan chan bool
-    parentsForgetFn []func(string, fs.EntryType) // ChangeNotify 上游订阅者（通常是 VFS）
-    notifiedRemotes  map[string]bool // 通知失效标记表
-    notifiedMu       sync.Mutex
+func (b *Persistent) ExpireObject(co *Object, withData bool) error {
+    co.CacheTs = time.Now().Add(time.Duration(-co.CacheFs.opt.InfoAge)) // 回拨 InfoAge
+    err := b.AddObject(co)           // ← JSON 序列化后写回 Bolt DB（持久化）
+    if withData {
+        _ = os.RemoveAll(path.Join(b.dataPath, co.abs())) // ← 同步删磁盘上该文件的所有 chunk
+    }
+    return err
 }
 ```
 
-**设计要点**：`Fs` 嵌入 `fs.Fs`（底层 remote），对外呈现标准 `fs.Fs` 接口，内部拦截所有操作：**先查本地缓存 → 判断是否命中 → miss 时透传到底层**。
-
-### 2.2 Object：文件元数据缓存
-
-[object.go#L24-L40](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/object.go#L24-L40)
-
-```go
-type Object struct {
-    fs.Object                       // 嵌入底层 fs.Object（可能为 nil，需 refreshFromSource 填充）
-    ParentFs      fs.Fs             // 实际所在 FS（tempFs 或 remote）
-    CacheFs       *Fs               // 所属缓存 FS
-    Name          string
-    Dir           string
-    CacheModTime  int64
-    CacheSize     int64
-    CacheStorable bool
-    CacheType     string            // "Object" | "TempObject"
-    CacheTs       time.Time         // 元数据缓存时间戳，TTL 判定核心
-    CacheHashes   map[hash.Type]string // 哈希懒缓存
-    refreshMutex  sync.Mutex        // 防并发重复 refresh
-}
-```
-
-### 2.3 Directory：目录元数据缓存
-
-[directory.go#L14-L26](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/directory.go#L14-L26)
-
-```go
-type Directory struct {
-    Directory fs.Directory          // 嵌入底层 fs.Directory（可能为 nil）
-    CacheFs      *Fs
-    Name         string
-    Dir          string
-    CacheModTime int64
-    CacheSize    int64
-    CacheItems   int64
-    CacheType    string              // "Directory"
-    CacheTs      *time.Time          // 目录缓存时间戳（指针，可能为 nil）
-}
-```
-
-### 2.4 Handle：文件读句柄 + 预加载工作池
-
-[handle.go#L43-L60](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/handle.go#L43-L60)
-
-```go
-type Handle struct {
-    ctx          context.Context
-    cachedObject *Object
-    cfs          *Fs
-    memory       *Memory             // RAM 中转缓存（go-cache）
-    preloadQueue chan int64          // 待预加载的 chunk offset 队列
-    preloadOffset  int64             // 上次触发预加载的起始 offset
-    offset         int64             // 当前读位置
-    seenOffsets    map[int64]bool    // 已提交给 worker 的 chunk offset
-    mu             sync.Mutex
-    workersWg      sync.WaitGroup
-    workers        int               // 当前 worker 数
-    maxWorkerID    int
-    UseMemory      bool
-}
-```
-
-### 2.5 存储层双实现
-
-| 实现 | 文件 | 介质 | 用途 | 失效策略 |
-|------|------|------|------|---------|
-| `Memory` | [storage_memory.go](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/storage_memory.go) | RAM (go-cache) | 流式读取短期中转，读完即丢 | CleanChunksByNeed：seek 后删除 offset 之前的 chunk |
-| `Persistent` | [storage_persistent.go](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/storage_persistent.go) | Bolt DB + 本地文件系统 | 元数据持久化 + chunk 持久化 | CleanChunksBySize：按时间戳从最旧开始删，至总大小 ≤ ChunkTotalSize |
-
----
-
-## 三、通知失效机制（边界最容易混淆的部分）
-
-### 3.1 通知失效的两条路径
-
-通知失效存在 **两条独立路径**，作用于不同层面：
-
-#### 路径 A：CacheTs 回拨（持久化，影响下一次 TTL 判定）
-
-`ExpireObject` / `ExpireDir` 将 `CacheTs` 回拨 `InfoAge`，使得下一次 TTL 判断 `now > CacheTs + InfoAge` 恒成立：
+### 2.2 ExpireDir：目录级持久化失效（向上递归）
 
 [storage_persistent.go#L342-L372](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/storage_persistent.go#L342-L372)
 
 ```go
 func (b *Persistent) ExpireDir(cd *Directory) error {
-    // 将 CacheTs 回拨 InfoAge，相当于立即使 TTL 判定过期
-    t := time.Now().Add(-cd.CacheFs.opt.InfoAge)
+    t := time.Now().Add(time.Duration(-cd.CacheFs.opt.InfoAge)) // 统一回拨时刻
     cd.CacheTs = &t
-    // 同时向上递归失效所有祖先目录
-    // ...
+
+    return b.db.Update(func(tx *bolt.Tx) error {
+        currentDir := cd.abs()
+        for { // 从当前目录开始，向上遍历所有祖先直到根
+            bucket := b.getBucket(currentDir, false, tx)
+            if bucket != nil {
+                val := bucket.Get([]byte("."))
+                if val != nil {
+                    cd2 := &Directory{CacheFs: cd.CacheFs}
+                    _ = json.Unmarshal(val, cd2)
+                    cd2.CacheTs = &t                     // ← 每个祖先都设为同一回拨时刻
+                    enc2, _ := json.Marshal(cd2)
+                    _ = bucket.Put([]byte("."), enc2)    // ← 逐个写回 Bolt DB
+                }
+            }
+            if currentDir == "" { break }                 // 根目录到达，停止
+            currentDir = cleanPath(path.Dir(currentDir))  // 切到父目录
+        }
+        return nil
+    })
 }
 ```
 
-**作用范围**：写回 Bolt DB，持久化存在，影响所有后续通过 `NewObject` / `List` 从 DB 读出的判断。
+### 2.3 路径 A 的数学恒等性（核心！）
 
-#### 路径 B：notifiedRemotes 标记（内存态，一次性消费）
+| 操作 | 公式 |
+|------|------|
+| 失效写入 | `CacheTs = T₀ - InfoAge`（T₀ = 通知到达时刻） |
+| TTL 判断 | `now > CacheTs + InfoAge`（3 处全部使用 `time.After` 严格大于） |
+| **代入化简** | `now > (T₀ - InfoAge) + InfoAge = T₀` |
+| **等价条件** | **`now > T₀`：只要查询发生在通知时刻之后，TTL 恒过期** |
 
-`receiveChangeNotify` 将被通知的路径写入内存 map，`isNotifiedRemote` 读取并 **消费（删除）** 该标记：
+**临界窗口**：仅当查询与通知在**同一纳秒**（`now == T₀`）时，`time.After()` 返回 false，TTL 才不会过期。实际工程中可忽略。
 
-[cache.go#L856-L860](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L856-L860)
+---
+
+## 三、路径 B：内存标记 notifiedRemotes（一次性消费）
+
+### 3.1 写入点（唯一）
+
+[cache.go#L856-L859](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L856-L859)
 
 ```go
-f.notifiedMu.Lock()
-defer f.notifiedMu.Unlock()
-f.notifiedRemotes[forgetPath] = true
-f.notifiedRemotes[cd.Remote()] = true
+f.notifiedRemotes[forgetPath] = true    // 被通知的对象或目录本身
+f.notifiedRemotes[cd.Remote()] = true   // 其父目录（EntryObject 时为父 dir；EntryDirectory 时为自身）
 ```
+
+### 3.2 消费点（唯一！整个 cache 包只有 1 处调用）
+
+Grep 结果确证：`isNotifiedRemote` **仅在 `Object.refresh()` 中被调用**。
 
 [cache.go#L1872-L1883](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L1872-L1883)
 
@@ -153,543 +114,345 @@ f.notifiedRemotes[cd.Remote()] = true
 func (f *Fs) isNotifiedRemote(remote string) bool {
     f.notifiedMu.Lock()
     defer f.notifiedMu.Unlock()
-
     n, ok := f.notifiedRemotes[remote]
-    if !ok || !n {
-        return false
-    }
-    delete(f.notifiedRemotes, remote) // 消费后删除，一次性
+    if !ok || !n { return false }
+    delete(f.notifiedRemotes, remote) // ← 消费后立即删除！一次性语义
     return n
 }
 ```
 
-**作用范围**：仅内存态，一次性消费，**只在 `Object.refresh()` 中被检查**（见第 5 节），不影响 `NewObject` / `List` 的 DB 级 TTL 判断。
+**一次性语义**：读→删→返回。下一次同路径再查就变 false 了。
 
-### 3.2 receiveChangeNotify 完整流程
+### 3.3 路径 B 真实作用（路径 A 覆盖不到的死角）
 
-[cache.go#L819-L860](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L819-L860)
+路径 A（CacheTs 回拨）只对 **下一次从 Bolt DB 重新读** 的判断生效。但有一个死角：
+
+> 调用方在通知前已通过 `NewObject` 获取了 Object 实例并持有其引用，内存中该对象的 `CacheTs` 字段仍是**旧值**（DB 已更新，但内存副本不会自动同步）。
+
+完整场景示例（InfoAge = 6h）：
+
+| 时刻 | 事件 | 内存对象 co.CacheTs | DB 中 CacheTs |
+|------|------|-------------------|--------------|
+| T - 10min | `NewObject("a.txt")` 返回 co，调用方持有引用 | T - 10min | T - 10min |
+| T₀ | ChangeNotify 到来，ExpireObject 回拨 DB | T - 10min（不变！） | **T₀ - 6h** |
+| T₀ + 1min | 调用方用**旧 co** 执行 `co.Size()` → `refresh()` | T - 10min | T₀ - 6h |
+
+此时 `refresh()` 中 TTL 判断：
 
 ```
-底层 remote 触发 ChangeNotify
-        │
-        ▼
-receiveChangeNotify(forgetPath, entryType)
-        │
-        ├─ 1. notifyChangeUpstream() → 通知 VFS 等上游订阅者
-        │
-        ├─ 2. 路径 A（CacheTs 回拨，持久化失效）：
-        │     ├─ 若 entryType == EntryObject：
-        │     │     ├─ ExpireObject(co, true)  → 回拨 CacheTs + 删除磁盘 chunk
-        │     │     └─ 取父目录 cd = dir(forgetPath)
-        │     └─ ExpireDir(cd) → 回拨 cd 及所有祖先目录的 CacheTs
-        │
-        └─ 3. 路径 B（notifiedRemotes 标记，内存一次性失效）：
-              notifiedRemotes[forgetPath] = true
-              notifiedRemotes[cd.Remote()] = true
+now = T₀ + 1min
+CacheTs (内存) = T - 10min
+TTL = (T - 10min) + 6h = T + 5h50m
+now > TTL?  →  (T₀ + 1min) > (T + 5h50m)  →  false（TTL 未过期！）
 ```
 
-### 3.3 关键边界：两条路径分别在什么地方被检查
+**路径 A 在此场景失效**——因为内存对象不会自动从 DB 重新拉取 CacheTs。
 
-| 失效路径 | 存储位置 | 检查位置 | 触发后果 |
-|---------|---------|---------|---------|
-| A: CacheTs 回拨 | Bolt DB（持久化） | `NewObject` 第 2 步、`List` 第 2 步、`Object.refresh()` | TTL 判断过期 → 透传 remote 刷新 |
-| B: notifiedRemotes | 内存（一次性） | 仅 `Object.refresh()` 中 | 直接触发 `refreshFromSource`，无论 TTL 是否过期 |
+路径 B 就是为此而设：`isNotifiedRemote("a.txt")` 返回 true，强制触发 `refreshFromSource`。
 
-**⚠️ 重要边界**：`NewObject` 和 `List` **不检查 notifiedRemotes 标记**，它们只依赖 Bolt DB 中 CacheTs 的 TTL 判断。只有通过已缓存的 Object 调用 `ModTime()/Size()/Storable()/Hash()/Open()` 等方法时，才会走 `Object.refresh()` 从而检查 notifiedRemotes。
+### 3.4 路径 B 的边界与限制
+
+| 限制项 | 说明 |
+|-------|------|
+| 检查位置 | **仅** `Object.refresh()` 中，`NewObject` / `List` **完全不检查** |
+| 一次性 | 消费后立即删除，只作用一次。若刷新失败，后续属性读取只能靠 TTL |
+| 仅对象级 | 虽然 `notifiedRemotes` 也标记了父目录，但 `refresh()` 是对象级方法，父目录标记实际无消费点（Directory 没有对应的 refresh 方法） |
+
+**父目录标记的命运**：`notifiedRemotes["foo/"] = true` 写入后，**没有任何代码会消费它**。因为 Directory 结构的属性读取不经过 refresh()，且 `List` 不检查 notifiedRemotes。该标记在 `receiveChangeNotify` 中设置但实际是冗余项，会一直存在直到被新通知覆盖或进程退出。
 
 ---
 
-## 四、单文件查询：NewObject 的完整判断分支
+## 四、三大核心 API 的判断边界精确定义
+
+### 4.1 NewObject（单文件查询）
 
 [cache.go#L932-L973](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L932-L973)
 
 ```
-调用方 → f.NewObject(ctx, remote)
-           │
-           ▼
-     Step 1: NewObject(f, remote)
-     构造一个空壳 Object，Dir/Name 填好，Object 字段为 nil
-     若启用 tempFs 且该路径在 pending upload 队列中：
-         CacheType = "TempObject"，ParentFs = tempFs
-     否则：
-         CacheType = "Object"，ParentFs = 底层 remote
-           │
-           ▼
-     Step 2: f.cache.GetObject(co)
-     从 Bolt DB 按 co.Dir/co.Name 查找并反序列化 JSON 到 co
-           │
-           ├─ 失败（DB 中不存在 / 父 Bucket 不存在）：
-           │     Debugf "find: error" → 进入 Step 4（透传）
-           │
-           ├─ 成功但 TTL 过期：
-           │     time.Now().After(co.CacheTs + InfoAge) → true
-           │     Debugf "find: cold object" → 进入 Step 4（透传）
-           │     ⚠️ 注意：此处 NOT 检查 notifiedRemotes！
-           │
-           └─ 成功且 TTL 未过期：
-                 Debugf "find: warm object"
-                 ──► return co, nil  ← 缓存命中，不访问 remote
+NewObject(ctx, remote)
+    │
+    ▼
+Step 1: 构造空壳 Object（Object=nil）
+    │
+    ▼
+Step 2: GetObject(co)  从 Bolt DB 读 JSON 填充 co
+    │
+    ├─ 失败（DB 不存在/父 Bucket 不存在）：
+    │     → goto Step 4 透传
+    │
+    ├─ 成功但 TTL 过期：
+    │     now > co.CacheTs + InfoAge   ← 严格 After
+    │     ⚠️ 此处 NOT 检查 notifiedRemotes
+    │     → goto Step 4 透传
+    │
+    └─ 成功且 TTL 未过期：
+          → return co, nil   ← ✅ 命中，不访问 remote
 ```
 
 ```
-           │（Step 2 未命中，进入透传）
-           ▼
-     Step 3: 确定实际查询目标 FS
-           │
-           ├─ tmp_upload_path 已配置：
-           │     3a: tempFs.NewObject(ctx, remote)
-           │     ├─ 成功 → 使用 tempFs 返回的 obj
-           │     └─ 失败 → 继续 3b
-           │
-           └─ 3b: f.Fs.NewObject(ctx, remote)  ← 透传到底层 remote
-                 ├─ 成功 → 使用 remote 返回的 obj
-                 └─ 失败 → return nil, err
-           │
-           ▼
-     Step 4: 回写缓存
-     ObjectFromOriginal(ctx, f, obj).persist()
-         ├─ updateData() → 用底层 obj 填充 CacheModTime/CacheSize/CacheStorable
-         ├─ CacheTs = now
-         └─ cache.AddObject() → JSON 序列化写入 Bolt DB
-           │
-           ▼
-     return co, nil
+Step 3（miss 后）: 选择来源 FS
+    ├─ tmp_upload_path 已配 → tempFs.NewObject，找不到再 f.Fs.NewObject
+    └─ 否则 → f.Fs.NewObject(ctx, remote)  ← 透传 remote
+    │
+    ▼
+Step 4: ObjectFromOriginal(obj).persist()
+    CacheTs = now  →  AddObject 写 DB  →  return
 ```
 
-### NewObject 命中/透传边界总结
-
-| 条件 | 结果 | 是否访问 remote |
-|------|------|----------------|
-| DB 存在 + `now ≤ CacheTs + InfoAge` | ✅ 命中返回 | 否 |
-| DB 不存在 | ❌ miss | 是 |
-| DB 存在 + `now > CacheTs + InfoAge` | ❌ miss（TTL 过期） | 是 |
-| notifiedRemotes[remote] = true | ❌ **不影响** NewObject！仍按 TTL 判断 | 可能否（若 TTL 未过期） |
-
-**关键结论**：`NewObject` 是 **DB 直读 + TTL 判断**，完全不知道 notifiedRemotes 的存在。如果对象刚被 ChangeNotify 标记但 TTL 尚未过期，`NewObject` 仍可能返回陈旧的缓存对象。但该对象后续调用 `ModTime()/Open()` 等方法时，会通过 `refresh()` 中的 notifiedRemotes 检查触发真正刷新（见第 5 节）。
+**NewObject 通知后行为（T > T₀）**：
+- 从 DB 读出的 `co.CacheTs = T₀ - InfoAge`
+- TTL：`T > (T₀ - InfoAge) + InfoAge = T₀` → **true，恒过期**
+- **必然透传 remote**（除纳秒临界窗口）
+- notifiedRemotes **不检查、不消费**
 
 ---
 
-## 五、对象读取刷新：Object.refresh / refreshFromSource / Open
-
-### 5.1 Object.refresh：元数据懒刷新
-
-[object.go#L154-L166](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/object.go#L154-L166)
-
-`refresh()` 被 Object 的几乎所有属性读取方法隐式调用：
-- `ModTime(ctx)` → `o.refresh(ctx)`
-- `Size()` → `o.refresh(context.TODO())`
-- `Storable()` → `o.refresh(context.TODO())`
-- `Hash(ctx, ht)` → `o.refresh(ctx)`
-- `Open(ctx, ...)` → 有条件调用
-
-```
-调用方（如 obj.ModTime()）
-           │
-           ▼
-     o.refresh(ctx)
-           │
-           ▼
-     isNotified = isNotifiedRemote(o.Remote())
-     ├─ true  → 消费（删除）notifiedRemotes 中的该标记
-     └─ false → 未被通知
-           │
-           ▼
-     isExpired = now > CacheTs + InfoAge
-           │
-           ▼
-     if !isExpired && !isNotified:
-         return nil  ← ✅ 两个条件都不满足，不刷新，直接用缓存
-           │
-           ▼（任一条件满足）
-     o.refreshFromSource(ctx, true)
-```
-
-**refresh 的 AND 语义**：必须同时满足「TTL 未过期」**且**「未被通知」，才跳过刷新。任一条件成立即刷新。
-
-### 5.2 Object.refreshFromSource：真实透传 remote
-
-[object.go#L168-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/object.go#L168-L197)
-
-```
-o.refreshFromSource(ctx, force)
-     │
-     ├─ refreshMutex 加锁（防并发重复刷新）
-     │
-     ├─ 短路判断：if o.Object != nil && !force → return nil
-     │   （已有底层对象且不强制刷新，直接返回）
-     │
-     ├─ 根据 CacheType 选择目标 FS：
-     │   ├─ isTempFile() == true → ParentFs.NewObject(ctx, o.Remote())  ← tempFs
-     │   └─ 否则 → CacheFs.Fs.NewObject(ctx, o.Remote())               ← 底层 remote
-     │
-     ├─ 失败 → return err
-     │
-     └─ 成功：
-          o.updateData(ctx, liveObject)
-              → o.Object = liveObject
-              → CacheModTime/CacheSize/CacheStorable 从 liveObject 同步
-              → CacheTs = now
-              → CacheHashes 清空
-          o.persist() → 写回 Bolt DB
-          return nil
-```
-
-### 5.3 Object.Open：文件数据读取的完整链路
-
-[object.go#L217-L246](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/object.go#L217-L246)
-
-```
-o.Open(ctx, options...)
-     │
-     ▼
-     Step A: 确保元数据有效
-     │
-     ├─ o.Object == nil（空壳对象，还从未填充底层对象）：
-     │     → o.refreshFromSource(ctx, true)  ← 强制透传
-     │
-     └─ o.Object != nil：
-           → o.refresh(ctx)  ← 走 TTL + notifiedRemotes 双条件判断
-     │
-     ▼（Step A 失败直接 return error）
-     │
-     Step B: 构造 Handle + 处理 Range/Seek
-     cacheReader := NewObjectHandle(ctx, o, o.CacheFs)
-         ├─ workers = TotalWorkers（默认 4；Plex 连接时先降为 1）
-         ├─ memory = NewMemory(-1)   ← 无限期 TTL，由 CleanChunksByNeed 控制
-         ├─ preloadQueue = make(chan, TotalWorkers*10)
-         └─ startReadWorkers() → 启动 N 个 worker goroutine
-     │
-     ▼
-     Step C: 解析 OpenOption，定位初始 offset
-     for option in options:
-         SeekOption → offset
-         RangeOption → offset, limit
-         cacheReader.Seek(offset, io.SeekStart)
-     │
-     ▼
-     return readers.NewLimitedReadCloser(cacheReader, limit)
-            （后续调用方 Read() 时才真正触发 chunk 获取）
-```
-
-### 5.4 Handle.Read → getChunk：chunk 三级缓存
-
-[handle.go#L262-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/handle.go#L262-L288)
-
-```
-调用方 → handle.Read(p)
-           │
-           ├─ offset >= cachedObject.Size() → return 0, io.EOF
-           │
-           ▼
-     handle.getChunk(currentOffset)
-           │
-           ▼
-     Step 1: 对齐到 chunk 边界
-     offsetInChunk = currentOffset % ChunkSize
-     chunkStart = currentOffset - offsetInChunk
-           │
-           ▼
-     Step 2: queueOffset(chunkStart) → 触发预加载
-     │
-     ├─ chunkStart == preloadOffset → 相同位置，跳过
-     │
-     └─ 新位置：
-          ├─ UseMemory → CleanChunksByNeed(chunkStart) 删除之前的 RAM chunk
-          ├─ preloadOffset = chunkStart
-          ├─ 重置 seenOffsets 中 < chunkStart 的项
-          └─ 为每个 worker 提交一个连续 chunk：
-              for i in range(workers):
-                  o = chunkStart + ChunkSize * i
-                  if o >= Size → skip
-                  if seenOffsets[o] == true → skip
-                  seenOffsets[o] = true
-                  preloadQueue <- o
-           │
-           ▼
-     Step 3: 三级缓存按优先级查找
-     │
-     ├─ Level 1: UseMemory == true → memory.GetChunk(obj, chunkStart)
-     │     命中 → goto Step 4
-     │
-     ├─ Level 2: storage().GetChunk(obj, chunkStart)
-     │     （重试 ReadRetries*8 次，每次间隔 500ms，等待 worker 写完）
-     │     命中 → goto Step 4
-     │
-     └─ Level 3: 全部 miss → return "chunk not found" error
-                  （理论上不应发生，因为 Step 2 已提交 worker 下载，
-                   除非 worker 全部退出或网络持续故障）
-           │
-           ▼
-     Step 4: 处理非对齐偏移
-     if offsetInChunk > 0:
-         data = data[offsetInChunk:]
-           │
-           ▼
-     copy(p, data)
-     handle.offset += readSize
-     return readSize
-```
-
-### 5.5 Worker.run：后台 chunk 下载
-
-[handle.go#L386-L430](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/handle.go#L386-L430)
-
-```
-worker 从 preloadQueue 取 chunkStart
-     │
-     ▼
-     Step 1: 再次检查缓存（避免重复下载）
-     │
-     ├─ UseMemory:
-     │   ├─ memory.HasChunk(obj, chunkStart) → true → continue（跳过）
-     │   └─ storage().GetChunk(obj, chunkStart) → 命中
-     │         → 写回 memory，continue（只升 Level，不下载）
-     │
-     └─ !UseMemory:
-         storage().HasChunk(obj, chunkStart) → true → continue
-     │
-     ▼（确认所有层级都没有，才发起下载）
-     │
-     Step 2: w.download(chunkStart, chunkEnd, retry=0)
-     │
-     ├─ w.reader(chunkStart, chunkEnd, closeOpen)
-     │   ├─ 已有 rc 且支持 RangeSeek → rc.RangeSeek(chunkStart, ...)
-     │   ├─ 已有 rc 且支持 io.Seeker → rc.Seek(chunkStart, ...)
-     │   └─ 否则 → 关闭旧 rc，重新 open:
-     │         cachedObject.Object.Open(ctx, &RangeOption{Start, End})
-     │         ↑↑↑ 这是最终对底层 remote 的透传
-     │
-     ├─ io.ReadFull(rc, data)
-     │
-     ├─ 失败（非 EOF/UnexpectedEOF）：
-     │     cachedObject.refreshFromSource(ctx, true)  ← 刷新元数据
-     │     指数退避后 retry+1 重试，最多 ReadRetries 次
-     │
-     └─ 成功：
-          ├─ UseMemory → memory.AddChunk(absPath, data, chunkStart)
-          └─ storage().AddChunk(absPath, data, chunkStart)
-              → 写磁盘文件 + DataTsBucket 记录时间戳和大小
-```
-
-### 对象读取刷新边界总结
-
-| 场景 | 判断条件 | 是否透传 remote |
-|------|---------|----------------|
-| `refresh()` 判断 | `TTL 未过期 AND notifiedRemotes 无标记` | 否 |
-| `refresh()` 判断 | `TTL 过期 OR notifiedRemotes 有标记` | 是（`refreshFromSource`） |
-| `Open()` 元数据层 | `o.Object == nil` → 强制 `refreshFromSource` | 是 |
-| chunk 读 Level 1 | Memory 命中 | 否 |
-| chunk 读 Level 2 | Persistent（磁盘）命中 | 否 |
-| chunk 读 Level 3 | 两级都 miss | 是（worker 通过 `Object.Object.Open(RangeOption)` 下载） |
-
----
-
-## 六、目录列表：List 的完整判断分支
+### 4.2 List（目录列表）
 
 [cache.go#L976-L1089](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/cache.go#L976-L1089)
 
 ```
-调用方 → f.List(ctx, dir)
-           │
-           ▼
-     Step 1: ShallowDirectory(f, dir)
-     构造空壳 Directory，CacheTs = nil
-           │
-           ▼
-     Step 2: f.cache.GetDirEntries(cd)
-     从 Bolt DB 读整个目录 Bucket：
-       - 读 "." key → JSON 反序列化到 cd（填充 CacheTs 等）
-       - 遍历 Bucket：子目录（v==nil）→ 构造 Directory；文件（v!=nil）→ 构造 Object
-       - 返回 entries（混合 fs.DirEntries）
-           │
-           │
-           ├─ 失败（Bucket 不存在 / "." key 缺失）：
-           │     Debugf "list: error" → 进入 Step 4（透传）
-           │
-           ├─ 成功但 TTL 过期：
-           │     now > cd.CacheTs + InfoAge → true
-           │     Debugf "list: cold listing" → 进入 Step 4
-           │     ⚠️ 注意：此处 NOT 检查 notifiedRemotes！
-           │
-           ├─ 成功但 entries 为空（len == 0）：
-           │     Debugf "list: empty listing" → 进入 Step 4
-           │     （空目录也强制透传确认，TODO 注释质疑此行为）
-           │
-           └─ 成功且非空且 TTL 未过期：
-                 Debugf "list: warm N from cache"
-                 ──► return entries, nil  ← ✅ 缓存命中
+List(ctx, dir)
+    │
+    ▼
+Step 1: ShallowDirectory 构造空壳（CacheTs=nil）
+    │
+    ▼
+Step 2: GetDirEntries(cd)  读整个目录 Bucket
+    读 "." key 填充 cd.CacheTs，遍历 entries
+    │
+    ├─ 失败（Bucket 不存在 / "." key 缺失）：
+    │     → goto Step 4 透传
+    │
+    ├─ 成功但 TTL 过期：
+    │     now > cd.CacheTs + InfoAge   ← 严格 After
+    │     ⚠️ 此处 NOT 检查 notifiedRemotes
+    │     → goto Step 4 透传
+    │
+    ├─ 成功且 TTL 未过期 但 entries 为空：
+    │     （TODO 注释："empty dirs from source?"）
+    │     → goto Step 4 透传（强制确认空目录）
+    │
+    └─ 成功 + TTL 未过期 + len(entries) > 0：
+          → return entries, nil   ← ✅ 命中
 ```
 
 ```
-           │（Step 2 未命中，进入透传 + 合并）
-           ▼
-     Step 3: 合并本地临时文件（仅 tmp_upload_path 已配置）
-     │
-     searchPendingUploadFromDir(cd.abs()) → 查 Bolt DB tempBucket
-     对每个 pending：
-         tempFs.NewObject(ctx, cleanRoot(queuedRemote))
-         → ObjectFromOriginal().persist() → 写缓存
-         → 加入 cachedEntries
-           │
-           ▼
-     Step 4: 透传到底层 remote 列目录
-     sourceEntries, err = f.Fs.List(ctx, dir)
-           │
-           ▼
-     Step 5: 清除已失效的缓存条目
-     对 Step 2 返回的旧缓存 entries：
-         entryRemote 不在 sourceEntries 中（二分查找）：
-             ├─ entry 是 Object → cache.RemoveObject(fp)
-             └─ entry 是 Directory → cache.RemoveDir(fp)
-           │
-           ▼
-     Step 6: 合并 sourceEntries 到 cachedEntries
-     对 sourceEntries 中每个 entry：
-         ├─ 是 Object：
-         │   ├─ 若与 cachedEntries 中同名（temp 文件）→ 跳过（temp 优先）
-         │   └─ 否则 → ObjectFromOriginal().persist() 写缓存，加入结果
+Step 3-4（miss 后）:
+    3. tmp_upload_path 已配 → 合并 pending upload 队列中 tempFs 文件
+    4. f.Fs.List(ctx, dir)  ← 透传 remote 列目录
+    5. 旧缓存中存在但 source 没有的条目 → RemoveObject/RemoveDir
+    6. sourceEntries 中文件 → ObjectFromOriginal().persist()
+       sourceEntries 中目录 → 若 DB 不存在或 DB CacheTs 已过期 → AddBatchDir 批量写回
+    7. 当前目录 cd.CacheTs = now → AddDir 写回 DB
+    → return cachedEntries
+```
+
+**List 通知后行为（T > T₀）**：
+- 从 DB 读出的 `cd.CacheTs = T₀ - InfoAge`（ExpireDir 已写回）
+- TTL：`T > T₀` → **true，恒过期**
+- **必然透传 remote**（除纳秒临界窗口）
+- notifiedRemotes **不检查、不消费**
+- 空目录判断不影响结论（TTL 已先过期）
+
+**特别注意**：ChangeNotify 通知的是**子对象/子目录变更**，`ExpireDir` 回拨的是**父目录 CacheTs**。所以 List("foo/") 虽然不直接看 notifiedRemotes["foo/"]，但路径 A 已让 foo/ 的 TTL 过期，最终结果一致。
+
+---
+
+### 4.3 Object.refresh / refreshFromSource / Open（对象属性读取与文件打开）
+
+[object.go#L154-L246](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/object.go#L154-L246)
+
+#### refresh() 双条件判断（AND 语义命中，OR 语义刷新）：
+
+```go
+func (o *Object) refresh(ctx context.Context) error {
+    isNotified := o.CacheFs.isNotifiedRemote(o.Remote()) // 路径 B：消费并删除标记
+    isExpired := time.Now().After(o.CacheTs.Add(InfoAge)) // 路径 A：内存 CacheTs 参与 TTL
+    if !isExpired && !isNotified {  // ← 两个都不成立才跳过
+        return nil
+    }
+    return o.refreshFromSource(ctx, true)
+}
+```
+
+**真值表：**
+
+| isExpired (TTL) | isNotified (通知) | 结果 | 说明 |
+|-----------------|------------------|------|------|
+| false | false | ✅ 不刷新 | 正常缓存命中 |
+| false | **true** | ⚡ 刷新 | **路径 B 单独触发**（覆盖路径 A 死角：内存旧 CacheTs） |
+| **true** | false | ⚡ 刷新 | 路径 A 单独触发（NewObject 刚刷新/或正常 TTL 过期） |
+| **true** | **true** | ⚡ 刷新 | 两条都触发（isNotified 标记被消费，TTL 实际生效） |
+
+#### refreshFromSource：真实透传
+
+```go
+func (o *Object) refreshFromSource(ctx context.Context, force bool) error {
+    o.refreshMutex.Lock(); defer o.refreshMutex.Unlock()
+
+    if o.Object != nil && !force { return nil } // 已有底层对象且不强制→跳过
+
+    var liveObject fs.Object
+    if o.isTempFile() {
+        liveObject, err = o.ParentFs.NewObject(ctx, o.Remote())     // tempFs
+    } else {
+        liveObject, err = o.CacheFs.Fs.NewObject(ctx, o.Remote())   // ← 透传 remote
+    }
+    o.updateData(ctx, liveObject) // o.Object = liveObject；同步 ModTime/Size/Storable；CacheTs=now；清空 Hash
+    o.persist()                   // 写回 Bolt DB
+    return nil
+}
+```
+
+#### Object.Open：打开文件读取数据
+
+```go
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+    var err error
+    if o.Object == nil {
+        err = o.refreshFromSource(ctx, true)  // 空壳对象：强制透传
+    } else {
+        err = o.refresh(ctx)                  // 非空壳：走双条件 refresh
+    }
+    if err != nil { return nil, err }
+
+    cacheReader := NewObjectHandle(ctx, o, o.CacheFs)
+    // 解析 SeekOption/RangeOption 定位 offset
+    // 启动 N 个 worker 预加载 chunk
+    return readers.NewLimitedReadCloser(cacheReader, limit), nil
+}
+```
+
+**refresh 通知后行为分两种情况：**
+
+| 场景 | TTL 判断 | isNotified | 结果 |
+|------|---------|-----------|------|
+| 对象是通知后 **新 NewObject 获取**（CacheTs 已在 NewObject 时重置为 T₀+ε） | false | **true（首次调用消费）** → 后续调用 false | 首次仍触发 refresh；之后靠 TTL |
+| 对象是通知前 **已持有引用**（CacheTs 仍为旧值） | 取决于旧 CacheTs 是否已过期 | **true（首次消费）** | 一定刷新（至少一个条件成立） |
+
+#### Chunk 数据读取（与元数据通知解耦）
+
+[handle.go#L200-L259](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/handle.go#L200-L259)
+
+Chunk 数据有独立的三级缓存体系，**不直接受 notifiedRemotes 影响**：
+
+```
+Handle.Read(p) → getChunk(currentOffset)
+    │
+    ▼
+对齐到 chunk 边界 → queueOffset() 提交 worker 预加载
+    │
+    ▼ Level 1（RAM）：memory.GetChunk(obj, chunkStart)
+    ├─ 命中 → 返回
+    └─ 未命中
          │
-         └─ 是 Directory：
-             DirectoryFromOriginal() 构造
-             ├─ 若 DB 中不存在 或 DB 中的 CacheTs 已过期
-             │   → 加入 batchDirectories 待批量写回
-             └─ 加入结果
-           │
-           ▼
-     Step 7: 批量写目录缓存 + 更新当前目录 CacheTs
-     AddBatchDir(batchDirectories)
-     cd.CacheTs = &now
-     AddDir(cd) → 将当前目录元数据（含新 CacheTs）写回 Bolt DB
-           │
-           ▼
-     return cachedEntries, nil
+         ▼ Level 2（磁盘）：storage().GetChunk(obj, chunkStart)
+         │  （重试 ReadRetries*8 次，等 worker 落盘）
+         ├─ 命中 → 返回
+         └─ 未命中 → return "chunk not found" error
 ```
 
-### List 命中/透传边界总结
+**ChangeNotify 对 chunk 的影响仅通过 `ExpireObject(..., true)` 中 `os.RemoveAll` 直接删除磁盘上该文件的 chunk 目录实现**，不经过 notifiedRemotes。
 
-| 条件 | 结果 | 是否访问 remote |
-|------|------|----------------|
-| DB Bucket 存在 + `"."` 元数据存在 + `now ≤ CacheTs + InfoAge` + `len(entries) > 0` | ✅ 命中返回 | 否 |
-| DB Bucket 不存在 / `"."` 缺失 | ❌ miss | 是 |
-| DB 存在 + `now > CacheTs + InfoAge` | ❌ miss（TTL 过期） | 是 |
-| DB 存在 + TTL 未过期 + `len(entries) == 0` | ❌ miss（空目录强制确认） | 是 |
-| notifiedRemotes[dir] = true | ❌ **不影响** List！仍按 TTL 判断 | 可能否（若 TTL 未过期且非空） |
+Worker 真实下载透传：
+[handle.go#L432-L491](file:///d:/fz/0601-2/solo-dogfeeding/code/51-rclone/backend/cache/handle.go#L432-L491)
 
-**关键结论**：`List` 与 `NewObject` 一样，是 **DB 直读 + TTL 判断**，不检查 notifiedRemotes。目录被 ChangeNotify 标记后，如果 TTL 尚未过期，`List` 仍可能返回陈旧的目录列表。但后续对列表中 Object 的属性读取会通过 `Object.refresh()` 的 notifiedRemotes 检查刷新。
-
----
-
-## 七、写操作的缓存失效与透传统一模式
-
-所有写操作遵循以下模式：
-
-```
-1. 如涉及 tempFs → pause 后台上传
-2. 透传到底层 remote 执行真实操作
-   f.Fs.Put() / f.Fs.Mkdir() / o.Object.Remove() 等
-3. 操作成功后更新本地缓存：
-   ├─ 新增/覆盖：AddObject / AddDir 写 Bolt DB，CacheTs = now
-   ├─ 删除：RemoveObject / RemoveDir 删 Bolt DB 条目 + 删磁盘 chunk 目录
-   └─ 目录变更：ExpireDir(parent) 回拨父目录及所有祖先的 CacheTs
-4. 如涉及 tempFs → play 恢复后台上传
-5. 如底层 remote 不支持 ChangeNotify，或启用了 tempFs：
-   notifyChangeUpstreamIfNeeded() → 手动通知 VFS 等上游
-```
-
-涉及写操作的完整失效矩阵：
-
-| 操作 | 删条目 | 删 chunks | ExpireDir 父目录 | notifyChangeUpstream |
-|------|--------|----------|-----------------|---------------------|
-| Put | ✅（旧条目） | ✅ | ✅ | 条件触发 |
-| Update | ✅ | ✅ | - | ✅（对象级） |
-| Remove | ✅ | ✅ | ✅ | 条件触发 |
-| Mkdir | 新增写缓存 | - | ✅ | 条件触发 |
-| Rmdir | ✅（整个 Bucket） | ✅ | ✅ | 条件触发 |
-| Move | ✅（旧文件） | ✅（旧文件） | ✅（旧+新父目录） | 条件触发 |
-| DirMove | ✅（整个源目录） | ✅ | ✅（源+目的父目录） | 条件触发 |
-| Copy | - | - | ✅（源+目的父目录） | 条件触发 |
-
----
-
-## 八、缓存全链路协作图
-
-```
-                    ┌──────────────────────────────────┐
-                    │         调用方（VFS/CLI 等）        │
-                    └──────┬───────────────┬─────────────┘
-                           │               │
-          NewObject/List   │               │  obj.ModTime/Size/Open/Hash
-                           ▼               ▼
-                    ┌──────────────────────────────────┐
-                    │         backend/cache/Fs           │
-                    │  ┌─────────────────────────────┐  │
-                    │  │ NewObject: DB + TTL 判断     │  │
-                    │  │ List:      DB + TTL + 非空判 │  │
-                    │  │ (两者都不看 notifiedRemotes) │  │
-                    │  └─────────────────────────────┘  │
-                    │  ┌─────────────────────────────┐  │
-                    │  │ Object.refresh:              │  │
-                    │  │   TTL过期  OR  notified?     │  │
-                    │  │   → 任一成立则 refreshFromSrc │  │
-                    │  └─────────────────────────────┘  │
-                    └──────┬───────────────┬─────────────┘
-                           │               │
-                   miss/TTL│               │ chunk 三级缓存 miss
-                           ▼               ▼
-            ┌──────────────────┐   ┌──────────────────────┐
-            │  Persistent(DB)  │   │ 底层 Remote Fs        │
-            │  Bolt DB 元数据  │   │ (任意 backend)        │
-            │  FS Chunk 文件   │   │  Object.Open(Range)   │
-            └────────┬─────────┘   └──────────────────────┘
-                     │ 流式读加速
-                     ▼
-            ┌──────────────────┐
-            │  Memory (RAM)    │
-            │  go-cache 短期块  │
-            └──────────────────┘
-
-   失效来源（三条独立路径）：
-   ┌──────────────────┐  ┌──────────────────────┐  ┌──────────────────┐
-   │ 本地写操作        │  │ ChangeNotify 回调     │  │ TTL超时/空间清理  │
-   │ Expire* 回拨Ts   │  │ Expire* + notifiedMap│  │ CleanChunksBySize│
-   └──────────────────┘  └──────────────────────┘  └──────────────────┘
+```go
+func (w *worker) download(chunkStart, chunkEnd int64, retry int) {
+    w.rc, err = w.reader(chunkStart, chunkEnd, closeOpen)
+    //   ↳ 内部最终调用：cachedObject.Object.Open(ctx, &RangeOption{Start, End})
+    //     ↑↑↑ 这是 chunk 对底层 remote 的唯一透传点
+    data = make([]byte, chunkEnd-chunkStart)
+    sourceRead, err = io.ReadFull(w.rc, data)
+    // 写 Memory + 写 Persistent（双写）
+    if w.r.UseMemory { w.r.memory.AddChunk(...) }
+    w.r.storage().AddChunk(...)
+}
 ```
 
 ---
 
-## 九、关键边界结论汇总
+## 五、ChangeNotify 后时序场景大全
 
-### 9.1 notifiedRemotes（通知失效标记）的真实作用域
+### 场景假设
+- InfoAge = 6h（默认）
+- T₀ 时刻收到 ChangeNotify：文件 `docs/report.pdf`（EntryObject）修改
+- `ExpireObject(docs/report.pdf, true)` + `ExpireDir(docs)`（含根目录递归）
+- `notifiedRemotes["docs/report.pdf"]=true`，`notifiedRemotes["docs"]=true`
 
-| API | 是否检查 notifiedRemotes | 说明 |
-|-----|--------------------------|------|
-| `Fs.NewObject` | ❌ 否 | 仅 DB + TTL 判断 |
-| `Fs.List` | ❌ 否 | 仅 DB + TTL + 非空判断 |
-| `Fs.ListR` | ❌ 否 | 若底层支持则直接透传并沿途缓存 |
-| `Object.ModTime` | ✅ 是 | 通过 `refresh()` 检查 |
-| `Object.Size` | ✅ 是 | 通过 `refresh()` 检查 |
-| `Object.Storable` | ✅ 是 | 通过 `refresh()` 检查 |
-| `Object.Hash` | ✅ 是 | 通过 `refresh()` 检查 |
-| `Object.Open` | ✅ 条件性 | `o.Object != nil` 时走 `refresh()`；`o.Object == nil` 时强制透传 |
-| `Handle.getChunk` | ❌ 否 | chunk 数据有独立的三级缓存 + worker 机制 |
+### 各时刻调用行为
 
-**语义**：notifiedRemotes 是一种 **「懒标记」**——它不强制立即刷新，而是等调用方下次读取该对象属性时才触发刷新。对象级（NewObject/List）获取不检查，属性级读取才检查。
+| 时刻 | 调用 | TTL 计算 | notifiedRemotes | 是否透传 remote | 说明 |
+|------|------|---------|----------------|----------------|------|
+| T₀ + 1ns | `NewObject("docs/report.pdf")` | `T₀+1ns > (T₀-6h)+6h = T₀` → true | 不检查 | **是** | 正常；仅纳秒级才可能不中 |
+| T₀ + 1ns | `List("docs")` | `T₀+1ns > T₀` → true（父 dir CacheTs 已回拨） | 不检查 | **是** | 父目录 CacheTs 由 ExpireDir 回拨 |
+| T₀ + 1ns | 旧引用 `obj.Size()` → `refresh()` | 取决于旧 CacheTs（如 T₀-10min：`T₀+1ns > (T₀-10min)+6h` → false） | **消费=true** | **是** | 路径 B 覆盖死角 |
+| T₀ + 1ns | 刚 NewObject 后立即 `obj.ModTime()` → `refresh()` | `T₀+1ns > (T₀+1ns)+6h` → false | **消费=true** | **是** | 看似冗余，实则防御：NewObject 到 Open 间可能又有远端变化 |
+| T₀ + 1min | `NewObject("docs/report.pdf")` | `T₀+1m > T₀` → true | 不检查 | **是** | 路径 A 生效 |
+| T₀ + 1min | 旧引用 `obj.Hash()` → `refresh()` | 取决于旧 CacheTs（过期则 true；未过期则 false） | **已消费=false** | TTL 过期→是；否则否 | 标记已被上一步 Size() 消费！ |
+| T₀ + 1min | `List("docs")` | `T₀+1m > T₀` → true | 不检查 | **是** | 路径 A 生效 |
+| T₀ + 1min | `NewObject("docs/report.pdf").Open(...)` | Open 内部 refresh：TTL false + **消费=true** | 消费=true | **是（元数据+chunk）** | notifiedRemotes 触发元数据 refresh；chunk 被 ExpireObject 删除，必重新下载 |
+| T₀ + 6h + 1s | 旧引用 `obj.Size()` → `refresh()` | `T₀+6h+1s > (T₀-10min)+6h = T₀+5h50m` → true | 已消费=false | **是** | 路径 A（自然 TTL 过期）兜底，无需标记 |
 
-### 9.2 Expire*（CacheTs 回拨）的真实作用域
+---
 
-| API | 是否受 Expire* 影响 | 说明 |
-|-----|---------------------|------|
-| `Fs.NewObject` | ✅ 是 | TTL 判断直接基于 DB 中 CacheTs |
-| `Fs.List` | ✅ 是 | TTL 判断直接基于 DB 中 CacheTs |
-| `Object.refresh` | ✅ 是 | TTL 判断同样基于 CacheTs |
-| chunk 数据读取 | ❌ 否（ExpireObject withData=true 会显式删磁盘 chunk） | chunk 另有独立的空间清理机制 |
+## 六、各机制之间的关系总结图
 
-### 9.3 Remote 透传触发条件
+```
+底层 remote 触发 ChangeNotify(forgetPath="docs/report.pdf", EntryObject)
+        │
+        ▼
+receiveChangeNotify
+        │
+        ├──────────────────────────────────────────────────────────┐
+        │                                                          │
+        ▼ 路径 A（持久化，Bolt DB 写回）                             ▼ 路径 B（内存，一次性标记）
+  ExpireObject("docs/report.pdf", true)                   notifiedRemotes["docs/report.pdf"] = true
+  ├─ CacheTs = T₀ - 6h  → AddObject 写 DB                notifiedRemotes["docs"] = true
+  └─ os.RemoveAll(磁盘 chunk 目录)                          │
+        │                                                     │ 唯一消费点：Object.refresh()
+        ▼                                                     ▼
+  ExpireDir("docs")                               isNotifiedRemote(remote) → 读→删→返回
+  ├─ "docs".CacheTs = T₀ - 6h  → 写 DB
+  └─ "".CacheTs = T₀ - 6h      → 写 DB                        │
+        │                                                     ▼
+        ▼                                            Object.refresh() 真值表：
+  DB 中所有相关条目 CacheTs 均被回拨                        ┌─ TTL OK    AND NOT notified → ✅ skip
+        │                                                 ├─ TTL EXPIRED OR  notified → ⚡ refreshFromSource
+        │  影响的判断点：                                       │
+        │  ┌─ NewObject: now > CacheTs+6h  ──► 总是 true       ▼
+        │  ├─ List:      now > CacheTs+6h  ──► 总是 true    透传 f.Fs.NewObject()
+        │  └─ refresh:   now > CacheTs+6h  ──► 视内存 CacheTs 而定
+        │
+        ▼
+  对新获取对象（NewObject → 从 DB 读）：
+    now > T₀ 恒成立 → 总是透传
+  对已持有旧引用对象（不从 DB 重读）：
+    TTL 可能不成立 → 需要路径 B 兜底
+```
 
-| 层级 | 透传触发条件 | 透传目标 |
-|------|-------------|---------|
-| 单文件元数据 | DB miss **或** TTL 过期 | `f.Fs.NewObject()` |
-| 目录元数据 | DB miss **或** TTL 过期 **或** 缓存为空 | `f.Fs.List()` |
-| 对象属性刷新 | TTL 过期 **或** notifiedRemotes 标记 | `o.CacheFs.Fs.NewObject()` |
-| Chunk 数据 | RAM miss **且** 磁盘 miss | `Object.Object.Open(RangeOption)` |
-| 所有写操作 | 始终透传（先写 remote，后更缓存） | 对应 `f.Fs.Xxx()` / `o.Object.Xxx()` |
+---
+
+## 七、最终结论矩阵
+
+### 7.1 ChangeNotify 后各 API 是否必然透传 remote
+
+| API | 是否必然透传 | 依赖的失效路径 | 例外/边界 |
+|-----|-------------|---------------|----------|
+| `NewObject(path)` | **是**（T > T₀） | A（CacheTs 回拨） | 通知后同一纳秒内的极端竞态 |
+| `List(dir)` | **是**（T > T₀） | A（父目录 CacheTs 回拨）+ 空目录强制确认 | 同纳秒竞态；若 dir 非通知路径的祖先则不受影响 |
+| `obj.ModTime()` / `Size()` / `Storable()` / `Hash()` | **是（至少首次）** | A（新对象 TTL 过期） **或** B（旧引用消费标记） | 若 B 标记已被另一个属性消费，且旧引用 TTL 未过期，第二次属性读取可能不透传（设计边界） |
+| `obj.Open()` | **是** | 元数据：A/B 任一；Chunk：ExpireObject 已删磁盘文件 | Chunk 若仅在 RAM 中（未写 Persistent），则不受 ExpireObject 影响（实际场景极罕见：Open 后短时间内收到通知且 RAM 未清理） |
+| `Handle.Read()`（chunk） | **Chunk 级独立** | ExpireObject 的 `os.RemoveAll` 删除磁盘 chunk；三级缓存独立判断 | 若 chunk 仅在 RAM 且内存对象未 GC，理论上可能读到旧数据 |
+
+### 7.2 两条失效路径的定位
+
+| 维度 | 路径 A：CacheTs 回拨（持久化） | 路径 B：notifiedRemotes（内存） |
+|------|------------------------------|-------------------------------|
+| **覆盖的 API** | NewObject、List、Object.refresh（所有涉及 TTL 判断的） | 仅 Object.refresh |
+| **作用对象** | 下次从 DB 重新读取的所有对象 | 已在内存中被持有的旧引用对象 |
+| **持续性** | 持久化，写到 Bolt DB，进程重启不丢 | 内存态，一次性消费，进程重启丢失 |
+| **触发方式** | TTL 判断自动生效（now > T₀ 恒成立） | 下次属性读取时主动消费标记 |
+| **冗余度** | 新获取场景下与路径 B 部分冗余 | 旧引用场景下唯一有效的机制 |
+| **父目录** | ExpireDir 递归所有祖先，全部回拨 | 标记了父目录但实际无消费代码（Dead Write） |

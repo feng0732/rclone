@@ -1,265 +1,494 @@
-# SFTP 与 FTP 后端共同边界梳理
+# SFTP 与 FTP 后端 — 错误适配与目录对象边界梳理
 
-本文档对照 [sftp.go](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go) 与 [ftp.go](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go)，从**连接建立**、**目录遍历**、**错误适配**三个维度梳理二者的共同边界与设计模式。
-
----
-
-## 一、连接建立 (Connection Establishment)
-
-### 1.1 整体架构对比
-
-| 维度 | SFTP 后端 | FTP 后端 |
-|------|-----------|----------|
-| 底层库 | `github.com/pkg/sftp` + `golang.org/x/crypto/ssh` | `github.com/jlaffaye/ftp` |
-| 连接结构体 | `conn { sshClient, sftpClient }` | 直接使用 `*ftp.ServerConn` |
-| 新建连接函数 | `sftpConnection(ctx)` 第 719 行 | `ftpConnection(ctx)` 第 446 行 |
-| 获取连接函数 | `getSftpConnection(ctx)` 第 798 行 | `getFtpConnection(ctx)` 第 562 行 |
-| 归还连接函数 | `putSftpConnection(pc, err)` 第 837 行 | `putFtpConnection(pc, err)` 第 589 行 |
-| 排空连接池 | `drainPool(ctx)` 第 879 行 | `drainPool(ctx)` 第 621 行 |
-
-### 1.2 共同边界：连接池模式
-
-两个后端均采用**连接池 + 互斥锁**的经典模式，结构高度一致：
-
-```
-poolMu (sync.Mutex)
-    ↓
-pool ([]*conn / []*ftp.ServerConn)
-    ↓
-drain (*time.Timer)  — 空闲超时后自动排空
-```
-
-**共同行为**：
-- `getXxxConnection`：先从池中取，无可用连接则新建
-- `putXxxConnection`：归还到池尾，若有错误则先检查连接存活
-- `drainPool`：关闭所有池中连接，清空池
-- `IdleTimeout`：空闲超时后自动排空连接池（通过 `time.AfterFunc`）
-
-### 1.3 共同边界：并发控制
-
-两个后端均使用 `pacer.TokenDispenser` 控制并发连接数：
-
-| 配置项 | SFTP | FTP |
-|--------|------|-----|
-| 选项名 | `connections` (第 388 行) | `concurrency` (第 88 行) |
-| 默认值 | 0 (无限制) | 0 (无限制) |
-| 取令牌 | `f.tokens.Get()` | `f.tokens.Get()` |
-| 还令牌 | `f.tokens.Put()` | `f.tokens.Put()` |
-
-### 1.4 共同边界：重试机制 (Pacer)
-
-| 项目 | SFTP | FTP |
-|------|------|-----|
-| Pacer 位置 | `f.pacer` (第 628 行) | `f.pacer` (第 298 行) |
-| minSleep | 100ms (第 44 行) | 10ms (第 41 行) |
-| maxSleep | 2s (第 45 行) | 2s (第 42 行) |
-| decayConstant | 2 | 2 |
-| 创建方式 | `fs.NewPacer(ctx, pacer.NewDefault(...))` | 相同 |
-
-**差异**：SFTP 的 minSleep 为 100ms，FTP 为 10ms，反映了两种协议的预期响应延迟不同。
-
-### 1.5 共同边界：连接存活检查
-
-归还连接时，若存在错误，均会执行**存活探测**以决定是否丢弃连接：
-
-| 后端 | 探测方法 | 判断逻辑 |
-|------|----------|----------|
-| SFTP | `c.sftpClient.Getwd()` | 先判断是否为"常规错误"(`StatusError`/`PathError`/`os.ErrNotExist`)，非常规错误才探测 |
-| FTP | `c.NoOp()` | 若存在 `textproto.Error` 则探测 |
-
-**设计意图一致**：协议层面的业务错误（如文件不存在）不应导致连接被丢弃；只有连接层面的错误才需要丢弃重连。
-
-### 1.6 共同边界：代理支持
-
-两个后端均支持 SOCKS5 代理和 HTTP CONNECT 代理：
-
-| 配置项 | SFTP (第 511-536 行) | FTP (第 190-214 行) |
-|--------|-----------------------|----------------------|
-| SOCKS 代理 | `socks_proxy` | `socks_proxy` |
-| HTTP 代理 | `http_proxy` | `http_proxy` |
-| 实现方式 | `proxy.SOCKS5Dial` / `proxy.HTTPConnectDial` | 相同 |
-| 基础 Dialer | `fshttp.NewDialer(ctx)` | 相同 |
-
-### 1.7 共同边界：初始化验证
-
-两个后端在 `NewFs` 中都会**建立一条初始连接**并放入池中，用于尽早暴露配置错误：
-
-- SFTP: `NewFsWithConnection` 第 1217 行 `f.getSftpConnection(ctx)`
-- FTP: `NewFs` 第 707 行 `f.getFtpConnection(ctx)`
+本文档对照 [sftp.go](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go)、[ssh.go](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/ssh.go) 与 [ftp.go](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go)，逐行核对**对象查找**、**目录判断**、**标准错误转换**、**连接归还时的错误分类**四个核心边界。
 
 ---
 
-## 二、目录遍历 (Directory Traversal)
+## 一、对象查找 (Object Lookup)
 
-### 2.1 核心接口对比
+### 1.1 调用链对比
 
-| 接口 | SFTP 实现 (行号) | FTP 实现 (行号) | 共同行为 |
-|------|------------------|-----------------|----------|
-| `List(ctx, dir)` | 第 1387 行 | 第 889 行 | 列出目录条目，区分文件与目录 |
-| `NewObject(ctx, remote)` | 第 1342 行 | 第 846 行 | 获取单个文件对象 |
-| `dirExists(ctx, dir)` | 第 1356 行 | 第 869 行 | 判断目录是否存在 |
-| `Mkdir(ctx, dir)` | 第 1504 行 | 第 1077 行 | 创建目录（含父目录） |
-| `Rmdir(ctx, dir)` | 第 1519 行 | 第 1086 行 | 删除空目录 |
-
-### 2.2 共同边界：路径编码 (Encoder)
-
-两个后端均使用 `encoder.MultiEncoder` 处理文件名编码转换：
-
-| 阶段 | SFTP | FTP |
-|------|------|-----|
-| 发出请求前 | `f.opt.Enc.FromStandardPath(remote)` 第 2095 行 | `f.dirFromStandardPath(dir)` 第 779 行 |
-| 收到响应后 | `f.opt.Enc.ToStandardName(info.Name())` 第 1406 行 | `f.entryToStandard(entry)` 第 769 行 |
-
-**共同模式**：标准路径 (rclone 内部使用) ⇄ 编码路径 (远程协议使用)
-
-### 2.3 共同边界：条目分类
-
-遍历结果均分为 **目录** (`fs.Dir`) 和 **文件** (`Object`) 两类，通过 `fs.DirEntries` 返回：
-
-- SFTP (第 1423-1433 行): `info.IsDir()` 判断，`fs.NewDir` 或 `&Object{}`
-- FTP (第 941-961 行): `object.Type == ftp.EntryTypeFolder` 判断，跳过 `.` 和 `..`
-
-### 2.4 共同边界：根路径为文件的处理
-
-当 `root` 参数指向一个文件时，两个后端都将 `f.root` 调整为其父目录，并返回 `fs.ErrorIsFile`：
-
-- SFTP: 第 1286-1311 行
-- FTP: 第 718-736 行
-
-### 2.5 差异点：空目录判断
-
-| 后端 | 策略 | 原因 |
-|------|------|------|
-| SFTP | 直接通过 `ReadDir` 返回空切片即可判断 | SFTP 协议对不存在的目录会返回错误 |
-| FTP | 空列表时需额外调用 `dirExists` 验证 (第 928-936 行) | FTP 协议对不存在目录可能返回空列表和成功码 |
-
-### 2.6 差异点：符号链接处理
-
-| 后端 | 处理方式 |
-|------|----------|
-| SFTP | 非普通文件且非目录时，重新 `stat` 解析目标 (第 1409-1422 行)，支持 `skip_links` 选项跳过 |
-| FTP | 依赖 FTP 库对 `EntryTypeLink` 的处理，通过 `entry.Target` 记录目标 (第 775 行) |
-
----
-
-## 三、错误适配 (Error Adaptation)
-
-### 3.1 错误转换总览
-
-两个后端都将**协议特定错误**转换为 **rclone 标准错误**，形成统一的错误抽象层。
-
-| rclone 标准错误 | SFTP 触发条件 | FTP 触发条件 |
-|-----------------|---------------|--------------|
-| `fs.ErrorObjectNotFound` | `os.IsNotExist(err)` (Object.stat 第 2213 行) | `StatusFileUnavailable`(550) / `StatusFileActionIgnored`(450) (translateErrorFile 第 747 行) |
-| `fs.ErrorDirNotFound` | `errors.Is(err, os.ErrNotExist)` (List 第 1400 行) | 同上 (translateErrorDir 第 758 行) |
-| `fs.ErrorIsFile` | `info.IsDir() == false` (NewObject 第 2218 行) | `entry.Type != EntryTypeFolder` (NewObject 第 852 行) |
-| `fs.ErrorIsDir` | 目录 Stat 返回 `info.IsDir() == true` (NewObject 第 2218 行) | 间接通过 `findItem` 返回 `nil` + `ErrorObjectNotFound` |
-
-### 3.2 共同边界：错误分层
-
-两个后端都采用三层错误模型：
+**SFTP 调用链**：
 
 ```
-┌─────────────────────────────┐
-│   rclone 标准错误 (fs.*)     │  ← 对外暴露
-├─────────────────────────────┤
-│   后端适配层 (转换函数)      │  ← 适配逻辑
-├─────────────────────────────┤
-│   协议库原始错误             │  ← 底层实现
-└─────────────────────────────┘
+NewObject(ctx, remote)                              // sftp.go:1342
+  └─ o.stat(ctx)                                    // sftp.go:2210
+       └─ f.stat(ctx, o.remote)                     // sftp.go:2195
+            └─ c.sftpClient.Stat(absPath)           // 单次 LSTAT/STAT
 ```
 
-- SFTP 适配层：散落在各方法中（如 `Object.stat` 的 `os.IsNotExist → fs.ErrorObjectNotFound`）
-- FTP 适配层：集中在 `translateErrorFile()`、`translateErrorDir()` 等函数中
+**FTP 调用链**：
 
-### 3.3 共同边界：连接归还时的错误分类
+```
+NewObject(ctx, remote)                              // ftp.go:846
+  └─ f.findItem(ctx, path.Join(f.root, remote))    // ftp.go:788
+       ├─ [MLST 可用] c.GetEntry(encodedPath)       // 单次 MLST
+       └─ [MLST 不可用] c.List(dir) + 遍历匹配      // 列父目录后扫描
+```
 
-两个后端在 `putXxxConnection` 中都区分**业务错误**与**连接错误**：
+**关键差异**：SFTP 始终用单次 `Stat` 完成查找；FTP 有两条路径——支持 MLST 时用 `GetEntry`，否则退化为列父目录后逐项匹配。
 
-**SFTP (第 848-868 行)** 的"常规错误"判定：
+### 1.2 "未找到"的返回方式
+
+| 后端 | 中间层返回 | NewObject 最终返回 |
+|------|-----------|-------------------|
+| SFTP | `f.stat` 返回 `os.ErrNotExist` 的 error | `o.stat` 将其转换为 `fs.ErrorObjectNotFound` |
+| FTP | `findItem` 返回 `(nil, nil)` — entry 为 nil、error 也为 nil | `NewObject` 判断 `entry == nil` → 返回 `fs.ErrorObjectNotFound` |
+
+FTP 的 `findItem` 采用 `(nil, nil)` 表示"未找到"是一个重要设计选择——调用方无法区分"路径不存在"和"路径指向目录"（见下节）。
+
+### 1.3 路径指向目录时的错误
+
+这是两个后端最显著的语义差异：
+
+**SFTP** — [Object.stat](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go#L2210-L2223)：
+
 ```go
-var statusErr *sftp.StatusError
-var pathErr *os.PathError
-switch {
-case errors.Is(err, os.ErrNotExist):
-    isRegularError = true
-case errors.As(err, &statusErr):
-    isRegularError = true
-case errors.As(err, &pathErr):
-    isRegularError = true
+// sftp.go:2218-2219
+if info.IsDir() {
+    return fs.ErrorIsDir       // ← 目录明确返回 ErrorIsDir
 }
 ```
 
-**FTP (第 601-610 行)** 的"协议错误"判定：
+**FTP** — [NewObject](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L846-L866)：
+
 ```go
-if tpErr := textprotoError(err); tpErr != nil {
-    nopErr := c.NoOp()
-    // ...
+// ftp.go:852-865
+if entry != nil && entry.Type != ftp.EntryTypeFolder {
+    // ...创建 Object
+    return o, nil
+}
+return nil, fs.ErrorObjectNotFound   // ← 目录也返回 ErrorObjectNotFound
+```
+
+| 场景 | SFTP NewObject 返回 | FTP NewObject 返回 |
+|------|--------------------|--------------------|
+| 路径不存在 | `fs.ErrorObjectNotFound` | `fs.ErrorObjectNotFound` |
+| 路径是目录 | `fs.ErrorIsDir` | `fs.ErrorObjectNotFound` |
+| 路径是文件 | `(*Object, nil)` | `(*Object, nil)` |
+
+**影响**：上层调用者通过 `NewObject` 无法区分 FTP 上"路径不存在"和"路径是目录"两种情况，而 SFTP 可以。
+
+---
+
+## 二、目录判断 (Directory Existence)
+
+### 2.1 dirExists 实现对比
+
+**SFTP** — [dirExists](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go#L1356-L1376)：
+
+```go
+// sftp.go:1356-1376
+info, err := c.sftpClient.Stat(dir)   // 直接 Stat
+if err != nil {
+    if os.IsNotExist(err) {
+        return false, nil              // 不存在 → (false, nil)
+    }
+    return false, fmt.Errorf("dirExists stat failed: %w", err)
+}
+if !info.IsDir() {
+    return false, fs.ErrorIsFile       // ← 是文件 → 返回 ErrorIsFile
+}
+return true, nil                       // 是目录 → (true, nil)
+```
+
+**FTP** — [dirExists](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L869-L878)：
+
+```go
+// ftp.go:869-878
+entry, err := f.findItem(ctx, path.Join(f.root, remote))
+if err != nil {
+    return false, fmt.Errorf("dirExists: %w", err)
+}
+if entry != nil && entry.Type == ftp.EntryTypeFolder {
+    return true, nil                   // 是目录 → (true, nil)
+}
+return false, nil                      // ← 不存在或是文件 → 统一 (false, nil)
+```
+
+### 2.2 返回值矩阵
+
+| 场景 | SFTP dirExists | FTP dirExists |
+|------|---------------|---------------|
+| 目录存在 | `(true, nil)` | `(true, nil)` |
+| 路径不存在 | `(false, nil)` | `(false, nil)` |
+| 路径是文件 | `(false, fs.ErrorIsFile)` | `(false, nil)` |
+| 连接/协议错误 | `(false, wrapped error)` | `(false, wrapped error)` |
+
+**差异**：SFTP 在路径是文件时返回 `fs.ErrorIsFile`，调用方可以区分"不存在"和"是文件"。FTP 在两种情况下统一返回 `(false, nil)`，丢失了区分信息。
+
+### 2.3 差异在 mkdir 中的传播
+
+**SFTP** — [mkdir](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go#L1469-L1501)：
+
+```go
+// sftp.go:1475-1478
+ok, err := f.dirExists(ctx, dirPath)
+if err != nil {
+    return fmt.Errorf("mkdir dirExists failed: %w", err)  // fs.ErrorIsFile 被包装后返回
 }
 ```
 
-**共同逻辑**：只有非业务类错误才触发存活探测，业务错误不影响连接复用。
+当路径是文件时，SFTP 的 `mkdir` 返回 `"mkdir dirExists failed: fs.ErrorIsFile"` — `fs.ErrorIsFile` 被包装在 `fmt.Errorf` 中。
 
-### 3.4 共同边界：重试判定
+**FTP** — [mkdir](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L1031-L1067)：
 
-| 后端 | 重试入口 | 重试判断 |
-|------|----------|----------|
-| SFTP | `f.pacer.Call(...)` 第 818 行 | 依赖 `pacer` 默认策略 + `fserrors.ShouldRetry` |
-| FTP | `shouldRetry(ctx, err)` 第 400 行 | `isRetriableFtpError` (421/426 状态码) + `fserrors.ShouldRetry` |
+```go
+// ftp.go:1036-1041
+fi, err := f.getInfo(ctx, abspath)
+if err == nil {
+    if fi.IsDir {
+        return nil
+    }
+    return fs.ErrorIsFile          // ← 直接返回，不包装
+}
+```
 
-**共同依赖**：都依赖 `fserrors.ShouldRetry()` (第 404 行 `fserrors/error.go`) 处理通用网络错误（如连接断开、超时等）。
+FTP 的 `mkdir` 通过 `getInfo`（而非 `dirExists`）检测，直接返回 `fs.ErrorIsFile`，不包装。
 
-### 3.5 共同边界：Mkdir 幂等性处理
+| 场景 | SFTP mkdir 对文件路径 | FTP mkdir 对文件路径 |
+|------|----------------------|---------------------|
+| 返回值 | `fmt.Errorf("mkdir dirExists failed: %w", fs.ErrorIsFile)` | `fs.ErrorIsFile` |
+| `errors.Is(err, fs.ErrorIsFile)` | ✅ 成立（因 `%w` 保留 unwrap） | ✅ 成立 |
 
-创建目录时，"目录已存在"均被视为成功：
-
-| 后端 | 处理方式 |
-|------|----------|
-| SFTP | `os.IsExist(err)` → 调试日志 + 返回 nil (第 1494 行) |
-| FTP | 状态码 250/550/521 → 置为 nil (第 1056-1064 行) |
-
-### 3.6 差异点：错误处理集中度
-
-| 后端 | 风格 | 特点 |
-|------|------|------|
-| SFTP | 分散式 | 错误转换散落在各操作函数中，没有统一的转换函数 |
-| FTP | 集中式 | 有 `translateErrorFile`、`translateErrorDir`、`textprotoError` 等专门函数 |
-
-### 3.7 FTP 特有：超时保护
-
-FTP 后端的 `List` 和 `Close` 操作有独立的超时保护（goroutine + timer）：
-
-- `List` 超时: `f.ci.TimeoutOrInfinite()` (第 912 行)
-- `Close` 超时: `f.opt.CloseTimeout` (第 1279 行)
-
-这是因为 FTP 采用数据连接/控制连接分离的模式，某些操作可能长时间阻塞。
+两者都能通过 `errors.Is` 匹配到 `fs.ErrorIsFile`，但 SFTP 的错误消息多了外层包装。
 
 ---
 
-## 四、总结：共同边界矩阵
+## 三、标准错误转换 (Standard Error Translation)
 
-| 模块 | 共同设计模式 | 关键差异点 |
-|------|-------------|-----------|
-| **连接池** | pool + poolMu + drain + IdleTimeout | SFTP 封装 conn 结构体，FTP 直接用 ServerConn |
-| **并发控制** | TokenDispenser + connections/concurrency 选项 | 选项命名不同，机制相同 |
-| **重试机制** | fs.Pacer + pacer.NewDefault + fserrors.ShouldRetry | minSleep 不同 (100ms vs 10ms) |
-| **存活检查** | 归还时遇错探测，常规错误不复用检查 | 探测方法不同 (Getwd vs NoOp)，判断条件不同 |
-| **代理支持** | SOCKS5 + HTTP CONNECT + fshttp dialer | 完全一致 |
-| **路径编码** | encoder.MultiEncoder 双向转换 | 完全一致 |
-| **目录列表** | 区分文件/目录 + DirEntries 返回 | 空目录判断策略不同 |
-| **错误转换** | 协议错误 → rclone 标准错误 | SFTP 分散式，FTP 集中式 |
-| **Mkdir 幂等** | 目录已存在视为成功 | 判断条件不同 (os.IsExist vs 状态码) |
-| **初始化验证** | NewFs 时建立初始连接验证 | 完全一致 |
+### 3.1 转换函数对比
+
+**SFTP — 无集中式转换函数**，转换散落在各方法中：
+
+| 方法 | 原始错误 | 转换逻辑 | 目标错误 |
+|------|---------|---------|---------|
+| `Object.stat` (第 2213 行) | `os.IsNotExist(err)` | `if` 判断 | `fs.ErrorObjectNotFound` |
+| `Object.stat` (第 2218 行) | `info.IsDir()` | `if` 判断 | `fs.ErrorIsDir` |
+| `List` (第 1400 行) | `errors.Is(err, os.ErrNotExist)` | `if` 判断 | `fs.ErrorDirNotFound` |
+| `dirExists` (第 1367 行) | `os.IsNotExist(err)` | `if` 判断 | `(false, nil)` |
+| `dirExists` (第 1372 行) | `!info.IsDir()` | `if` 判断 | `fs.ErrorIsFile` |
+| `mkdir` (第 1494 行) | `os.IsExist(err)` | `if` 判断 | `nil` (幂等) |
+
+**FTP — 集中式转换函数**：
+
+[translateErrorFile](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L747-L755)：
+
+```go
+func translateErrorFile(err error) error {
+    if errX := textprotoError(err); errX != nil {
+        switch errX.Code {
+        case ftp.StatusFileUnavailable, ftp.StatusFileActionIgnored:  // 550, 450
+            err = fs.ErrorObjectNotFound
+        }
+    }
+    return err   // 不匹配时原样返回
+}
+```
+
+[translateErrorDir](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L758-L766)：
+
+```go
+func translateErrorDir(err error) error {
+    if errX := textprotoError(err); errX != nil {
+        switch errX.Code {
+        case ftp.StatusFileUnavailable, ftp.StatusFileActionIgnored:  // 550, 450
+            err = fs.ErrorDirNotFound
+        }
+    }
+    return err
+}
+```
+
+### 3.2 相同 FTP 状态码，不同 rclone 错误
+
+FTP 的 `translateErrorFile` 和 `translateErrorDir` 对**同一组状态码** (550, 450) 映射到**不同的 rclone 标准错误**：
+
+| FTP 状态码 | 含义 | translateErrorFile | translateErrorDir |
+|-----------|------|--------------------|-------------------|
+| 550 | File Unavailable | `fs.ErrorObjectNotFound` | `fs.ErrorDirNotFound` |
+| 450 | File Action Ignored | `fs.ErrorObjectNotFound` | `fs.ErrorDirNotFound` |
+
+这是因为 FTP 协议本身不区分"文件不存在"和"目录不存在"——都用 550/450 表示。rclone 通过**调用上下文**（文件操作 vs 目录操作）来选择映射目标。
+
+SFTP 不需要这种区分——`pkg/sftp` 库将协议错误统一转换为 Go 标准错误 (`os.ErrNotExist`)，由 `os.IsNotExist` / `errors.Is(err, os.ErrNotExist)` 判断。
+
+### 3.3 完整的错误转换映射表
+
+| rclone 标准错误 | SFTP 触发条件 (代码位置) | FTP 触发条件 (代码位置) |
+|-----------------|------------------------|------------------------|
+| `fs.ErrorObjectNotFound` | `os.IsNotExist(err)` [Object.stat 第 2213 行] | `translateErrorFile`: 550/450 [第 750 行] |
+| `fs.ErrorDirNotFound` | `errors.Is(err, os.ErrNotExist)` [List 第 1400 行] | `translateErrorDir`: 550/450 [第 761 行] |
+| `fs.ErrorIsDir` | `info.IsDir()` [Object.stat 第 2218 行] | **不产生** — NewObject 对目录返回 `ErrorObjectNotFound` |
+| `fs.ErrorIsFile` | `!info.IsDir()` [dirExists 第 1372 行] | **不产生** — mkdir 通过 `getInfo` 独立判断 |
+| `fs.ErrorDirectoryNotEmpty` | `len(entries) != 0` [Rmdir 第 1527 行] | **不产生** — 直接调用 RemoveDir，依赖服务端返回错误 |
+
+### 3.4 FTP findItem 的特殊错误吞没
+
+[findItem](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L788-L842) 的 GetEntry 路径中有一个特殊的错误吞没逻辑：
+
+```go
+// ftp.go:808-811
+err = translateErrorFile(err)
+if err == fs.ErrorObjectNotFound {
+    return nil, nil    // ← ErrorObjectNotFound 被吞没，变为 (nil, nil)
+}
+```
+
+以及：
+
+```go
+// ftp.go:813-818
+if errX := textprotoError(err); errX != nil {
+    switch errX.Code {
+    case ftp.StatusBadArguments:
+        err = nil      // ← 501 Bad Arguments 也被吞没
+    }
+}
+```
+
+**原因**：某些 FTP 服务器对 MLST 命令返回 501，表示不支持该功能。`findItem` 将此视为"未找到"而非错误，使后续逻辑退回到 List 遍历路径。
+
+SFTP 没有类似的多路径回退机制，也不存在错误吞没的情况。
 
 ---
 
-## 五、可抽象的公共组件
+## 四、连接归还时的错误分类 (Connection Return Error Classification)
 
-基于上述共同边界，理论上可抽取以下公共组件供两类后端复用：
+### 4.1 核心发现：逻辑反转
 
-1. **连接池泛型**：`ConnectionPool[T]` 封装 pool/poolMu/drain/tokens 逻辑
-2. **错误适配器基类**：提供 `isRegularError`、`shouldRetry` 等模板方法
-3. **路径编码工具**：标准路径与编码路径双向转换的辅助函数
-4. **目录遍历模板**：`List` 方法的骨架实现 (编码 → 调用 → 解码 → 分类)
+两个后端在 `putXxxConnection` 中的错误分类逻辑是**反转的**。
 
-目前两个后端各自独立实现了这些逻辑，存在一定的代码重复。
+**SFTP** — [putSftpConnection](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go#L837-L876)：
+
+```go
+// sftp.go:846-868
+if err != nil {
+    isRegularError := false
+    var statusErr *sftp.StatusError
+    var pathErr *os.PathError
+    switch {
+    case errors.Is(err, os.ErrNotExist):  isRegularError = true
+    case errors.As(err, &statusErr):      isRegularError = true
+    case errors.As(err, &pathErr):        isRegularError = true
+    }
+    if !isRegularError {                  // ← 非常规错误才探测
+        _, nopErr := c.sftpClient.Getwd()
+        if nopErr != nil {
+            _ = c.close()
+            return
+        }
+    }
+}
+// 常规错误 / 无错误 / 探测通过 → 归还池中
+```
+
+**SFTP 策略**：协议层业务错误（StatusError / PathError / ErrNotExist）是"常规"的，**跳过**存活探测；其他错误（如网络断开）才探测。
+
+**FTP** — [putFtpConnection](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L589-L618)：
+
+```go
+// ftp.go:601-610
+if err != nil {
+    if tpErr := textprotoError(err); tpErr != nil {  // ← 是 textproto 错误才探测
+        nopErr := c.NoOp()
+        if nopErr != nil {
+            _ = c.Quit()
+            return
+        }
+    }
+}
+// 非 textproto 错误 / 无错误 / 探测通过 → 归还池中
+```
+
+**FTP 策略**：`textproto.Error`（即 FTP 协议响应错误）才触发探测；非协议错误（如网络错误）**直接归还池中**。
+
+### 4.2 逻辑对比
+
+| 条件 | SFTP 行为 | FTP 行为 |
+|------|----------|---------|
+| 协议层业务错误 (如文件不存在) | **跳过**探测，直接归还 | **触发**探测，验证连接 |
+| 非协议错误 (如网络断开) | **触发**探测 | **跳过**探测，直接归还 |
+| 无错误 | 直接归还 | 直接归还 |
+
+两个后端对"何时触发存活探测"的判断逻辑完全相反。SFTP 的逻辑更直觉——协议层错误说明连接正常（服务端正常响应了），不需要检查；网络层错误才需要验证连接。FTP 的逻辑则相反——收到协议响应时反而去验证连接，而网络错误时却直接归还。
+
+> 注：FTP 代码注释写的是 "If not a regular FTP error code then check the connection"，但实际代码条件为 `tpErr != nil`（即**是** textproto 错误时检查），注释与代码矛盾。若注释是正确意图，则代码中的条件应为 `tpErr == nil`。
+
+### 4.3 SFTP 独有：CanReuse 检查
+
+SFTP 在归还连接前还有一个 FTP 没有的检查：
+
+```go
+// sftp.go:842-844
+if !c.sshClient.CanReuse() {
+    return    // 外部 SSH 进程不可复用，直接丢弃
+}
+```
+
+这用于外部 SSH 二进制模式（`--sftp-ssh`），该模式下每次操作启动新的 SSH 进程，不可复用。FTP 不支持外部进程模式，因此无此检查。
+
+### 4.4 SFTP 独有：从池中取连接时的存活检查
+
+SFTP 的 `getSftpConnection` 在从池中取连接时会检查连接是否已关闭：
+
+```go
+// sftp.go:804-813
+for len(f.pool) > 0 {
+    c = f.pool[0]
+    f.pool = f.pool[1:]
+    err := c.closed()      // ← 检查 SSH 连接是否已关闭
+    if err == nil {
+        break              // 可用
+    }
+    fs.Errorf(f, "Discarding closed SSH connection: %v", err)
+    c = nil
+}
+```
+
+FTP 的 `getFtpConnection` **没有**这个检查——直接取出池中第一个连接使用，依赖后续操作的错误来发现连接已断开。
+
+```go
+// ftp.go:568-571
+if len(f.pool) > 0 {
+    c = f.pool[0]
+    f.pool = f.pool[1:]    // 直接取出，无存活检查
+}
+```
+
+### 4.5 Token 操作时序差异
+
+| 步骤 | SFTP getSftpConnection | FTP getFtpConnection |
+|------|----------------------|---------------------|
+| 1 | `accounting.LimitTPS(ctx)` | `f.tokens.Get()` (若 concurrency > 0) |
+| 2 | `f.tokens.Get()` (若 connections > 0) | `accounting.LimitTPS(ctx)` |
+| 3 | 从池中取/新建连接 | 从池中取/新建连接 |
+
+SFTP 先限流再取令牌，FTP 先取令牌再限流。这意味着在令牌有限时，FTP 会先占用令牌再等待限流，SFTP 则先等限流再占用令牌。
+
+### 4.6 Pacer 使用差异
+
+| 后端 | 新建连接是否经 Pacer | 位置 |
+|------|---------------------|------|
+| SFTP | 是 | `getSftpConnection` 中 `f.pacer.Call(func(){...})` (第 818 行) |
+| FTP | 是（但 Pacer 在 `ftpConnection` 内部） | `ftpConnection` 中 `f.pacer.Call(func(){...})` (第 543 行) |
+
+SFTP 在 `getSftpConnection` 层面使用 Pacer 包装整个 `sftpConnection` 调用。FTP 在 `ftpConnection` 内部使用 Pacer 包装 `Dial + Login`。效果相同，但 Pacer 的作用范围不同——SFTP 对建连+初始化 SFTP 子系统整体限速，FTP 仅对 Dial+Login 限速。
+
+---
+
+## 五、List 中的错误路径
+
+### 5.1 SFTP List 错误路径
+
+[List](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go#L1387-L1436)：
+
+```
+c.sftpClient.ReadDir(sftpDir)
+  ├─ errors.Is(err, os.ErrNotExist) → fs.ErrorDirNotFound
+  ├─ 其他错误 → fmt.Errorf("error listing %q: %w", dir, err)
+  └─ 成功 → 遍历 infos
+       ├─ 符号链接 → f.stat(ctx, remote) 再解析
+       │    ├─ os.IsNotExist → 忽略，用原始 info
+       │    └─ 其他错误 → fs.Errorf 日志，用原始 info
+       ├─ info.IsDir() → fs.NewDir
+       └─ 否则 → &Object{}
+```
+
+SFTP 的 `ReadDir` 对不存在的目录直接返回错误，因此不需要"空列表二次验证"。
+
+### 5.2 FTP List 错误路径
+
+[List](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L889-L964)：
+
+```
+c.List(encodedPath)   [goroutine + timeout]
+  ├─ 错误 → translateErrorDir → 550/450 变为 fs.ErrorDirNotFound
+  ├─ 超时 → errors.New("timeout when waiting for List")
+  └─ 成功但空列表 → f.dirExists(ctx, dir) 二次验证
+       ├─ 不存在 → fs.ErrorDirNotFound
+       └─ 存在 → 返回空 entries (合法空目录)
+```
+
+FTP 需要"空列表二次验证"是因为 FTP 协议对不存在的目录可能返回成功 + 空列表。这是 FTP 协议的已知缺陷。
+
+### 5.3 遍历中的条目处理差异
+
+| 行为 | SFTP | FTP |
+|------|------|-----|
+| 符号链接 | 重新 stat 解析目标，stat 失败时用原始 info 兜底 | 依赖 ftp.Entry 的 Type 字段，不额外解析 |
+| `.` / `..` 条目 | sftp 库通常不返回 | 显式 `continue` 跳过 (第 943 行) |
+| 编码转换 | `f.opt.Enc.ToStandardName(info.Name())` 单独转换 | `f.entryToStandard(entry)` 同时转换 Name 和 Target |
+
+---
+
+## 六、Mkdir 与 Rmdir 的错误适配
+
+### 6.1 Mkdir 幂等性
+
+**SFTP** — [mkdir](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go#L1469-L1501)：
+
+```
+dirExists(dirPath)
+  ├─ (true, nil) → return nil           // 已存在
+  ├─ (false, fs.ErrorIsFile) → return wrapped error  // 是文件
+  └─ (false, nil) → 递归创建父目录后 Mkdir
+       └─ os.IsExist(err) → return nil  // 竞态：别人先建了，视为成功
+```
+
+**FTP** — [mkdir](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L1031-L1067)：
+
+```
+getInfo(abspath)
+  ├─ err == nil && fi.IsDir → return nil     // 已存在
+  ├─ err == nil && !fi.IsDir → return fs.ErrorIsFile  // 是文件
+  └─ err == ErrorObjectNotFound → 递归创建父目录后 MakeDir
+       └─ textproto 状态码 250/550/521 → return nil   // 幂等处理
+```
+
+| 幂等场景 | SFTP 判定方式 | FTP 判定方式 |
+|---------|-------------|-------------|
+| 目录已存在(预检) | `dirExists` 返回 `(true, nil)` | `getInfo` 返回 `fi.IsDir == true` |
+| 目录已存在(竞态) | `os.IsExist(err)` | FTP 状态码 550/521 |
+| 服务器返回 250 | 不适用（SFTP 无此场景） | `StatusRequestedFileActionOK` → nil |
+
+### 6.2 Rmdir 差异
+
+**SFTP** — [Rmdir](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/sftp/sftp.go#L1519-L1538)：
+
+```go
+// sftp.go:1522-1527
+entries, err := f.List(ctx, dir)     // 先 List 检查目录是否为空
+if len(entries) != 0 {
+    return fs.ErrorDirectoryNotEmpty  // ← 主动检查
+}
+err = c.sftpClient.RemoveDirectory(root)
+```
+
+**FTP** — [Rmdir](file:///d:/fz/0601-2/solo-dogfeeding/code/46-rclone/backend/ftp/ftp.go#L1086-L1094)：
+
+```go
+// ftp.go:1091-1093
+err = c.RemoveDir(encodedPath)
+f.putFtpConnection(&c, err)
+return translateErrorDir(err)        // ← 依赖服务端返回错误
+```
+
+SFTP 主动检查目录是否为空后再删除（因为某些 SFTP 服务器会递归删除），FTP 依赖服务端返回非空错误。
+
+---
+
+## 七、总结：精确差异矩阵
+
+| 边界 | 共同模式 | SFTP 特有 | FTP 特有 |
+|------|---------|----------|---------|
+| **对象查找** | 不存在→ErrorObjectNotFound | 目录→`fs.ErrorIsDir` | 目录→`fs.ErrorObjectNotFound` |
+| **目录判断** | 存在→(true,nil)；不存在→(false,nil) | 文件→`(false, fs.ErrorIsFile)` | 文件→`(false, nil)` |
+| **错误转换** | 协议错误→rclone标准错误 | 散落各方法，用 `os.IsNotExist` | 集中 `translateErrorFile/Dir`，用状态码 550/450 |
+| **相同码不同映射** | 不适用 | 不适用 | 550/450 根据上下文映射 ErrorObjectNotFound 或 ErrorDirNotFound |
+| **连接归还错误分类** | 有错误时选择性探测 | 协议错误跳过探测，网络错误触发探测 | **反转**：协议错误触发探测，网络错误跳过探测 |
+| **取连接存活检查** | 从池中取连接 | `c.closed()` 检查 | 无检查 |
+| **List 空目录** | 空列表→空entries | ReadDir 直接区分不存在 | 需 dirExists 二次验证 |
+| **Mkdir 幂等** | 目录已存在视为成功 | `os.IsExist` | 状态码 250/550/521 |
+| **Rmdir 空检查** | 依赖空目录约束 | 主动 List 检查 | 依赖服务端错误 |
+| **findItem 吞没** | 不适用 | 不适用 | ErrorObjectNotFound→(nil,nil)；501→nil |

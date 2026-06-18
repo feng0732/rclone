@@ -354,17 +354,41 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) (err error) 
 
 ### 4.1 Pacer 调用方式：`Call` vs `CallNoRetry`
 
-GCS 后端使用两种不同的 Pacer 调用模式，差异在于是否在低层进行多次重试：
+GCS 后端通过 [fs.NewPacer](file:///d:/fz/0601-2/solo-dogfeeding/code/42-rclone/fs/pacer.go#L23-L37) 创建 Pacer，**重试次数来自全局配置** `ci.LowLevelRetries`，而非 lib/pacer 裸库默认值：
+
+```go
+// [fs/pacer.go:L23-L37]
+func NewPacer(ctx context.Context, c pacer.Calculator) *Pacer {
+    ci := GetConfig(ctx)
+    retries := max(ci.LowLevelRetries, 1)     // ← 来自 --low-level-retries 全局 flag
+    maxConnections := max(ci.MaxConnections, 0)
+    p := &Pacer{
+        Pacer: pacer.New(
+            pacer.RetriesOption(retries),     // 覆盖裸库默认 retries=3
+            pacer.CalculatorOption(c),
+            // ...
+        ),
+    }
+    return p
+}
+```
+
+GCS 在 `NewFs` 中创建 Pacer（见 [googlecloudstorage.go:L587](file:///d:/fz/0601-2/solo-dogfeeding/code/42-rclone/backend/googlecloudstorage/googlecloudstorage.go#L587)）：
+```go
+f.pacer = fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep)))
+```
+
+两种调用模式差异：
 
 | 方法 | 底层行为 | 使用场景 |
 |------|---------|---------|
-| `pacer.Call(fn)` | `p.call(fn, retries)`，默认 retries=3，低层循环重试 + 指数退避 | 读操作（List、Get、Copy）和写操作中幂等的 Delete |
-| `pacer.CallNoRetry(fn)` | `p.call(fn, 1)`，**只执行 1 次**，若需重试则把错误包装为 `fserrors.RetryError` 抛给上层 | **上传操作**（Objects.Insert 的 Media 上传） |
+| `pacer.Call(fn)` | `p.call(fn, retries)`，**retries = `--low-level-retries` 配置值**，低层循环重试 + 指数退避 | 读操作（List、Get、Copy）和写操作中幂等的 Delete |
+| `pacer.CallNoRetry(fn)` | `p.call(fn, 1)`，**强制只执行 1 次**，忽略 LowLevelRetries 配置；若需重试则把错误包装为 `fserrors.RetryError` 抛给上层 | **上传操作**（Objects.Insert 的 Media 上传） |
 
 `CallNoRetry` 的实现（见 [lib/pacer/pacer.go:L255-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/42-rclone/lib/pacer/pacer.go#L255-L257)）：
 ```go
 func (p *Pacer) CallNoRetry(fn Paced) error {
-    return p.call(fn, 1)  // 只尝试 1 次
+    return p.call(fn, 1)  // 只尝试 1 次，忽略全局配置的 LowLevelRetries
 }
 ```
 
@@ -423,7 +447,7 @@ func shouldRetry(ctx context.Context, err error) (again bool, errOut error) {
 | `Objects.Copy`（改 mtime） | `SetModTime()` L1360 | `pacer.Call` | 幂等写 |
 | `Objects.Rewrite`（服务端复制） | `Copy()` L1168 | `pacer.Call` | 幂等写 |
 | **`Objects.Insert.Media`（上传）** | **`Update()` L1484** | **`pacer.CallNoRetry`** | **Reader 流不可重放，低层重试会读空数据** |
-| HTTP GET（下载） | `Open()` L1409 | `pacer.Call` | 幂等读，通过 HTTP Range 重试 |
+| HTTP GET（初始下载请求） | `Open()` L1409 | `pacer.Call` | 低层重试（`LowLevelRetries` 次），仅对请求阶段生效；流已建立后的读取失败不由这层处理 |
 
 ### 4.4 HTTP 状态码 → 语义错误
 
@@ -533,15 +557,41 @@ fs.Fs.Put(in, src)
         └─ f.pacer.CallNoRetry(shouldRetry)                     [速率控制 + 仅 1 次低层尝试，失败包装为 RetryError 交上层]
 ```
 
-### 6.2 下载对象 (`Object.Open`)
+### 6.2 下载对象：两层重试机制
+
+下载过程涉及两层**不同层级**的重试，分别处理 HTTP 请求建立阶段和数据流读取阶段：
+
 ```
-fs.Object.Open(options)
-  ├─ 构造 HTTP GET 请求到 info.MediaLink
-  ├─ fs.FixRangeOption(options, bytes)                           [处理 Range 请求]
-  ├─ gzipped && !Decompress → 设置 Accept-Encoding: gzip       [保持压缩传输]
-  └─ f.client.Do(req)
-      └─ f.pacer.Call(shouldRetry)
+operations.Open(src, options)          # 上层统一入口（见 fs/operations/reopen.go:L123）
+  │
+  ├─ 第一层：ReOpen 封装（operations.ReOpen，maxTries = LowLevelRetries）
+  │   ├─ 初始调用 Object.Open() → ↓ 进入第二层
+  │   └─ 读流失败后 Range 续读：
+  │       ReOpen.Read() → io.Copy 读 h.rc.Read() 出错
+  │         → h.reopen()
+  │             ├─ h.rangeOption.Start = h.start + h.offset     # 续传起点
+  │             └─ h.src.Open(ctx, opts...) 重新建立 HTTP 连接
+  │
+  └─ 第二层：Object.Open 低层重试（仅请求阶段）
+      Object.Open(options)
+        ├─ fs.FixRangeOption(options, bytes)                     [处理 Range 请求]
+        ├─ gzipped && !Decompress → Accept-Encoding: gzip
+        └─ f.pacer.Call(func() {                                 # LowLevelRetries 次
+               f.client.Do(req)  ← 仅重试"发请求→收响应头"阶段
+           })
+           返回 http.Response.Body（io.ReadCloser）
 ```
+
+两层重试的区别：
+
+| 层级 | 重试什么 | 何时生效 | 重试次数 | 实现位置 |
+|------|---------|---------|---------|---------|
+| **第一层：Pacer 低层重试** | HTTP 请求建立（`client.Do` 返回错误或 5xx） | Body 未开始读取之前 | `LowLevelRetries` | `Object.Open` 内 `pacer.Call` |
+| **第二层：ReOpen Range 续读** | Body 读取过程中 `Read()` 返回错误（连接中断等） | Body 已开始读取后 | `LowLevelRetries` | `operations.ReOpen.Read` → `reopen()` |
+
+为什么需要两层：
+- Pacer 只能重试"发出请求→收到响应"这一完整 round-trip；一旦 `client.Do` 成功返回 `http.Response.Body`，后续从 Body 流式读取的失败 Pacer 管不到
+- ReOpen 包装层追踪已读取的 `offset`，失败后自动构造 `Range: bytes=<offset>-` 续传请求重新 `Object.Open`
 
 ### 6.3 列出目录 (`Fs.ListP`)
 ```

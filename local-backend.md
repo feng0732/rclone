@@ -174,84 +174,304 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 ## 权限处理
 
-### 1. 文件创建权限
+权限处理是本地后端跨平台差异最复杂的部分。核心矛盾在于：**Unix 以「权限位」（rwx + SUID/SGID/Sticky）为模型，Windows 以「文件属性」（Hidden/ReadOnly/System 等标志）为模型**，两者并非完全对等。Go 标准库在 Windows 上通过模拟方式提供了「类 Unix」的 `os.FileMode`，但语义被大幅简化。
 
-本地后端创建文件/目录时使用的权限位：
+### 1. Mode 位的数据模型
 
-| 操作 | 权限 | 位置 |
-|------|------|------|
-| 创建普通文件 | 0666 | `backend/local/local.go`（Update 方法） |
-| 创建目录 | 0777 | `backend/local/local.go`（Mkdir 方法） |
+#### 1.1 存储格式：Unix 风格八进制
 
-> 上述权限会被操作系统的 umask 修正，实际权限 = mode & ~umask。
+元数据中的 `mode` 字段统一使用 Unix 风格的八进制字符串表示，定义在 `backend/local/metadata.go` 的 `systemMetadataInfo`：
 
-### 2. 权限修改（Chmod）
+```go
+"mode": {
+    Help:    "File type and mode",
+    Type:    "octal, unix style",
+    Example: "0100664",
+},
+```
 
-#### 普通文件权限修改
+格式解析：`0100664` 是一个 7 位（及以上）的八进制数：
 
-使用标准 `os.Chmod`，所有平台均支持。
+| 位段（八进制） | 含义 | 示例值 |
+|---------------|------|--------|
+| 最高位（文件类型） | `001`=FIFO, `002`=字符设备, `004`=目录, `006`=块设备, `010`=普通文件, `012`=符号链接, `014`=Socket | `010` = 普通文件 |
+| 次高位（特殊位） | SUID=4, SGID=2, Sticky=1 | `0` = 无 |
+| 所有者权限 | r=4, w=2, x=1 | `6` = rw- |
+| 组权限 | 同上 | `6` = rw- |
+| 其他用户权限 | 同上 | `4` = r-- |
 
-#### 符号链接权限修改（lChmod）
+因此 `0100664` = 普通文件 + 无特殊位 + 所有者rw- + 组rw- + 其他r--。
 
-核心函数：`lChmod` — 修改符号链接本身的权限而非目标。
+#### 1.2 Mode 读取的跨平台差异
 
-| 平台 | 支持情况 | 实现文件 |
-|------|----------|----------|
-| Linux | ❌ 不支持 | 归入 lchmod.go (windows \|\| plan9 \|\| js \|\| linux) |
-| Windows | ❌ 不支持 | `backend/local/lchmod.go` |
-| macOS/FreeBSD/NetBSD/OpenBSD/Solaris 等 | ✅ 支持 | `backend/local/lchmod_unix.go` |
-| plan9/js | ❌ 不支持 | 归入 lchmod.go |
+各平台元数据读取时，mode 的来源不同：
 
-**Linux 不支持原因**：Linux 的 `fchmodat` 系统调用不接受 `AT_SYMLINK_NOFOLLOW` 标志，会返回 `ENOTSUP`。
+| 平台组 | mode 来源 | 实现文件 | 说明 |
+|--------|----------|----------|------|
+| **真实 Unix**（Linux/macOS/FreeBSD/NetBSD/OpenBSD/Solaris） | `stat.Mode`（`syscall.Stat_t` 原生 mode 字段） | `backend/local/metadata_linux.go` / `metadata_bsd.go` / `metadata_unix.go` | 包含完整的文件类型位 + 12 位权限位（含 SUID/SGID/Sticky） |
+| **Windows** | `info.Mode()`（Go 标准库模拟） | `backend/local/metadata_windows.go` | 仅保留文件类型位 + 简化权限（写位 = 非只读），SUID/SGID/Sticky 全部丢失 |
+| **其他**（Dragonfly/plan9/js/aix） | `info.Mode()`（Go 标准库模拟） | `backend/local/metadata_other.go` | 同上，简化权限 |
 
-实现方式（Unix）：使用 `unix.Fchmodat` + `unix.AT_SYMLINK_NOFOLLOW` 标志。
+**关键代码对比**：
 
-### 3. 所有权处理（Chown）
+```go
+// Unix: 使用 syscall 原生 stat.Mode（完整信息）
+// metadata_linux.go / metadata_bsd.go / metadata_unix.go
+m.Set("mode", fmt.Sprintf("%0o", stat.Mode))
+
+// Windows/Other: 使用 Go 模拟的 info.Mode()（信息丢失）
+// metadata_windows.go / metadata_other.go
+m.Set("mode", fmt.Sprintf("%0o", info.Mode()))
+```
+
+#### 1.3 Windows 的 FileAttributes 未被利用
+
+在 `backend/local/metadata_windows.go` 中有一个 FIXME 注释：
+
+```go
+// FIXME do something with stat.FileAttributes ?
+```
+
+Windows 的 `syscall.Win32FileAttributeData.FileAttributes` 包含大量有价值的信息，但目前**完全未被读取或写入**：
+
+| 属性标志 | 值 | rclone 是否处理 |
+|---------|----|----------------|
+| `FILE_ATTRIBUTE_READONLY` | 0x00000001 | ✅ 间接通过 `os.Chmod` 处理（见下文） |
+| `FILE_ATTRIBUTE_HIDDEN` | 0x00000002 | ❌ 未处理 |
+| `FILE_ATTRIBUTE_SYSTEM` | 0x00000004 | ❌ 未处理 |
+| `FILE_ATTRIBUTE_DIRECTORY` | 0x00000010 | ✅ 通过 `info.Mode().IsDir()` 间接处理 |
+| `FILE_ATTRIBUTE_ARCHIVE` | 0x00000020 | ❌ 未处理 |
+| `FILE_ATTRIBUTE_TEMPORARY` | 0x00000100 | ❌ 未处理 |
+| `FILE_ATTRIBUTE_SPARSE_FILE` | 0x00000200 | ❌ 未处理（稀疏文件仅在创建时优化） |
+| `FILE_ATTRIBUTE_REPARSE_POINT` | 0x00000400 | ✅ 通过符号链接逻辑间接处理 |
+| `FILE_ATTRIBUTE_COMPRESSED` | 0x00000800 | ❌ 未处理 |
+| `FILE_ATTRIBUTE_OFFLINE` | 0x00001000 | ❌ 未处理 |
+| `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED` | 0x00002000 | ❌ 未处理 |
+| `FILE_ATTRIBUTE_ENCRYPTED` | 0x00004000 | ❌ 未处理 |
+
+### 2. Mode 写入的跨平台语义差异
+
+#### 2.1 核心流程：writeMetadataToFile
+
+`writeMetadataToFile` 方法（`backend/local/metadata.go`）是权限写入的总入口，处理顺序为：
+
+```
+times (atime/mtime/btime) → uid/gid (所有权) → mode (权限)
+```
+
+Mode 写入的详细流程：
+
+```go
+// 1. 从元数据解析 mode（八进制）
+mode, hasMode := o.parseMetadataInt(m, "mode", 8)
+
+// 2. 合法性校验
+if hasMode && mode >= 0 && uint(mode) <= math.MaxUint32 {
+    // 3. 判断目标是否为符号链接
+    if o.translatedLink {
+        // 4a. 符号链接：需要 lChmod（平台支持有限）
+        if haveLChmod {
+            err = lChmod(o.path, os.FileMode(umode))
+        } else {
+            // 不支持时仅记录 debug，不报错（优雅降级）
+            fs.Debugf(o, "Unable to set mode %v on a symlink on this OS", ...)
+        }
+    } else {
+        // 4b. 普通文件/目录：os.Chmod
+        err = os.Chmod(o.path, os.FileMode(umode))
+    }
+}
+```
+
+#### 2.2 os.Chmod 在 Windows 上的实际效果
+
+Windows 上调用 `os.Chmod(path, mode)` 时，Go 运行时仅处理**只读位**：
+
+| mode 值 | 对 Windows 文件的影响 |
+|---------|---------------------|
+| 任意位包含「写权限」被清除（mode & 0222 == 0） | 设置 `FILE_ATTRIBUTE_READONLY` 标志 |
+| 任意位包含「写权限」（mode & 0222 != 0） | 清除 `FILE_ATTRIBUTE_READONLY` 标志 |
+| 读/执行权限位 | 完全忽略 |
+| SUID/SGID/Sticky 位 | 完全忽略 |
+| 文件类型位（高 4 位） | 完全忽略 |
+
+换句话说，Windows 上 `os.Chmod` 是一个「**只有写位有效**」的降级实现。
+
+#### 2.3 os.Chmod 在 Unix 上的实际效果
+
+Unix 上 `os.Chmod` 会完整设置权限，但需注意：
+
+- 只有文件所有者或 root 才能修改权限
+- SUID/SGID 位在某些文件系统上可能被内核清除
+- Sticky 位仅对目录有意义
+
+### 3. 符号链接权限修改（lChmod）
+
+核心函数：`lChmod` — 修改符号链接本身的权限而非其指向的目标。
+
+| 平台 | 支持情况 | 实现文件 | build tag |
+|------|----------|----------|-----------|
+| Linux | ❌ 不支持 | `backend/local/lchmod.go` | `linux` |
+| Windows | ❌ 不支持 | `backend/local/lchmod.go` | `windows` |
+| macOS/FreeBSD/NetBSD/OpenBSD/Solaris 等 | ✅ 支持 | `backend/local/lchmod_unix.go` | 非 linux 的 Unix |
+| plan9/js | ❌ 不支持 | `backend/local/lchmod.go` | `plan9 \|\| js` |
+
+不支持的平台上 `haveLChmod = false`，调用时仅打 debug 日志，不报错。
+
+**Linux 不支持原因**：Linux 的 `fchmodat` 系统调用不接受 `AT_SYMLINK_NOFOLLOW` 标志，传入时返回 `ENOTSUP`。Linux 内核从设计上就不允许修改符号链接的权限位（符号链接始终为 0777）。
+
+**Unix 实现**（`backend/local/lchmod_unix.go`）：
+
+```go
+func syscallMode(i os.FileMode) (o uint32) {
+    o |= uint32(i.Perm())         // 0-9 位: rwxrwxrwx
+    if i&os.ModeSetuid != 0 { o |= syscall.S_ISUID }  // SUID
+    if i&os.ModeSetgid != 0 { o |= syscall.S_ISGID }  // SGID
+    if i&os.ModeSticky != 0 { o |= syscall.S_ISVTX }  // Sticky
+    return
+}
+
+func lChmod(name string, mode os.FileMode) error {
+    // NB linux does not support AT_SYMLINK_NOFOLLOW as a parameter to fchmodat
+    return unix.Fchmodat(unix.AT_FDCWD, name, syscallMode(mode), unix.AT_SYMLINK_NOFOLLOW)
+}
+```
+
+**特殊注意**：在 Linux 上通过元数据同步符号链接权限会**静默失败**，仅记录 debug 日志，不会导致同步任务整体失败。
+
+### 4. 文件创建权限
+
+本地后端创建文件/目录时传入的权限位：
+
+| 操作 | 请求权限 | 代码位置 | 说明 |
+|------|---------|----------|------|
+| 创建普通文件 | `0666` (rw-rw-rw-) | `Update` / `PartialUploads` 方法 (`backend/local/local.go`) | 受 umask 修正 |
+| 创建目录 | `0777` (rwxrwxrwx) | `Mkdir` / `MkdirAll` / `serverSideMove` (`backend/local/local.go`) | 受 umask 修正 |
+
+**跨平台差异**：
+
+- **Unix**：内核会执行 `mode & ~umask`，常见 umask 为 022 时文件实际为 0644，目录实际为 0755
+- **Windows**：传入的权限位参数基本被忽略，安全描述符由父目录 ACL 继承决定，仅 `FILE_ATTRIBUTE_READONLY` 可能受后续 `os.Chmod` 影响
+
+### 5. 所有权处理（Chown）
 
 实现位置：`writeMetadataToFile` 方法（`backend/local/metadata.go`）
 
+执行顺序：
+
+```go
+// 1. 解析 uid/gid
+uid, hasUID := o.parseMetadataInt(m, "uid", 10)
+gid, hasGID := o.parseMetadataInt(m, "gid", 10)
+
+// 2. 如果只提供了 uid，gid 复用 uid 的值（FIXME 行为）
+if hasUID && !hasGID {
+    gid = uid
+}
+
+// 3. 平台判断
+if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
+    fs.Debugf(o, "Ignoring request to set ownership %o.%o on this OS", gid, uid)
+} else {
+    // 4. 符号链接用 Lchown，普通文件用 Chown
+    if o.translatedLink {
+        err = os.Lchown(o.path, uid, gid)
+    } else {
+        err = os.Chown(o.path, uid, gid)
+    }
+}
+```
+
 | 平台 | 支持情况 | 说明 |
 |------|----------|------|
-| Windows | ❌ 忽略 | 仅输出 debug 日志 |
-| plan9 | ❌ 忽略 | 仅输出 debug 日志 |
-| Unix 系列 | ✅ 支持 | `os.Chown` / `os.Lchown` |
+| Windows | ❌ 静默忽略 | 仅 debug 日志，Windows 使用 ACL 模型 |
+| plan9 | ❌ 静默忽略 | 仅 debug 日志 |
+| Unix 系列 | ✅ 支持 | 需要 root 或 CAP_CHOWN 能力才能修改为非当前用户 |
 
-符号链接使用 `os.Lchown`，普通文件使用 `os.Chown`。
+**已知设计缺陷**（代码中标注 FIXME）：
 
-### 4. 权限错误处理
+- 未读取当前用户的 uid/gid，即使目标值与当前值相同也会尝试设置，可能产生不必要的 EPERM 错误
+- 只设置 uid 时 gid 强制取 uid 的值，可能不符合预期
 
-#### 目录列表权限
+### 6. 时间相关的权限控制（NoSetModTime）
 
-`List` 方法（`backend/local/local.go`）中：
+配置项 `NoSetModTime`（`--local-no-set-modtime`）禁用修改时间设置：
 
-- 目录打开权限错误（Permission denied）：
-  - 记录错误日志
-  - 上报为 NoRetryError（失败同步但不重试）
-  - 返回 nil error（继续执行但标记失败）
+```go
+// backend/local/local.go - Precision 方法
+if f.opt.NoSetModTime {
+    return fs.ModTimeNotSupported
+}
+```
 
-#### 单独文件 stat 失败
+适用场景：
 
-- 非 Windows/Plan9 平台使用 `Readdirnames` 逐个 `Lstat`
-- 单个文件 stat 失败不终止整个目录遍历
-- 被过滤规则排除的文件不报告错误
+- 无写权限的只读文件系统
+- 无法修改时间的挂载点（如某些 FUSE 文件系统）
+- 性能优化场景，跳过 utimensat 系统调用
 
-### 5. Windows 特殊权限处理
+### 7. 权限错误处理
 
-#### 隐藏文件更新
+#### 7.1 目录列表权限
+
+`List` 方法（`backend/local/local.go`）中处理目录打开的权限错误：
+
+```
+os.Open 目录失败
+    ↓
+错误为 fs.ErrPermission (Permission denied)
+    ↓
+记录 fs.Errorf 错误日志
+    ↓
+err = fs.NoRetryError(err)  // 标记为不可重试，避免反复尝试
+    ↓
+返回 (nil, nil)  // 不将错误向上抛出，但错误已被统计
+```
+
+这种处理策略确保单个无权限的目录不会导致整个同步任务失败。
+
+#### 7.2 单独文件 stat 失败
+
+**Windows/Plan9** 使用 `Readdir()` 批量读取：
+- 单个文件 stat 错误可能被 Go 标准库吸收
+- 目录句柄打开失败时整个目录列表失败
+
+**其他 OS** 使用 `Readdirnames()` + 逐个 `Lstat`：
+- 单个文件的 stat 失败被 `fs.Errorf` 记录
+- 不会终止整个目录遍历，继续处理其他文件
+- 被过滤器（如 `--exclude`）排除的文件不报告错误
+
+### 8. Windows 特殊权限 Workaround
+
+#### 8.1 隐藏/系统文件更新
 
 `Update` 方法（`backend/local/local.go`）：
 
-- 以 `O_CREATE|O_TRUNC` 打开失败且为 Permission denied 时
-- 尝试以 `O_WRONLY|O_TRUNC`（不带 CREATE）重新打开
-- 解决 Windows 上更新隐藏/系统文件的权限问题
+```
+尝试以 O_WRONLY|O_CREATE|O_TRUNC 打开文件
+    ↓ 失败且错误为 Permission denied
+    ↓ （可能是 FILE_ATTRIBUTE_HIDDEN 或 FILE_ATTRIBUTE_SYSTEM）
+以 O_WRONLY|O_TRUNC（不带 O_CREATE）重新打开
+    ↓ 成功则继续写入
+```
 
-#### 目录删除权限
+背景：Windows 上如果文件带有隐藏或系统属性，带有 `CREATE_ALWAYS` 的打开可能失败。使用 `TRUNCATE_EXISTING`（不带创建标志）可以绕过这个限制。
+
+#### 8.2 只读目录删除
 
 `Rmdir` 方法（`backend/local/local.go`）：
 
-- Windows 上删除目录遇 `ErrPermission` 时
-- 先 `Chmod` 为 `0o600` 再尝试删除
-- 对应 Go issue #26295 的 workaround
+```
+尝试 os.Remove 删除目录
+    ↓ 失败且错误为 ErrPermission
+os.Chmod(path, 0o600)  // 先尝试清除只读属性
+    ↓
+再次尝试 os.Remove
+```
+
+对应 Go issue #26295：即使微软文档声称 `FILE_ATTRIBUTE_READONLY` 对目录无效，但在某些情况下仍会干扰删除操作。此 workaround 先强制设置写权限再删除。
+
+测试用例见 `backend/local/local_internal_windows_test.go` 的 `TestRmdirWindows`。
 
 ---
 

@@ -325,7 +325,11 @@ const (
 
 **读取触发**：`_readDir()`（`vfs/dir.go#L532-L587`）在 `_age()` 判定过期时才调用 `list.DirSorted()` 拉取后端列表，否则直接返回缓存。读取成功后重置 `d.read` 与 `cleanupTimer`（`vfs/dir.go#L583-L584`）。
 
-**变更通知**：`VFS.New()` 在后端支持 `ChangeNotify` 时注册 `Dir.changeNotify()`（`vfs/dir.go#L290-L299`），收到变更即 `invalidateDir()`（`vfs/dir.go#L274-L284`）将 `read` 置零；否则用 `PollInterval`（默认 1 分钟）轮询（`vfs/vfs.go#L249-L255`）。
+**变更通知**：启动逻辑位于 `vfs/vfs.go#L247-L255`，严格区分后端是否支持 `ChangeNotify` 特性：
+
+- **后端支持 `ChangeNotify`**：创建 `chan time.Duration` 作为 `pollChan`，将回调函数 `vfs.root.changeNotify` 与该 channel 一同传入后端的 `do(ctx, callback, pollChan)`，随后向 channel 写入初始间隔 `time.Duration(vfs.Opt.PollInterval)`（默认 1 分钟）。间隔的实际使用由各后端 `ChangeNotify` 实现自行决定（如监听该 channel 的动态调整）。回调触发时走 `Dir.changeNotify()`（`vfs/dir.go#L290-L299`）→ `invalidateDir()`（`vfs/dir.go#L274-L284`），将目标目录（及目录条目自身）的 `read` 字段置为零时间，强制下次 `_readDir()` 重新从后端拉取。
+
+- **后端不支持 `ChangeNotify`**：若用户仍配置了 `PollInterval > 0`，仅打印一条 info 日志 `poll-interval is not supported by this remote`，**不做任何轮询或缓存失效动作**，目录缓存仍按 `DirCacheTime`（默认 5 分钟）自然过期。
 
 ### 3.3 目录读取与合并：_readDirFromEntries()
 
@@ -634,7 +638,15 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
 2. `newRWFileHandle` 立即 `Truncate(0)`+`Dirty()`（`vfs/read_write.go#L62-L70`），并 `addObject` 加入目录虚拟条目（`vfs/dir.go#L445-L462`）——文件立即可见。
 3. 写入走 `item.WriteAt()` → 本地磁盘 → `_dirty()` 标脏并 `_save()` 元数据（`vfs/vfscache/item.go#L1378-L1411`、`L431-L447`）。
 4. 关闭 `item.Close()` → `_actualClose()` 因 `WriteBack>0` 走异步：`writeback.Add()` 入队，5s 后到期上传（`vfs/vfscache/item.go#L798-L807`、`vfs/vfscache/writeback/writeback.go#L427-L459`）。
-5. 上传成功 `_store()` 调 `storeFn`（即 `File.setObject`，`vfs/file.go#L544-L554`）更新目录对象引用，并 `AddVirtual`/升级虚拟条目。
+5. 上传成功后目录条目更新按句柄类型分两条路径，最终殊途同归：
+   - **RW 句柄（磁盘缓存写回）**：`Item._store()`（`vfs/vfscache/item.go#L1331-L1376`）上传完成后调用传入的 `storeFn(o)`，该函数即 `File.setObject`（`vfs/file.go#L544-L554`）。
+   - **Write 句柄（Pipe 直传）**：`WriteFileHandle.close()`（`vfs/write.go#L187-L213`）等待 `<-fh.result` 返回成功后，同样执行 `fh.file.setObject(fh.o)`。
+   
+   `File.setObject` 的执行链为：更新 `f.o` → 释放 `File.mu` → 调用 `d.addObject(f)`（`vfs/dir.go#L445-L462`）。`addObject` 将节点写入 `d.items[leaf] = f`，并标记 `d.virtual[leaf] = vAddFile`（首次出现时累加父链 `_virtuals` 计数）。此时用户侧 `readdir` 立即可见该文件（因为 `items` 已更新）。
+   
+   该 `vAddFile` 虚拟标记的最终清理发生在**下一次目录从后端读取时**：
+   - 若后端列表已包含同名文件：`_readDirFromEntries()`（`vfs/dir.go#L732-L787`）→ `mv.add()`（`vfs/dir.go#L681-L696`）命中 `case vAddFile`，调用 `_deleteVirtual(name)`（`vfs/dir.go#L596-L607`）清除虚拟标记，条目升级为「真实条目」。
+   - 若后端列表尚未出现该文件：由每次 List 前的 `_purgeVirtual()`（`vfs/dir.go#L620-L659`）负责清理——仅当写入已完成（`!f.writingInProgress()`）且未被缓存使用时才删除虚拟标记；否则保留。
 6. 挂载层 `flush` 立即返回，用户感知「秒存」；后台 `WaitForWriters()`（`vfs/vfs.go#L434-L464`）在卸载前等待所有写回完成。
 
 ### 5.4 典型场景：随机读写（如 SQLite）
@@ -652,13 +664,13 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
    │ 选择最优句柄              │ 维持合并视图                 │ 脏标记 + 延迟上传
    │                           │                             │
    ├── Read: 流式不落盘 ───────┤ 读路径命中缓存，少调 List ──┤ 关闭后异步回写
-   ├── Write: Pipe 直传 ──────┤ 本地修改即时可见(virtual) ──┤ 上传完成升级虚拟条目
+   ├── Write: Pipe 直传 ──────┤ 本地修改即时可见(virtual) ──┤ 上传成功 setObject→addObject→vAddFile
    └── RW: 本地缓存文件 ──────┤ 写时 addObject 注入目录 ────┤ reload 恢复未传数据
                                                               │
                           配额/年龄清理保护本地磁盘不爆 ───────┘
 ```
 
-三者通过 `CachePath`、虚拟条目、`storeFn` 回调紧密耦合：打开文件决定数据落点，目录缓存保证可见性与一致性，写回策略保证持久性与磁盘可控。
+三者通过 `CachePath`、虚拟条目、`storeFn` 回调紧密耦合：打开文件决定数据落点，目录缓存保证可见性与一致性，写回策略保证持久性与磁盘可控。写回完成通过 `File.setObject → Dir.addObject` 将条目注入目录并标记 `vAddFile`，待下次后端 List 时由 `mv.add()` 升级为真实条目。
 
 ---
 
@@ -670,7 +682,7 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
 | --- | --- | --- | --- | --- |
 | `--vfs-cache-mode` | `CacheMode` | `off` | 句柄选择与是否启用磁盘缓存 | `vfs/file.go#L891-L922` |
 | `--dir-cache-time` | `DirCacheTime` | `5m` | 目录列表缓存有效期 | `vfs/dir.go#L360-L367` |
-| `--poll-interval` | `PollInterval` | `1m` | 变更轮询间隔 | `vfs/vfs.go#L249-L255` |
+| `--poll-interval` | `PollInterval` | `1m` | 后端支持 ChangeNotify 时通过 channel 传递的轮询间隔；不支持时仅警告不生效 | `vfs/vfs.go#L247-L255` |
 | `--vfs-cache-max-age` | `CacheMaxAge` | `1h` | 缓存项最大留存时间 | `vfs/vfscache/cache.go#L803` |
 | `--vfs-cache-max-size` | `CacheMaxSize` | `-1`(无限) | 缓存总大小上限 | `vfs/vfscache/cache.go#L738-L743` |
 | `--vfs-cache-min-free-space` | `CacheMinFreeSpace` | `-1`(不限制) | 目标最小剩余空间 | `vfs/vfscache/cache.go#L720-L733` |

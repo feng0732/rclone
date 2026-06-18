@@ -119,6 +119,34 @@ if srcName > dstName || (srcName == dstName && srcType > dstType) {
 
 **总结**：同名文件与目录冲突时，目录侧静默递归（不报告该名称本身的差异），文件侧报告为缺失。目录子内容在递归中逐一报告。
 
+#### 2.2.4 NoTraverse 模式：不遍历目标定位对象
+
+`--no-traverse` 标志下，march 不列出目标目录树，而是对每个源条目通过 `NewObject()` 按需定位目标对象。此模式在源文件较少、目标文件很多时性能更优。
+
+**核心机制**（fs/march/march.go 第 419-491 行）：
+
+```
+1. 读取源列表到 originalSrcChan
+2. 构建双通道流水线：
+   ├── matchTasks (chan matchTask)   → workers 并行处理
+   └── dstMatches (chan <-chan DirEntry) → 保证顺序输出
+3. 每个 worker 处理 matchTask：
+   ├── 目录条目：直接返回 nil（NewObject 不能匹配目录）
+   ├── 文件条目：NewObject(m.Ctx, path.Join(job.dstRemote, leaf))
+      ├── 成功 → 返回目标对象
+      └── 失败 → 返回 nil（表示目标不存在）
+4. dstMatches 按输入顺序读回结果，发送到 dstChan
+5. srcChan 重新发送原始源条目，与 dstChan 一一对应
+```
+
+**并发控制**：使用 `newObjectSem` 信号量（`ci.Checkers` 个槽位）限制同时调用 `NewObject` 的数量，避免对目标后端造成压力。
+
+**顺序保证**：即使 worker 乱序完成，`dstMatches` 通道队列也确保结果按原始源顺序发送到 `dstChan`。
+
+**局限性**：
+- 目录条目在目标侧始终得到 nil，因此会走 SrcOnly(Directory) → recurse=true → 对子目录内的每个文件再走 NewObject 流程
+- 无法检测目标侧多余文件（dstChan 永远不会有源中没有的条目）
+
 ### 2.3 checkMarch 回调：三层比对
 
 fs/operations/check.go `checkMarch` 实现 `Marcher` 接口，三个回调分别处理：
@@ -173,6 +201,65 @@ src 是 Object, dst 非 Object（第 178-184 行，不可达防御分支）
 src 是 Directory, dst 非 Directory（第 186-197 行，不可达防御分支）
   └── report(MissingOnSrc, '-')  differences++  srcFilesMissing++
 ```
+
+### 2.4 目标目录不存在时的递归报告
+
+当目标目录不存在时（`dstListErr == fs.ErrorDirNotFound`），march 框架有特殊处理，触发整个源侧的递归报告。
+
+**错误处理分支**（fs/march/march.go 第 543-545 行）：
+
+```go
+if dstListErr == fs.ErrorDirNotFound {
+    // Copy the stuff anyway
+} else if dstListErr != nil {
+    // 其他错误：记录错误并返回
+}
+```
+
+`ErrorDirNotFound` 被静默忽略，不报错返回，允许流程继续。
+
+**递归报告链路**：
+
+```
+processJob 处理某目录
+│
+├── dstListErr = fs.ErrorDirNotFound  →  静默，不返回错误
+│
+├── dstChan 为空（目标目录无任何条目）
+│
+└── matchListings() 比较
+    │
+    ├── 每个 src 条目都走 srcOnly()  →  Callback.SrcOnly(src)
+    │   │
+    │   ├── src 是 Object  →  report('+', MissingOnDst), differences++, dstFilesMissing++
+    │   │
+    │   └── src 是 Directory  →  checkMarch.SrcOnly 返回 recurse=true
+    │       │
+    │       └── march 生成新 listDirJob
+    │           ├── srcRemote = src.Remote()
+    │           ├── dstRemote = src.Remote()
+    │           ├── srcDepth = job.srcDepth - 1
+    │           └── noDst = true  (跳过目标列表)
+    │
+    └── 新 job 入队继续处理
+        │
+        └── 目标子目录也不存在 → dstListErr 再次为 ErrorDirNotFound
+            └── 重复上述流程，直到 srcDepth 耗尽或所有子目录处理完毕
+```
+
+**job 创建细节**（fs/march/march.go 第 497-506 行）：
+
+```go
+srcOnly(src) → recurse=true && srcDepth > 0 →
+jobs = append(jobs, listDirJob{
+    srcRemote: src.Remote(),
+    dstRemote: src.Remote(),
+    srcDepth:  job.srcDepth - 1,
+    noDst:     true,   // 不列出目标，避免再次 ErrorDirNotFound
+})
+```
+
+**效果**：目标目录不存在时，源目录树被完整遍历，每个文件都报告为目标缺失（'+'），目录逐层递归，不会因顶层目录不存在而中断。
 
 ---
 
@@ -335,18 +422,133 @@ CheckIdenticalDownload(ctx, src, dst) → (same, err)
 └── same        → differ=false, noHash=false  (内容一致)
 ```
 
-### 4.4 CheckSum 模式的 matchSum 分支
+### 4.4 CheckSum 模式完整链路
 
-fs/operations/check.go `matchSum()` 针对基于 SUM 文件的校验：
+CheckSum 模式不使用 march 框架，而是采用 "清单解析 → 文件系统遍历 → 双边比对 → 未消费清单兜底" 的独立流程。
+
+#### 4.4.1 CheckSum 初始化与参数倒置
+
+`CheckSum()`（fs/operations/check.go 第 409-469 行）入口有特殊的参数约定：
+
+```go
+// CheckSum 中 Fsrc 和 Fdst 被重新赋值：
+options.Fsrc = nil    // 源 Fs 被置空，表示"源"是 SUM 清单而非文件系统
+options.Fdst = fsrc   // 待校验的文件系统作为"目标"
+```
+
+这会影响后续报告中"files missing" vs "hashes missing" 的文案（见 reportResults 第 246-248 行）。
+
+#### 4.4.2 清单解析与消费
+
+**步骤 1：解析 SUM 文件**（第 429-436 行）
 
 ```
-matchSum(sumHash, objHash, ...)
+sumObj, err := fsum.NewObject(ctx, sumFile)
+hashes, err := ParseSumFile(ctx, sumObj)
+  → 正则 `^([^ ]+) [ *](.+)$` 匹配每一行
+  → 结果保存为 HashSums map[string]string
+  → key = 文件名（经 ApplyTransforms 规范化：NFC + 可选大小写折叠）
+  → value = 哈希值（小写）
+```
+
+**步骤 2：遍历文件系统**（第 444-447 行）
+
+```go
+lastErr := ListFn(ctx, opt.Fdst, func(obj fs.Object) {
+    c.checkSum(ctx, obj, download, hashes, hashType)
+})
+```
+
+对每个文件调用 `checkSum()`（第 472-533 行）进行消费：
+
+```go
+normalizedRemote := ApplyTransforms(ctx, obj.Remote())
+c.ioMu.Lock()
+sumHash, sumFound := hashes[normalizedRemote]
+hashes[normalizedRemote] = ""  // 消费标记：设为空字符串
+c.ioMu.Unlock()
+```
+
+**消费规则**：
+- 查找到对应哈希条目 → 标记为消费（置空），进入比对流程
+- 未查找到 → 根据 `OneWay` 标志决定：
+  - `OneWay=true` → 直接 return（不报告系统中多余的文件）
+  - `OneWay=false` → 报告为 src 缺失（'-', MissingOnSrc）
+
+#### 4.4.3 比对分支（download vs 非 download）
+
+**非 download 模式**（第 498-503 行）：直接调用对象的 `Hash()` 方法获取哈希。
+
+```go
+if !download {
+    objHash, err = obj.Hash(ctx, hashType)
+    c.matchSum(ctx, sumHash, objHash, obj, err, hashType)
+    return
+}
+```
+
+**download 模式**（第 505-532 行）：下载文件内容并流式计算哈希。
+
+```
+Open(ctx, obj) → in io.ReadCloser
+  → tr.Account(ctx, in).WithBuffer()  // 记账和缓冲
+  → hash.StreamTypes(in, hash.NewHashSet(hashType))
+    → 流式读取并计算指定哈希
+    → objHash = hashVals[hashType]
+  → matchSum 报告结果
+```
+
+#### 4.4.4 matchSum 结果分支
+
+`matchSum()`（fs/operations/check.go 第 536-566 行）的完整判定：
+
+```
+matchSum(sumHash, objHash, obj, err, hashType)
 ├── err != nil          → report(Error, '!')   "Failed to calculate hash"
-├── sumHash == ""       → report(Error, '!')   "duplicate file"
+├── sumHash == ""       → report(Error, '!')   "duplicate file"（重复消费）
 ├── objHash == ""       → report(Match, '=')   noHashes++  "could not check hash"
 ├── objHash == sumHash  → report(Match, '=')   "OK"
 └── default             → report(Differ, '*')   differences++  "files differ"
 ```
+
+**sumHash == ""** 意味着该条目已被另一个同名文件消费过（例如经过规范化后文件名相同的两个文件），此时报告为重复文件错误。
+
+#### 4.4.5 未消费清单兜底（第 449-467 行）
+
+遍历完文件系统后，对 `hashes` map 中仍未消费的条目进行兜底报告：
+
+```go
+for filename, hash := range hashes {
+    if hash == "" {          // 已消费，跳过
+        continue
+    }
+    if !fi.IncludeRemote(filename) {  // 被过滤器排除，跳过
+        continue
+    }
+    // 清单中有但文件系统中没有，报告为目标缺失
+    err := fmt.Errorf("file not in %v", opt.Fdst)
+    c.dstFilesMissing.Add(1)
+    c.reportFilename(filename, opt.MissingOnDst, '+')
+}
+```
+
+**注意**：此处使用 `reportFilename` 直接输出文件名（而非 `report` 输出 DirEntry），因为这些文件在文件系统中不存在，没有对应的 DirEntry 对象。
+
+#### 4.4.6 OneWay 单向校验逻辑
+
+`--one-way` 标志对 CheckSum 模式的影响体现在两个位置：
+
+| 位置 | OneWay=false | OneWay=true |
+|------|-------------|------------|
+| `checkSum()` 第 480-482 行 | 系统中有但清单中没有 → 报告为 src 缺失（'-'） | 系统中有但清单中没有 → 直接 return，不报告 |
+| 未消费清单兜底 | 清单中有但系统中没有 → 始终报告为 dst 缺失（'+'） | 清单中有但系统中没有 → 始终报告为 dst 缺失（'+'）|
+
+**OneWay 语义**：只校验"清单中有的文件必须在系统中存在且匹配"，不校验"系统中多余的文件"。
+
+**关键区别于普通 Check 的 OneWay**：
+- 普通 Check 的 OneWay 影响 DstOnly（目标有但源没有）→ 不报告
+- CheckSum 的 OneWay 影响 checkSum（系统有但清单没有）→ 不报告
+- 两者在"源/清单侧有但目标/系统侧没有"的方向上，OneWay 不影响，始终报告
 
 ### 4.5 最终结果汇总
 
@@ -395,6 +597,8 @@ cmd/cryptcheck/cryptcheck.go `cryptCheck()` 专门处理加密远端：
 
 ## 6. 关键数据流总结
 
+### 6.1 普通 Check 模式（遍历目标）
+
 ```
 CLI 参数解析 (cmd/check)
     │
@@ -419,7 +623,89 @@ CheckFn() ── march.Run() ── matchListings（排序键含 D/F 后缀）
 reportResults() → 退出码
 ```
 
-同名文件 vs 目录冲突的专有路径：
+### 6.2 NoTraverse 模式（不遍历目标定位对象）
+
+```
+CheckFn() ── march.Run(NoTraverse=true)
+    │
+    ├── processJob
+    │   ├── srcListDir  →  originalSrcChan
+    │   ├── 不调用 dstListDir
+    │   │
+    │   ├── matchTasks 队列（ci.Checkers 个 worker 并行）
+    │   │   ├── src 是 Directory → dstMatch <- nil
+    │   │   └── src 是 Object
+    │   │       ├── NewObject(path.Join(dstRemote, leaf))
+    │   │       ├── 成功 → dstMatch <- dstObject
+    │   │       └── 失败 → dstMatch <- nil
+    │   │
+    │   └── dstMatches 按顺序读回结果 → dstChan
+    │
+    └── matchListings(srcChan, dstChan)
+        ├── src有dst有(Object) → match → checkIdentical
+        ├── src有dst有(Directory) → match → recurse → 子目录再走 NewObject
+        ├── src有dst无 → srcOnly → '+' / 递归
+        └── dst有src无 → 不会发生（dstChan 只有 src 中的条目）
+```
+
+### 6.3 目标目录不存在时的递归报告
+
+```
+processJob 处理目录 X
+│
+├── dstListDir(X) → fs.ErrorDirNotFound
+├── dstChan 为空
+│
+└── matchListings()
+    │
+    ├── 每个 src 条目 → srcOnly
+    │   ├── Object → report('+', MissingOnDst)
+    │   └── Directory → recurse=true
+    │       └── 新 listDirJob{srcRemote=dir, dstRemote=dir, noDst=true}
+    │
+    └── 新 job 入队
+        │
+        └── 子目录同样 ErrorDirNotFound → 重复上述流程
+            └── 直到 srcDepth 耗尽或所有文件报告完毕
+```
+
+**关键特征**：`dstListErr == fs.ErrorDirNotFound` 被静默忽略，不返回错误，允许递归继续。
+
+### 6.4 CheckSum 模式：清单消费与单向校验
+
+```
+CheckSum()
+│
+├── ParseSumFile(sumFile) → HashSums map (key=文件名, value=哈希)
+│
+├── ListFn(fdst) → 遍历文件系统每个文件
+│   │
+│   └── checkSum(obj, hashes, hashType)
+│       ├── normalizedRemote = ApplyTransforms(obj.Remote())
+│       ├── sumHash, sumFound := hashes[normalizedRemote]
+│       ├── hashes[normalizedRemote] = ""  // 消费标记
+│       │
+│       ├── !sumFound
+│       │   ├── OneWay=true → return（不报告）
+│       │   └── OneWay=false → report('-', MissingOnSrc)
+│       │
+│       └── sumFound
+│           ├── !download → obj.Hash(ctx, hashType)
+│           └── download → Open(obj) → StreamTypes → 计算哈希
+│               └── matchSum() → 报告 '=', '*', 或 '!'
+│
+├── 遍历结束，兜底检查未消费清单
+│   │
+│   └── for filename, hash := range hashes
+│       ├── hash == "" → 已消费，跳过
+│       ├── !IncludeRemote → 被过滤，跳过
+│       └── 其他 → report('+', MissingOnDst)
+│
+└── reportResults() → 退出码
+```
+
+### 6.5 同名文件 vs 目录冲突的专有路径
+
 ```
 src=目录"foo" dst=文件"foo"     src=文件"foo" dst=目录"foo"
     │                              │

@@ -111,17 +111,41 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) (err error) {
     return f.cache.Create(bucket, func() error {
         // 1. 先尝试列出 bucket 中 1 个对象来探测是否存在
         //    （这样仅需 Storage Object Admin 角色，无需 Storage Admin）
-        // 2. 如果 404，则通过 Buckets.Insert API 创建
-        bucket := storage.Bucket{
-            Name:         bucket,
-            Location:     f.opt.Location,
-            StorageClass: f.opt.StorageClass,
-            IamConfiguration: ... // BucketPolicyOnly 时设置
+        err = f.pacer.Call(func() (bool, error) {
+            _, err = f.svc.Objects.List(bucket).MaxResults(1).Do()
+            return shouldRetry(ctx, err)
+        })
+        if err == nil {
+            return nil  // bucket 已存在
+        } else if gErr, ok := err.(*googleapi.Error); ok {
+            if gErr.Code != http.StatusNotFound {
+                return err  // 非 404 错误直接返回
+            }
+        } else {
+            return err
         }
-        // ... Buckets.Insert 调用
+
+        // 2. 只有探测到 404，才通过 Buckets.Insert API 创建
+        // ⚠️  注意：Buckets.Insert 不是幂等操作
+        //    如果第一次 Insert 成功但网络超时没收到响应，
+        //    pacer.Call 低层重试时会得到 409 Conflict（bucket 已存在）错误
+        bucket := storage.Bucket{...}
+        return f.pacer.Call(func() (bool, error) {
+            _, err = f.svc.Buckets.Insert(project, &bucket).Do()
+            return shouldRetry(ctx, err)
+        })
     }, nil)
 }
 ```
+
+#### 幂等性分析
+
+`makeBucket` 的整体流程是"探测-创建"两阶段：
+1. **Objects.List 探测**：完全幂等，重复调用无副作用，使用 `pacer.Call` 低层重试安全
+2. **Buckets.Insert 创建**：**非幂等**，成功后重试会返回 409 Conflict 错误
+   - `shouldRetry` 不会重试 409（只重试 5xx 和限流）
+   - 但如果第一次 Insert 成功响应丢失，第二次尝试 Insert 会失败
+   - `bucket.Cache` 的存在降低了并发冲突概率，但无法消除网络超时导致的重试冲突
 
 ### 2.4 Bucket 删除 → `Fs.Rmdir`
 
@@ -314,9 +338,9 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) (err error) 
 
 | 通用 fs 接口 | GCS 对象字段 | 转换方式 |
 |-------------|-------------|---------|
-| `Object.Size()` | `storage.Object.Size` | 直接赋值（gzip+Decompress 时为 -1） |
-| `Object.Hash(MD5)` | `storage.Object.Md5Hash` | base64 → hex |
-| `Object.ModTime()` | `metadata["mtime"]` / `metadata["goog-reserved-file-mtime"]` / `Updated` | 三级 fallback |
+| `Object.Size()` | `storage.Object.Size` | 直接赋值；**gzip+Decompress 时行为取决于是否有自定义 mtime**：<br>• 有自定义 mtime（rclone 上传的对象）→ 保留压缩后大小（Bug）<br>• 无自定义 mtime → 置为 -1（正确表示未知） |
+| `Object.Hash(MD5)` | `storage.Object.Md5Hash` | base64 → hex；**gzip+Decompress 时行为取决于是否有自定义 mtime**：<br>• 有自定义 mtime → 保留压缩后 MD5（Bug）<br>• 无自定义 mtime → 置为 `""`（正确表示未知） |
+| `Object.ModTime()` | `metadata["mtime"]` / `metadata["goog-reserved-file-mtime"]` / `Updated` | 三级 fallback，前两级解析成功会 `return`，跳过后续 gzip 清零 |
 | `Object.MimeType()` | `storage.Object.ContentType` | 直接赋值 |
 | `Object.SetModTime()` | 写入 metadata → `Objects.Copy` | 复制自身 |
 | `Fs.Put()` / `Object.Update()` | 构建 `storage.Object{Metadata, ContentType, StorageClass, ...}` | 上传时传入 |
@@ -393,7 +417,7 @@ func shouldRetry(ctx context.Context, err error) (again bool, errOut error) {
 | `Objects.List`（列目录） | `list()` L689 | `pacer.Call` | 幂等读，可安全低层重试 |
 | `Objects.Get`（读元数据） | `readObjectInfo()` L1288 | `pacer.Call` | 幂等读 |
 | `Buckets.List`（列 bucket） | `listBuckets()` L814 | `pacer.Call` | 幂等读 |
-| `Buckets.Insert`（建 bucket） | `makeBucket()` L1065 | `pacer.Call` | 幂等（结果是"已存在或刚创建"） |
+| `Buckets.Insert`（建 bucket） | `makeBucket()` L1065 | `pacer.Call` | **非幂等**；仅当 `Objects.List` 探测返回 404 时才调用 Insert；若 Insert 成功但响应丢失，低层重试会得到 409 Conflict 错误 |
 | `Buckets.Delete`（删 bucket） | `Rmdir()` L1110 | `pacer.Call` | 幂等删除 |
 | `Objects.Delete`（删对象） | `Remove()` L1507 | `pacer.Call` | 幂等删除 |
 | `Objects.Copy`（改 mtime） | `SetModTime()` L1360 | `pacer.Call` | 幂等写 |

@@ -633,6 +633,249 @@ defer atexit.OnError(&err, func() {
 
 ---
 
+### 场景五：同步管道中的混淆路径拆解
+
+Copy/Move 目录级同步时，所有"目标已存在"、"backup-dir"、"copy-dest"、"已匹配删源"、"大小写改名"等逻辑都集中在 **`pairChecker`** 阶段（先检查再决定是否传输）。这些逻辑按严格的代码顺序依次触发，彼此有依赖关系。
+
+#### pairChecker 完整执行顺序
+
+入口在 [sync.go:371-476](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/sync/sync.go#L371-L476)，每次处理一个 `ObjectPair`（源+目标）：
+
+```
+pairChecker 接收一个 pair (src, dst)
+    │
+    ├─ src.Storable() == false → 跳过
+    │
+    ├─ 1. NeedTransfer(dst, src)  → 初步判定是否需要传输
+    │   │
+    │   ├─ 需要传输 (needTransfer=true)
+    │   │   │
+    │   │   ├─ 2. CompareOrCopyDest — 检查 compare-dest/copy-dest
+    │   │   │   ├─ copy-dest 命中且服务端复制成功 → needTransfer=false
+    │   │   │   ├─ compare-dest 命中 → needTransfer=false
+    │   │   │   └─ 未命中 → needTransfer 保持 true
+    │   │   │
+    │   │   ├─ 3. FixCase（仅 --fix-case 且大小写不同时触发）
+    │   │   │   ├─ 需要传输且目标已不存在 → pair.Dst = nil
+    │   │   │   └─ 目标仍存在 → Move 改名，pair.Dst 指向新名
+    │   │   │
+    │   │   ├─ 4. Immutable 检查 → 已存在且不匹配 → 报错，不传输
+    │   │   │
+    │   │   └─ 5. backup-dir 处理（目标存在且 --backup-dir 时）
+    │   │       ├─ MoveBackupDir 成功 → pair.Dst = nil，进入上传队列
+    │   │       └─ MoveBackupDir 失败 → 报错，不进入上传队列
+    │   │
+    │   └─ 无需传输 (needTransfer=false) → 已匹配
+    │       │
+    │       └─ [仅 DoMove] 已匹配对象删源
+    │           ├─ SameObject(src, dst) → 不删（同一文件）
+    │           ├─ --ignore-existing → 不删
+    │           ├─ --check-first + --order-by → 放入上传队列（src==dst 表示删源）
+    │           └─ 其他 → 直接 DeleteFile(src)
+    │
+    └─ tr.Done() 记录检查统计
+```
+
+#### 路径一：目标已存在 + backup-dir
+
+**触发条件**：`needTransfer=true && pair.Dst != nil && s.backupDir != nil`
+
+代码位置：[sync.go:430-442](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/sync/sync.go#L430-L442)
+
+```go
+if pair.Dst != nil && s.backupDir != nil {
+    err := operations.MoveBackupDir(s.ctx, s.backupDir, pair.Dst)
+    if err != nil {
+        // 失败 → 报错，不放入上传队列（即不传输新文件）
+        s.processError(err)
+        s.logger(...)
+    } else {
+        // 成功 → 目标被移走，pair.Dst 置空，继续上传
+        pair.Dst = nil
+        ok = out.Put(s.inCtx, pair)
+    }
+}
+```
+
+**MoveBackupDir 内部**（[operations.go:1955-1960](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/operations.go#L1955-L1960)）：
+```go
+func MoveBackupDir(ctx context.Context, backupDir fs.Fs, dst fs.Object) (err error) {
+    remoteWithSuffix := SuffixName(ctx, dst.Remote())  // 加后缀名
+    overwritten, _ := backupDir.NewObject(ctx, remoteWithSuffix)
+    _, err = Move(ctx, backupDir, overwritten, remoteWithSuffix, dst)
+    return err
+}
+```
+
+**执行顺序**：
+1. 计算备份目标名：`SuffixName` 处理 `--suffix` 和 `--suffix-keep-extension`
+2. 如果备份目录已存在同名文件 → 作为 `overwritten` 传入 Move（Move 内部会先删再移）
+3. 调用 **服务端 Move** 将原目标文件移到备份目录
+4. Move 成功 → pair.Dst 置空 → 新文件可以"创建式"上传（而非覆盖式）
+
+**失败回退**：
+- MoveBackupDir 失败 → 报错且**不进入上传队列**，原目标文件保留在原位
+- 新文件不会被复制，避免"备份失败但新文件覆盖了旧文件"的数据丢失
+
+**与 Suffix 的特殊关系**：
+- 只设 `--suffix` 不设 `--backup-dir` 时，`backupDir = fdst`（用目标目录本身当备份目录）
+- 即旧文件原地改名加后缀，新文件写入原名
+
+#### 路径二：copy-dest 服务端复用
+
+**触发条件**：`needTransfer=true && len(ci.CopyDest) > 0`
+
+入口：[CompareOrCopyDest](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/operations.go#L1708-L1726) → 循环调用 [copyDest](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/operations.go#L1661-L1702)
+
+```
+copyDest(fdst, dst, src, CopyDestFs, backupDir)
+    │
+    ├─ 在 CopyDestFs 中按 remote 查找同名文件
+    │   └─ 找不到 → 返回 NoNeedTransfer=false（继续正常上传）
+    │
+    ├─ 找到 CopyDestFile → equal(src, CopyDestFile) 比较内容
+    │   └─ 内容不同 → 返回 NoNeedTransfer=false
+    │
+    └─ 内容相同
+        │
+        ├─ 目标不存在 或 目标与源内容不同 → 需要从 copy-dest 复制过来
+        │   │
+        │   ├─ 目标存在且有 backup-dir → MoveBackupDir(dst) 先移走旧目标
+        │   │   └─ 失败 → 返回错误
+        │   │
+        │   └─ Copy(fdst, dst, remote, CopyDestFile)  服务端复制
+        │       ├─ 成功 → NoNeedTransfer=true
+        │       └─ 失败 → NoNeedTransfer=false（降级到正常上传）
+        │
+        └─ 目标已存在且与源相同 → NoNeedTransfer=true（跳过）
+```
+
+**关键点**：
+- copy-dest 必须与目标**同配置同远程**（SameConfig 检查，启动时校验）
+- 复制走服务端 Copy（`features.Copy`），零带宽
+- **复制失败时不报错，只是降级到正常从源端传输**（[operations.go:1690-1692](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/operations.go#L1690-L1692)）
+- 与 backup-dir 联动：目标存在时先移到备份目录再从 copy-dest 复制
+
+**compare-dest vs copy-dest 的区别**：
+| 特性 | --compare-dest | --copy-dest |
+|------|---------------|-------------|
+| 行为 | 只比较，命中则跳过 | 命中则从 dest 服务端复制到目标 |
+| 服务端操作 | 不需要 | 需要 `features.Copy` |
+| 与 backup-dir 联动 | 不联动 | 联动（目标存在先备份） |
+
+#### 路径三：已匹配对象删源（Move 场景）
+
+**触发条件**：`needTransfer=false && s.DoMove`（文件已匹配，不需要传输，但在 Move 模式下需要删源）
+
+代码位置：[sync.go:451-471](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/sync/sync.go#L451-L471)
+
+```go
+if s.DoMove {
+    if operations.SameObject(src, pair.Dst) {
+        // 同一对象（同配置同路径）→ 不删
+        fs.Logf(src, "Not removing source file as it is the same file as the destination")
+    } else if s.ci.IgnoreExisting {
+        // --ignore-existing → 不删
+        fs.Debugf(src, "Not removing source file as destination file exists and --ignore-existing is set")
+    } else if s.checkFirst && s.ci.OrderBy != "" {
+        // --check-first + 排序 → 放入上传队列延迟删除（src==dst 表示删源）
+        ok = out.Put(s.inCtx, fs.ObjectPair{Src: src, Dst: src})
+    } else {
+        // 正常情况 → 直接删除
+        deleteFileErr := operations.DeleteFile(s.ctx, src)
+        s.processError(deleteFileErr)
+    }
+}
+```
+
+**四种情况对照**：
+
+| 场景 | 是否删源 | 原因 |
+|------|----------|------|
+| SameObject(src, dst) | 否 | 源和目标是同一个对象（同配置同路径），删了目标就没了 |
+| --ignore-existing | 否 | 用户明确要求保留源 |
+| --check-first + --order-by | 延迟删 | 放入传输队列按顺序处理，保证排序正确 |
+| 其他正常情况 | 立即删 | Move 的正常语义 |
+
+**失败回退**：
+- DeleteFile 失败 → 记录错误并累计到 stats，但 Move 整体继续
+- 源文件保留在原位，目标文件也已存在 → **两端都有文件**（与"Copy成功Delete失败"相同的最终状态）
+
+#### 路径四：大小写改名（FixCase + MoveCaseInsensitive）
+
+有两处大小写改名逻辑，**发生在不同阶段**，容易混淆：
+
+| 改名类型 | 触发位置 | 用途 |
+|----------|----------|------|
+| FixCase（sync 层） | pairChecker，NeedTransfer 之后 | 修正目标端文件名大小写以匹配源 |
+| MoveCaseInsensitive（operations 层） | Move 函数内部 | 处理大小写不敏感文件系统上的同名重命名 |
+
+**FixCase（--fix-case）**
+
+代码位置：[sync.go:394-416](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/sync/sync.go#L394-L416)
+
+触发条件：
+- `--fix-case` 开启
+- 非 `--immutable` 模式
+- 目标存在（`pair.Dst != nil`）
+- 源和目标仅大小写不同（`src.Remote() != pair.Dst.Remote()`）
+
+执行流程：
+1. 如果 needTransfer=true → 检查目标是否还在（NeedTransfer 可能已删除了目标以便重新上传）
+   - 目标已不存在 → `pair.Dst = nil`（后续重新创建正确大小写的文件）
+   - 目标仍存在 → 继续改名
+2. 调用 `operations.Move(...)` 将目标文件重命名为源的大小写形式
+3. 成功 → `pair.Dst = newDst`（指向新名字对象）
+4. 失败 → 报错，但流程继续
+
+> 注意：FixCase 发生在 backup-dir 处理**之前**。如果 FixCase 成功且 needTransfer=false，就不会触发 backup-dir。
+
+**MoveCaseInsensitive（operations 层）**
+
+代码位置：[operations.go:1962-2012](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/operations.go#L1962-L2012)
+
+触发条件（`needsMoveCaseInsensitive`）：
+- 非 Copy 操作（`cp=false`）
+- 源和目标同后端（`fdst.Name() == fsrc.Name()`）
+- 文件名不同（`dstFileName != srcFileName`）
+- 且满足以下之一：
+  - NFC 规范化后路径相同（Unicode 等价）
+  - 后端大小写不敏感且 `strings.EqualFold` 相等
+
+三步走策略：
+```
+步骤1: 生成随机临时名 → dstFileName + "-rclone-move-" + random.String(8)
+步骤2: Move 源文件 → 临时名
+步骤3: Move 临时名 → 目标名
+```
+
+**为什么需要中间临时名**：
+- 大小写不敏感文件系统（如 macOS HFS+、Windows NTFS、某些对象存储）认为 `File.txt` 和 `file.txt` 是同一个文件
+- 直接 `Move("file.txt", "File.txt")` 可能导致文件被覆盖或操作被忽略（因为系统认为它们相同）
+- 先移到一个完全不同的临时名，再移到目标名，确保两次操作都是"真实的"不同文件操作
+
+**失败回退**：
+- 步骤2失败 → 源文件仍在原位，直接返回错误，无残留
+- 步骤3失败 → 文件停在临时名，**需要手动恢复**（不会自动回退到源名）
+
+> MoveCaseInsensitive 在 Move 函数内部调用，是 Move 服务端路径的一个分支。FixCase 在 sync 层 pairChecker 中调用，用于修正已有目标文件的大小写。两者分别处于不同抽象层。
+
+#### 五条路径的执行时序总表
+
+按 pairChecker 中实际代码顺序排列：
+
+| 顺序 | 步骤 | 改变什么 | 失败后果 |
+|------|------|----------|----------|
+| 1 | NeedTransfer | 决定 needTransfer 标志 | 不适用（总是有结果） |
+| 2 | CompareOrCopyDest | 可能将 needTransfer 改为 true→false；可能从 copy-dest 服务端复制；可能调用 backup-dir | copy-dest 复制失败 → 降级到正常上传，不报错 |
+| 3 | FixCase | 可能移动 pair.Dst 的文件名；可能置 nil | 改名失败 → 报错，继续流程 |
+| 4 | Immutable 检查 | 可能阻止传输 | 已存在且不匹配 → 报错，不传输 |
+| 5 | backup-dir | 可能将 pair.Dst 移到备份目录并置 nil | 移备份失败 → 报错，不进入上传队列 |
+| 6 | （进入上传队列） | — | — |
+| — | 已匹配删源（仅 DoMove） | 可能删除源文件 | 删除失败 → 报错，源保留 |
+
+---
+
 ## 综合时序：服务端复制降级 + 目标已存在 + partial 清理
 
 以下是 Copy 操作覆盖最多边界条件的完整时序：

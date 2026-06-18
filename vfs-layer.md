@@ -1,523 +1,697 @@
-# VFS 抽象层代码理解
+# rclone VFS 抽象层代码理解
+
+本文档对照源码讲解 rclone VFS 抽象层的三大核心机制：**打开文件**、**目录缓存**、**写回策略**，并说明三者如何协同支撑 FUSE 挂载访问。所有引用均使用仓库相对路径，形如 `vfs/file.go#L834-L929`，可在 IDE 中点击跳转。
+
+---
 
 ## 一、整体架构
 
-rclone 的 VFS（虚拟文件系统）抽象层为云存储后端提供了一个符合 POSIX 标准的文件系统接口，使得 rclone 挂载的远程存储可以像本地文件系统一样被访问。
+VFS 层位于挂载层（FUSE）与后端存储（`fs.Fs`）之间，是实现「云存储当本地磁盘」的关键抽象层。
 
-### 核心组件关系
+### 1.1 调用链
 
 ```
-挂载层 (mount/cmoun/mount2)
-        ↓
-VFS 抽象层 (vfs/)
-        ↓
-VFS 缓存层 (vfs/vfscache/)
-        ↓
-后端存储 (backend/)
+cmd/mount (FUSE)
+    │  cmd/mount/fs.go#L42-L49  FS.Root() → vfs.Root()
+    ▼
+vfs.VFS  (vfs/vfs.go#L178-L191)
+    │  vfs/vfs.go#L562-L588  VFS.OpenFile()
+    ▼
+vfs.File.Open()  (vfs/file.go#L834-L929)  句柄选择
+    ├──► ReadFileHandle   (vfs/read.go)            只读，分块流式
+    ├──► WriteFileHandle  (vfs/write.go)           只写，io.Pipe 直传
+    └──► RWFileHandle     (vfs/read_write.go)      读写，落本地缓存
+                │
+                └──► vfscache.Item        (vfs/vfscache/item.go)    本地磁盘缓存
+                        └──► vfscache.writeback  (vfs/vfscache/writeback/writeback.go)  异步写回队列
+    │
+    ├──► vfs.Dir  (vfs/dir.go)            目录缓存 + 虚拟条目
+    │
+    └──► fs.Fs    后端对象存储接口
 ```
 
-### 核心接口定义
+### 1.2 核心接口
 
-VFS 层定义了两个核心接口：
-
-1. **Node 接口** - 代表文件系统中的一个节点（文件或目录）
-   - 定义在 [vfs.go:58-72](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfs.go#L58-L72)
-   - 包含 `IsFile()`、`Inode()`、`Open()`、`Remove()` 等方法
-
-2. **Handle 接口** - 代表一个打开的文件或目录句柄
-   - 定义在 [vfs.go:128-137](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfs.go#L128-L137)
-   - 扩展了标准的 `OsFiler` 接口，增加了 `Flush()`、`Release()`、`Lock()` 等 FUSE 所需方法
-
-### VFS 结构体
-
-VFS 结构体是整个虚拟文件系统的根，定义在 [vfs.go:178-191](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfs.go#L178-L191)：
+`Node` 是文件/目录的统一抽象，定义在 `vfs/vfs.go#L58-L72`：
 
 ```go
-type VFS struct {
-    f           fs.Fs                // 后端文件系统
-    ctx         context.Context      // 上下文
-    root        *Dir                 // 根目录
-    Opt         vfscommon.Options    // 配置选项
-    cache       *vfscache.Cache      // 磁盘缓存
-    pollChan    chan time.Duration   // 变更通知通道
-    inUse       atomic.Int32         // 打开计数
+type Node interface {
+    os.FileInfo
+    IsFile() bool
+    Inode() uint64
+    Open(flags int) (Handle, error)   // 打开文件/目录的统一入口
+    SetModTime(modTime time.Time) error
+    Sync() error
+    Remove() error
+    Path() string
+    // ...
 }
 ```
+
+`Handle` 接口在 `vfs/vfs.go#L128-L137` 定义，聚合了 `*os.File` 的全部方法并增加 `Flush()`/`Release()` 等 FUSE 必需回调。`baseHandle`（`vfs/vfs.go#L139-L163`）为所有未实现方法返回 `ENOSYS`，使具体句柄只需实现自己支持的部分。
+
+### 1.3 VFS 结构体
+
+`VFS` 顶层结构体见 `vfs/vfs.go#L178-L191`，关键字段：
+
+| 字段 | 含义 | 来源 |
+| --- | --- | --- |
+| `f fs.Fs` | 后端文件系统 | `vfs/vfs.go#L179` |
+| `root *Dir` | 根目录节点 | `vfs/vfs.go#L181` |
+| `Opt vfscommon.Options` | VFS 配置 | `vfs/vfs.go#L182` |
+| `cache *vfscache.Cache` | 磁盘缓存（`CacheMode>Off` 时启用） | `vfs/vfs.go#L183` |
+| `pollChan chan time.Duration` | 变更通知通道 | `vfs/vfs.go#L189` |
+| `inUse atomic.Int32` | 打开计数，用于复用/回收 | `vfs/vfs.go#L190` |
+
+`New()`（`vfs/vfs.go#L205-L284`）创建根目录、按 `CacheMode` 调用 `SetCacheMode()`（`vfs/vfs.go#L362-L378`）初始化磁盘缓存，并在后端支持 `ChangeNotify` 时注册回调（`vfs/vfs.go#L249-L255`）。
 
 ---
 
 ## 二、打开文件机制
 
-### 2.1 打开文件的完整流程
+打开文件是 VFS 的核心调度逻辑：根据 `flags` 推断读/写意图，再按 `CacheMode` 选择三种句柄之一。整个调度集中在 `File.Open()`。
 
-文件打开操作从 `VFS.OpenFile()` 开始，定义在 [vfs.go:562-588](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfs.go#L562-L588)：
+### 2.1 入口：VFS.OpenFile()
 
-```
-用户调用 open()
-    ↓
-VFS.OpenFile(name, flags, perm)
-    ├─ 解析并验证打开标志
-    ├─ VFS.Stat(name) → 查找节点
-    │   └─ 从根目录逐层查找
-    ├─ 如文件不存在且设置了 O_CREATE
-    │   └─ VFS.StatParent(name)
-    │       └─ Dir.Create(leaf, flags)
-    └─ node.Open(flags) → 根据缓存模式选择不同的句柄类型
-```
+`VFS.OpenFile()` 位于 `vfs/vfs.go#L562-L588`，负责路径解析与创建：
 
-### 2.2 三种文件句柄类型
-
-根据缓存模式和打开标志，`File.Open()` 会返回三种不同类型的句柄，定义在 [file.go:892-922](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/file.go#L892-L922)：
-
-| 句柄类型 | 适用场景 | 缓存模式要求 | 特点 |
-|---------|---------|-------------|------|
-| `ReadFileHandle` | 只读打开 | CacheMode < Full | 直接从远程流式读取，支持分块读取和重试 |
-| `WriteFileHandle` | 只写打开 | CacheMode < Writes | 通过 pipe 直接写入远程，不支持随机写 |
-| `RWFileHandle` | 读写打开 | CacheMode >= Minimal | 使用本地临时文件作为缓存，支持随机读写 |
-
-#### 2.2.1 ReadFileHandle - 只读句柄
-
-定义在 [read.go:20-37](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/read.go#L20-L37)
-
-**关键特性：**
-- 使用 `chunkedreader` 实现分块读取和并发流
-- 支持 `RangeSeek` 接口进行高效随机访问
-- 内置哈希校验确保数据完整性
-- 顺序读取等待机制：当检测到顺序读取时，会等待前面的读取完成（`waitSequential`）
-- 低级别重试机制：遇到错误时自动重试
-
-**打开流程：**
-```
-newReadFileHandle(f)
-    ↓
-openPending() → 延迟打开（第一次读取时才真正打开）
-    ├─ chunkedreader.New(o, ChunkSize, ChunkSizeLimit, ChunkStreams)
-    └─ accounting.Stats.NewTransfer → 统计传输
+```go
+func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, err error) {
+    // O_RDONLY + O_TRUNC 未定义行为，rclone 返回 EINVAL
+    if flags&accessModeMask == os.O_RDONLY && flags&os.O_TRUNC != 0 {
+        return nil, EINVAL
+    }
+    node, err := vfs.Stat(name)            // vfs/vfs.go#L483-L508 逐级 Stat
+    if err != nil {
+        if err != ENOENT || flags&os.O_CREATE == 0 {
+            return nil, err
+        }
+        // 不存在但带 O_CREATE → 先在父目录创建 File 节点
+        dir, leaf, err := vfs.StatParent(name)
+        node, err = dir.Create(leaf, flags) // vfs/dir.go#L1035-L1063
+    }
+    return node.Open(flags)                // 进入 File.Open()
+}
 ```
 
-#### 2.2.2 WriteFileHandle - 只写句柄
+`VFS.Open()`（`vfs/vfs.go#L593-L595`）与 `VFS.Create()`（`vfs/vfs.go#L601-L603`）都是它的薄包装。
 
-定义在 [write.go:14-29](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/write.go#L14-L29)
+### 2.2 句柄选择：File.Open()
 
-**关键特性：**
-- 使用 `io.Pipe` 实现流式写入
-- 通过 `operations.Rcat` 直接上传到远程
-- **不支持随机写**（只能顺序写入）
-- **不支持读取**（会返回 EPERM 错误）
-- 关闭时等待上传完成
+完整调度逻辑在 `vfs/file.go#L834-L929`。
 
-**打开流程：**
-```
-newWriteFileHandle(d, f, remote, flags)
-    ↓
-openPending() → 创建 pipe 并启动上传 goroutine
-    ├─ io.Pipe() → 创建读写管道
-    ├─ go operations.Rcat(pipeReader) → 后台上传
-    └─ file.setSize(0) → 重置文件大小
-```
+**阶段 1：解析 flags，确定读/写意图**（`vfs/file.go#L859-L889`）
 
-#### 2.2.3 RWFileHandle - 读写句柄
-
-定义在 [read_write.go:18-31](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/read_write.go#L18-L31)
-
-**关键特性：**
-- 使用本地磁盘文件作为缓存（`vfscache.Item`）
-- 支持完整的随机读写（ReadAt/WriteAt）
-- 支持文件截断（Truncate）
-- 关闭时异步或同步写回远程
-
-**打开流程：**
-```
-newRWFileHandle(d, f, flags)
-    ├─ cache.Item(CachePath) → 获取或创建缓存项
-    ├─ 检查 O_CREATE/O_EXCL 标志
-    ├─ 如需要则截断文件
-    └─ file.addWriter(fh) → 注册写入器
+```go
+switch {
+case rdwrMode == os.O_RDONLY:
+    read = true
+case rdwrMode == os.O_WRONLY:
+    write = true
+case rdwrMode == os.O_RDWR:
+    read = true
+    write = true
+}
+// O_APPEND 强制 read=true：追加写入前需要定位到文件末尾，需 RW 句柄
+if flags&os.O_APPEND != 0 { read = true; f.appendMode = true }
+// O_TRUNC / O_CREATE 强制 write=true
+if flags&os.O_TRUNC != 0  { write = true }
+if flags&os.O_CREATE != 0 { write = true }
 ```
 
-### 2.3 缓存模式与句柄选择
+设计要点：
+- `O_APPEND` 升级为读写模式，因为追加前必须知道当前大小（见 `RWFileHandle._writeAt` 的 `vfs/read_write.go#L340-L346`）。
+- `O_TRUNC`/`O_CREATE` 强制写权限，确保后续路径能创建/截断文件。
 
-缓存模式定义在 [vfscommon/cachemode.go:23-28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/cachemode.go#L23-L28)：
+**阶段 2：句柄类型选择**（`vfs/file.go#L891-L922`）
 
-| 缓存模式 | 值 | 行为 |
-|---------|----|------|
-| `CacheModeOff` | 0 | 无缓存，直接读写远程。不支持随机写，可能需要 `--vfs-cache-mode writes` |
-| `CacheModeMinimal` | 1 | 仅缓存读写打开的文件。只读和只写文件直接传输 |
-| `CacheModeWrites` | 2 | 缓存所有写入文件。只读文件直接读取 |
-| `CacheModeFull` | 3 | 缓存所有文件。读写都通过本地缓存 |
+```go
+CacheMode := d.vfs.Opt.CacheMode
+// 优先级 1：缓存中已有该文件（InUse 或 Exists）→ 强制 RW
+if CacheMode >= vfscommon.CacheModeMinimal &&
+    (d.vfs.cache.InUse(f.CachePath()) || d.vfs.cache.Exists(f.CachePath())) {
+    fd, err = f.openRW(flags)
+// 优先级 2：同时读 + 写
+} else if read && write {
+    if CacheMode >= vfscommon.CacheModeMinimal { fd, err = f.openRW(flags) }
+    else                                       { fd, err = f.openWrite(flags) }
+// 优先级 3：只写
+} else if write {
+    if CacheMode >= vfscommon.CacheModeWrites  { fd, err = f.openRW(flags) }
+    else                                       { fd, err = f.openWrite(flags) }
+// 优先级 4：只读
+} else if read {
+    if CacheMode >= vfscommon.CacheModeFull     { fd, err = f.openRW(flags) }
+    else                                       { fd, err = f.openRead() }
+}
+```
 
-句柄选择逻辑在 [file.go:896-919](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/file.go#L896-L919)。
+`CacheMode` 四档定义于 `vfs/vfscommon/cachemode.go#L23-L28`：`Off / Minimal / Writes / Full`。决策矩阵：
+
+| flags 意图 | CacheMode=Off | Minimal | Writes | Full |
+| --- | --- | --- | --- | --- |
+| 只读 | Read | Read | Read | RW |
+| 只写 | Write | Write | RW | RW |
+| 读写 | Write* | RW | RW | RW |
+| 缓存中已存在 | 按上表 | RW(强制) | RW(强制) | RW(强制) |
+
+\* `CacheMode=Off` 下读写会退化为 `WriteFileHandle`，读操作返回 `EPERM`（`vfs/write.go#L305-L317`）。
+
+若 `flags` 含 `O_CREATE`，最后调用 `d.addObject(f)`（`vfs/file.go#L924-L927`）把新文件作为虚拟条目加入目录缓存（见第三章）。
+
+### 2.3 ReadFileHandle：只读句柄
+
+结构体定义于 `vfs/read.go#L20-L37`，构造函数 `newReadFileHandle()` 在 `vfs/read.go#L47-L69`。
+
+```go
+type ReadFileHandle struct {
+    baseHandle
+    r           *accounting.Account  // 底层 reader，带统计与限速
+    offset      int64                // 当前读偏移
+    size        int64                // 对象大小（0 表未知长度）
+    cond        sync.Cond            // 顺序读等待条件变量
+    hash        *hash.MultiHasher    // 哈希校验器
+    noSeek      bool                 // 是否禁止 seek
+    sizeUnknown bool                 // 源大小未知（流式场景）
+}
+```
+
+**延迟打开（Lazy Open）**：`openPending()` 在首次 `Read()` 时才建立连接，见 `vfs/read.go#L73-L89`：
+
+```go
+func (fh *ReadFileHandle) openPending() (err error) {
+    if fh.opened { return nil }
+    o := fh.file.getObject()
+    opt := &fh.file.VFS().Opt
+    // 关键：chunkedreader 分块 + 并发流读取
+    r, err := chunkedreader.New(fh.file.ctx, o,
+        int64(opt.ChunkSize),       // 单 chunk 大小，默认 128M（vfs/vfscommon/options.go#L80）
+        int64(opt.ChunkSizeLimit),  // chunk 上限
+        opt.ChunkStreams,           // 并发流数
+    ).Open()
+    tr := accounting.GlobalStats().NewTransfer(o, nil)
+    fh.r = tr.Account(fh.file.ctx, r).WithBuffer()  // 统计 + 预读缓冲
+    fh.opened = true
+    return nil
+}
+```
+
+**顺序读优化**：`readAt()`（`vfs/read.go#L257-L346`）在偏移落在「顺序窗口」内时调用 `waitSequential()`（`vfs/read.go#L224-L254`）阻塞等待，避免并发 Range 请求互相抢占；超时（`ReadWait` 默认 20ms，`vfs/vfscommon/options.go#L125`）后再 seek。
+
+**Seek 实现**：`seek()`（`vfs/read.go#L116-L168`）优先尝试缓冲丢弃（`SkipBytes`），失败则停止缓冲并用 `RangeSeek` 重新打开。
+
+**哈希校验**：`checkHash()`（`vfs/read.go#L348-L370`）在读完整个对象后比对本地与远端哈希，不一致则报「corrupted on transfer」。
+
+### 2.4 WriteFileHandle：只写句柄
+
+结构体定义于 `vfs/write.go#L14-L29`，构造函数 `newWriteFileHandle()` 在 `vfs/write.go#L38-L51`。核心设计：**`io.Pipe` 直接流式上传，不落本地磁盘**。
+
+**安全检查**：`safeToTruncate()`（`vfs/write.go#L54-L56`）确保只有 `O_TRUNC` 或新文件才能被覆写，否则 `openPending` 返回 `EPERM`（`vfs/write.go#L61-L87`）：
+
+```go
+func (fh *WriteFileHandle) openPending() (err error) {
+    if fh.opened { return nil }
+    if !fh.safeToTruncate() {
+        return EPERM  // "Can't open for write without O_TRUNC ..."
+    }
+    var pipeReader *io.PipeReader
+    pipeReader, fh.pipeWriter = io.Pipe()
+    go func() {
+        // operations.Rcat 处理分片、并发、统计等全部上传逻辑
+        o, err := operations.Rcat(fh.file.ctx, fh.file.Fs(), fh.remote,
+            pipeReader, time.Now(), nil)
+        fh.o = o
+        fh.result <- err  // 通过 channel 返回上传结果
+    }()
+    fh.file.setSize(0)
+    fh.truncated = true
+    fh.opened = true
+    return nil
+}
+```
+
+**WriteAt 约束**（`vfs/write.go#L128-L155`）：只能按 `offset` 递增顺序写；非顺序写先用 `waitSequential()`（`WriteWait` 默认 1000ms，`vfs/vfscommon/options.go#L120`）等待，仍不匹配则返回 `ESPIPE`。
+
+**Close 流程**（`vfs/write.go#L187-L213`）：关闭 `pipeWriter` → 阻塞等待 `result` channel（即上传完成）→ `setObject` 更新目录中的对象引用。若上传失败且对象为 nil，调用 `File.Remove()` 清理虚拟条目。
+
+### 2.5 RWFileHandle：读写句柄
+
+结构体定义于 `vfs/read_write.go#L18-L31`，是唯一支持完整随机读写的句柄。所有读写都落到 `vfscache.Item` 代表的本地磁盘文件。
+
+**构造时与缓存层对接**（`vfs/read_write.go#L43-L77`）：
+
+```go
+func newRWFileHandle(d *Dir, f *File, flags int) (fh *RWFileHandle, err error) {
+    item := d.vfs.cache.Item(f.CachePath())          // 获取/创建缓存项
+    exists := f.exists() || (item.Exists() && !item.WrittenBack())
+    if flags&(os.O_CREATE|os.O_EXCL) == os.O_CREATE|os.O_EXCL && exists {
+        return nil, EEXIST                            // O_CREATE|O_EXCL 但已存在
+    }
+    fh = &RWFileHandle{file: f, d: d, flags: flags, item: item}
+    // O_TRUNC 或 O_CREATE+不存在 → 立即截断并标记脏（确保空文件也能被上传）
+    if !fh.readOnly() && (fh.flags&os.O_TRUNC != 0 || (fh.flags&os.O_CREATE != 0 && !exists)) {
+        err = fh.Truncate(0)
+        item.Dirty()                                  // vfs/vfscache/item.go#L450-L456
+    }
+    if !fh.readOnly() {
+        fh.file.addWriter(fh)                         // vfs/file.go#L330-L335
+    }
+    return fh, nil
+}
+```
+
+**延迟打开**（`vfs/read_write.go#L92-L117`）：`openPending()` 持有 `file.muRW` 后调用 `item.Open(o)`，可能触发从后端下载到本地缓存（见第四章）。
+
+**写入流程**：`_writeAt()`（`vfs/read_write.go#L329-L362`）→ `item.WriteAt()`（`vfs/vfscache/item.go#L1378-L1411`）→ 写本地磁盘 → `item._dirty()` 标记脏。
+
+**关闭流程**：`close()`（`vfs/read_write.go#L156-L180`）→ `item.Close(setObject)`，由 Item 内部决定同步/异步写回（见第四章）。
+
+### 2.6 三种句柄对比
+
+| 特性 | ReadFileHandle | WriteFileHandle | RWFileHandle |
+| --- | --- | --- | --- |
+| 数据位置 | 内存缓冲 + 后端流 | `io.Pipe` 直传 | 本地磁盘文件 |
+| 随机读 | 支持（Range） | 不支持（`EPERM`） | 支持 |
+| 随机写 | 不支持 | 顺序写 | 完全支持 |
+| Truncate | 不适用 | 仅打开时 | 任意时刻 |
+| 打开延迟 | 低 | 低 | 可能高（需下载） |
+| 内存占用 | `ChunkSize×流数` | 上传缓冲 | 低（仅 fd） |
+| 适用场景 | 大文件顺序读、流媒体 | 一次性写新文件 | 数据库、随机修改 |
 
 ---
 
 ## 三、目录缓存实现
 
-### 3.1 目录缓存结构
+目录缓存的目标：**减少远程 List API 调用** + **在刷新前列表前保持本地修改可见**。实现集中在 `vfs.Dir`。
 
-目录缓存存储在 `Dir.items` 中，定义在 [dir.go:37](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/dir.go#L37)：
+### 3.1 数据结构
+
+`Dir` 结构体定义于 `vfs/dir.go#L26-L45`：
 
 ```go
 type Dir struct {
-    // ...
-    items   map[string]Node   // 目录条目缓存
-    virtual map[string]vState // 虚拟目录条目（本地修改未同步）
-    read    time.Time         // 上次读取时间
-    // ...
+    vfs          *VFS
+    f            fs.Fs
+    cleanupTimer *time.Timer   // 缓存过期清理定时器
+    mu      sync.RWMutex
+    parent  *Dir
+    path    string
+    read    time.Time         // 上次从后端读取时间
+    items   map[string]Node   // ★ 目录条目缓存（核心）
+    virtual map[string]vState // ★ 虚拟条目状态表
+    _virtuals atomic.Int32    // 本目录+子目录虚拟条目数
 }
 ```
 
-### 3.2 目录读取流程
+**虚拟条目状态**（`vfs/dir.go#L49-L57`）：
 
-目录读取的核心是 `Dir._readDir()`，定义在 [dir.go:532-587](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/dir.go#L532-L587)：
-
-```
-Dir.Stat(name) / Dir.ReadDirAll()
-    ↓
-Dir._readDir() → 带缓存的目录读取
-    ├─ 检查缓存是否过期（_age()）
-    │   └─ 缓存时间由 DirCacheTime 控制（默认 5 分钟）
-    ├─ 如缓存过期，调用 list.DirSorted() 从远程读取
-    ├─ 处理 Unicode 规范化重复（BlockNormDupes）
-    └─ Dir._readDirFromEntries() → 解析条目并更新缓存
-        ├─ manageVirtuals.add() → 处理虚拟条目
-        ├─ 复用已存在的 Node（避免重新创建）
-        └─ manageVirtuals.end() → 清理缺失条目
+```go
+type vState byte
+const (
+    vOK      vState = iota // 正常条目（来自后端）
+    vAddFile               // 本地新增的文件
+    vAddDir                // 本地新增的目录
+    vDel                   // 本地删除的条目
+)
 ```
 
-### 3.3 虚拟条目机制
+设计意图：`virtual` 表解决「本地 `mkdir`/`create`/`delete` 后，下一次 List 结果尚未合并」的一致性问题——本地修改先以虚拟状态记下，等下次 List 合并时再升级或清除。
 
-为了在远程目录列表刷新前保持本地修改的可见性，VFS 使用了**虚拟条目**机制。
+### 3.2 缓存有效性与过期
 
-虚拟条目状态定义在 [dir.go:52-57](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/dir.go#L52-L57)：
+**年龄判断**：`_age()`（`vfs/dir.go#L360-L367`）返回距上次读取的时长及是否过期（超过 `DirCacheTime`，默认 5 分钟，`vfs/vfscommon/options.go#L30`）。
 
-| 状态 | 含义 |
-|------|------|
-| `vOK` | 正常条目（非虚拟） |
-| `vAddFile` | 新增文件（本地添加，未从远程列表看到） |
-| `vAddDir` | 新增目录（本地添加，未从远程列表看到） |
-| `vDel` | 删除条目（本地删除，远程列表仍存在） |
+**定时清理**：`newDir()`（`vfs/dir.go#L59-L75`）创建 `cleanupTimer`，到期触发 `cacheCleanup()`（`vfs/dir.go#L77-L92`）；若过期则 `ForgetAll()`（`vfs/dir.go#L224-L258`）。
 
-**虚拟条目的生命周期：**
-1. 本地创建/删除文件时，添加对应虚拟条目
-2. 下一次目录列表刷新时，`manageVirtuals` 协调虚拟条目和真实条目
-3. 当真实列表中出现对应条目时，虚拟条目被清除
-4. `_purgeVirtual()` 定期清理不再需要的虚拟条目
+**读取触发**：`_readDir()`（`vfs/dir.go#L532-L587`）在 `_age()` 判定过期时才调用 `list.DirSorted()` 拉取后端列表，否则直接返回缓存。读取成功后重置 `d.read` 与 `cleanupTimer`（`vfs/dir.go#L583-L584`）。
 
-### 3.4 缓存有效性管理
+**变更通知**：`VFS.New()` 在后端支持 `ChangeNotify` 时注册 `Dir.changeNotify()`（`vfs/dir.go#L290-L299`），收到变更即 `invalidateDir()`（`vfs/dir.go#L274-L284`）将 `read` 置零；否则用 `PollInterval`（默认 1 分钟）轮询（`vfs/vfs.go#L249-L255`）。
 
-#### 缓存过期检查
-`Dir._age()` 定义在 [dir.go:360-367](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/dir.go#L360-L367)：
-- 如果 `read` 为零值，视为已过期
-- 超过 `DirCacheTime`（默认 5 分钟）视为过期
+### 3.3 目录读取与合并：_readDirFromEntries()
 
-#### 缓存刷新
-- 定期自动刷新：`cleanupTimer` 每 `DirCacheTime * 2` 触发一次
-- 手动刷新：`Dir.ForgetAll()`、`VFS.FlushDirCache()`
-- SIGHUP 信号：收到 SIGHUP 时刷新整个目录缓存
+将后端 `fs.DirEntries` 合并到缓存的核心算法在 `vfs/dir.go#L732-L787`：
 
-#### 变更通知
-如果后端支持 `ChangeNotify` 特性（定义在 [vfs.go:249-255](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfs.go#L249-L255)）：
-- 远程变更会触发 `Dir.changeNotify()`
-- 自动失效相关目录的缓存
+```go
+func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time) error {
+    mv := d._newManageVirtuals()                 // 先清理过期虚拟条目
+    for _, entry := range entries {
+        name := path.Base(entry.Remote())
+        node := d.items[name]
+        if mv.add(d, name) { continue }         // vDel 条目从列表中跳过
+        switch item := entry.(type) {
+        case fs.Object:
+            // 尽可能复用已有 *File，保留 inode 不变
+            if file, ok := node.(*File); node != nil && ok {
+                file.setObjectNoUpdate(item)     // vfs/file.go#L558-L565
+            } else {
+                node = newFile(d, d.path, item, name)
+            }
+        case fs.Directory:
+            if node == nil || !node.IsDir() {
+                node = newDir(d.vfs, d.f, d, item)
+            }
+            // 递归更新子目录...
+        }
+        d.items[name] = node
+    }
+    mv.end(d)                                    // 收尾清理
+    return nil
+}
+```
+
+### 3.4 虚拟条目合并：manageVirtuals
+
+`manageVirtuals` 是 `_readDirFromEntries` 生命周期内的辅助结构，定义于 `vfs/dir.go#L661-L728`。
+
+**`mv.add()` — 逐条处理后端条目**（`vfs/dir.go#L681-L696`）：
+
+```go
+func (mv manageVirtuals) add(d *Dir, name string) bool {
+    mv[name] = struct{}{}                        // 记录该名出现在后端列表
+    switch d.virtual[name] {
+    case vAddFile, vAddDir:
+        d._deleteVirtual(name)                  // 后端已确认 → 升级为真实条目
+    case vDel:
+        return true                             // 本地已删除 → 跳过
+    }
+    return false
+}
+```
+
+**`mv.end()` — 处理后端未列出的旧条目**（`vfs/dir.go#L702-L728`）：
+
+```go
+func (mv manageVirtuals) end(d *Dir) {
+    // Part A：清理 d.items 中在后端消失的条目
+    for name := range d.items {
+        if _, ok := mv[name]; !ok {
+            switch d.virtual[name] {
+            case vAddFile, vAddDir:
+                // 虚拟新增项后端还没看到 → 保留
+            default:
+                delete(d.items, name)           // 后端删除 → 同步删除
+            }
+        }
+    }
+    // Part B：清理已确认的 vDel 虚拟标记
+    for name, virtualState := range d.virtual {
+        if _, ok := mv[name]; !ok {
+            if virtualState == vDel {
+                d._deleteVirtual(name)
+            }
+        }
+    }
+}
+```
+
+**`_purgeVirtual()`**（`vfs/dir.go#L620-L659`）在每次读取前清理可清除的虚拟条目：`vAddDir` 在后端支持空目录时清除；`vAddFile` 在上传完成且未使用时清除；正在写入/缓存中的保留。
+
+### 3.5 本地修改如何写入虚拟表
+
+- **新增文件**：`Dir.addObject()`（`vfs/dir.go#L445-L462`）将节点加入 `items` 并标记 `vAddFile`/`vAddDir`，同时 `addVirtual(1)`（`vfs/dir.go#L210-L215`）累加父链计数。
+- **缓存层注入**：`VFS.AddVirtual()`（`vfs/vfs.go#L846-L862`）→ `Dir.AddVirtual()`（`vfs/dir.go#L471-L500`），让正在上传的文件在目录中可见。
+- **删除条目**：`Dir.delObject()`（`vfs/dir.go#L506-L518`）标记 `vDel`，直到下次 List 确认远端确无此项。
+
+这样，挂载侧 `readdir` 看到的永远是「后端列表 ∪ 本地修改 − 本地删除」的合并视图。
 
 ---
 
 ## 四、写回策略实现
 
-写回策略是 VFS 缓存层的核心功能，由 `vfscache` 包实现。
+写回策略由 `vfscache` 包实现：脏数据标记 → 延迟写回队列 → 异步上传 → 缓存清理。它支撑了「关闭即返回、后台同步」的体验。
 
 ### 4.1 缓存项结构
 
-每个缓存文件对应一个 `Item`，定义在 [vfscache/item.go:56-72](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/item.go#L56-L72)：
+`Item` 定义于 `vfs/vfscache/item.go#L56-L72`：
 
 ```go
 type Item struct {
-    name        string              // VFS 中的路径
-    opens       int                 // 打开计数
-    fd          *os.File            // 本地文件句柄
-    info        Info                // 持久化元数据
-    writeBackID writeback.Handle    // 写回队列 ID
-    // ...
-}
-
-type Info struct {
-    ModTime     time.Time     // 修改时间
-    ATime       time.Time     // 访问时间
-    Size        int64         // 文件大小
-    Rs          ranges.Ranges // 已缓存的块范围
-    Fingerprint string        // 远程对象指纹
-    Dirty       bool          // 是否需要写回
+    c               *Cache
+    mu              sync.Mutex
+    cond            sync.Cond              // 与 cache cleaner 同步
+    name            string                 // VFS 中的名字
+    opens           int                    // 打开计数
+    downloaders     *downloaders.Downloaders
+    o               fs.Object             // 远端对象，可能为 nil
+    fd              *os.File               // 本地缓存文件句柄
+    info            Info                   // 持久化元数据
+    writeBackID     writeback.Handle       // 写回队列中的 ID
+    pendingAccesses int                    // 正在访问的线程数（保护 reset）
+    modified        bool                   // 自上次 Open 以来是否修改
+    graceTimer      *time.Timer            // 延迟关闭宽限定时器
 }
 ```
 
-### 4.2 脏数据标记
+`Info`（`vfs/vfscache/item.go#L75-L82`）持久化到磁盘，含 `ModTime`/`ATime`/`Size`/`Rs`（已缓存区间）/`Fingerprint`/`Dirty`。锁顺序约定见文件头注释（`vfs/vfscache/item.go#L22-L52`）：`Cache.mu` → `Item.mu`，`downloaders.mu`/`writeback.mu` 在 `Item.mu` 之前。
 
-当文件被修改时，通过 `Item._dirty()` 标记为脏，定义在 [vfscache/item.go:431-447](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/item.go#L431-L447)：
+### 4.2 脏数据标记：_dirty()
+
+`_dirty()`（`vfs/vfscache/item.go#L431-L447`）是写回的起点：
 
 ```go
 func (item *Item) _dirty() {
     item.info.ModTime = time.Now()
     item.info.ATime = item.info.ModTime
+    if !item.modified {
+        item.modified = true
+        item.mu.Unlock()
+        item.c.writeback.Remove(item.writeBackID)  // 重新计时：先取消旧写回
+        item.mu.Lock()
+    }
     if !item.info.Dirty {
         item.info.Dirty = true
-        _ = item._save() // 保存元数据到磁盘
+        err := item._save()                        // 立即持久化元数据，支持断点续传
+        if err != nil { /* ... */ }
     }
 }
 ```
 
-### 4.3 写回队列
+每次 `Item.WriteAt()`（`vfs/vfscache/item.go#L1378-L1411`）写入成功后调用 `_dirty()`。注意 `_dirty()` 会先 `Remove` 旧写回任务再由后续 `Close` 重新入队，实现「每次修改都重置延迟计时」。
 
-写回队列由 `WriteBack` 结构体管理，定义在 [vfscache/writeback/writeback.go:29-41](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/writeback/writeback.go#L29-L41)：
+### 4.3 打开缓存文件：Item.Open()
+
+`Open()`（`vfs/vfscache/item.go#L498-L514`）带低层重试与 ENOSPC 恢复，核心在 `open()`（`vfs/vfscache/item.go#L518-L602`）：
+
+1. `createItemDir()` 建目录，`_checkObject(o)`（`vfs/vfscache/item.go#L862-L905`）比对远端指纹，远端变化且本地非脏则丢弃缓存。
+2. `opens++`，引用计数；首次打开时 `_createFile()`（`vfs/vfscache/item.go#L467-L494`）创建/打开本地文件并 `_save()` 元数据。
+3. `c.put()` 把 Item 放回 Cache map（防止被清理误删）。
+4. 若 `item.o != nil`，创建 `downloaders` 负责按需下载缺失区间。
+
+宽限机制：`opens==0` 且非脏时，`Close()`（`vfs/vfscache/item.go#L674-L700`）启动 `graceTimer`（`HandleCaching` 默认 5s，`vfs/vfscommon/options.go#L170`），到期由 `closeAfterGrace()`（`vfs/vfscache/item.go#L706-L721`）真正关闭；期间重新打开可直接复用 fd（`vfs/vfscache/item.go#L540-L564`）。
+
+### 4.4 关闭与写回触发：_actualClose()
+
+`_actualClose()`（`vfs/vfscache/item.go#L726-L814`）是写回的核心调度：
 
 ```go
-type WriteBack struct {
-    items   writeBackItems   // 优先级队列（按过期时间排序）
-    lookup  map[Handle]*writeBackItem
-    timer   *time.Timer      // 下一次写回定时器
-    uploads int              // 正在进行的上传数
+func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) {
+    _, _ = item._getSize()
+    // 脏文件关闭前补齐未下载区间（确保上传的是完整文件）
+    if item.info.Dirty && item.o != nil {
+        err = item._ensure(0, item.info.Size)     // vfs/vfscache/item.go#L1207-L1247
+    }
+    // 关闭 downloaders 与 fd，保存元数据
+    // ...
+    if item.info.Dirty {
+        if syncWriteBack {
+            item._store(item.c.ctx, storeFn)      // 同步上传
+        } else {
+            // 异步：加入写回队列
+            item.c.writeback.SetID(&item.writeBackID)
+            id := item.writeBackID
+            item.c.writeback.Add(id, item.name, item.info.Size, item.modified,
+                func(ctx context.Context) error {
+                    return item.store(ctx, storeFn)  // vfs/vfscache/item.go#L667-L671
+                })
+        }
+    }
+    item.modified = false
+    return err
 }
 ```
 
-### 4.4 写回触发时机
+同步/异步由 `syncWriteBack := item.c.opt.WriteBack <= 0` 决定（`vfs/vfscache/item.go#L678`）。默认 `WriteBack=5s`（`vfs/vfscommon/options.go#L130`）即异步写回。
 
-写回有两种模式，由 `WriteBack` 选项控制（默认 5 秒）：
+### 4.5 上传执行：Item._store()
 
-#### 同步写回（WriteBack <= 0）
-在 `Item.Close()` 时立即上传，定义在 [vfscache/item.go:678-679](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/item.go#L678-L679)：
+`_store()`（`vfs/vfscache/item.go#L617-L663`）：
+
 ```go
-if syncWriteBack {
-    checkErr(item._store(item.c.ctx, storeFn))
+func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
+    cacheObj, err := item.c.fcache.NewObject(ctx, item.name)  // 取本地缓存文件对象
+    if cacheObj != nil {
+        o, name := item.o, item.name
+        unlockMutexForCall(&item.mu, func() {
+            o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)  // 上传到远端
+        })
+        item.o = o
+        item._updateFingerprint()                              // 更新指纹
+    }
+    // 写回 VFS 层（更新目录条目的对象引用），必须在标记 clean 之前
+    if storeFn != nil && item.o != nil {
+        o := item.o
+        item.mu.Unlock()
+        storeFn(o)                                              // 即 File.setObject
+        item.mu.Lock()
+    }
+    item.info.Dirty = false                                    // 标记已干净，可被清理
+    err = item._save()
+    return nil
 }
 ```
 
-#### 异步写回（WriteBack > 0）
-关闭时加入写回队列，延迟上传，定义在 [vfscache/item.go:794-806](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/item.go#L794-L806)：
+### 4.6 写回队列：writeback.WriteBack
+
+`WriteBack` 定义于 `vfs/vfscache/writeback/writeback.go#L29-L41`，用最小堆（`writeBackItems`，`vfs/vfscache/writeback/writeback.go#L81-L115`）按 `expiry` 排序，`Less()` 见 `vfs/vfscache/writeback/writeback.go#L85-L92`。
+
+**入队 / 重置计时**：`Add()`（`vfs/vfscache/writeback/writeback.go#L259-L278`）：
 
 ```go
-// 在 _actualClose 中
-item.c.writeback.SetID(&item.writeBackID)
-id := item.writeBackID
-item.c.writeback.Add(id, item.name, item.info.Size, item.modified, 
-    func(ctx context.Context) error {
-        return item.store(ctx, storeFn)
-    })
-```
-
-### 4.5 写回执行流程
-
-```
-定时器到期或手动触发
-    ↓
-WriteBack.processItems(ctx)
-    ├─ 从优先级队列取出过期的 item
-    ├─ 检查并发上传数（受 --transfers 限制）
-    ├─ 标记为 uploading 状态
-    └─ go WriteBack.upload(ctx, wbItem)
-        ├─ 调用 putFn(ctx) → Item._store()
-        │   ├─ operations.Copy() → 上传到远程
-        │   ├─ 更新 item.o 为新的远程对象
-        │   ├─ item.info.Dirty = false → 清除脏标记
-        │   └─ item._save() → 保存元数据
-        ├─ 成功：从 lookup 中删除
-        └─ 失败：指数退避重试（delay *= 2，最大 5 分钟）
-```
-
-### 4.6 缓存清理策略
-
-缓存清理由后台 goroutine 定期执行，定义在 [vfscache/cache.go:844-866](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/cache.go#L844-L866)：
-
-#### 清理流程：
-1. **purgeOld**：删除超过 `CacheMaxAge`（默认 1 小时）未访问的文件
-2. **purgeOverQuota**：如超过 `CacheMaxSize`，按访问时间删除最旧的未使用文件
-3. **purgeClean**：如仍超限，删除非脏文件（即使正在使用）
-4. **purgeEmptyDirs**：删除空目录
-
-#### 磁盘空间不足处理：
-- 写入时检测到 ENOSPC 错误，调用 `Cache.KickCleaner()`
-- 立即触发清理流程，等待清理完成后重试
-- 使用 `preAccess`/`postAccess` 机制防止清理时访问冲突
-
-### 4.7 元数据持久化
-
-每个缓存文件都有对应的元数据文件（JSON 格式），存储在 `vfsMeta/` 目录下：
-
-```json
-{
-    "ModTime": "2024-01-01T00:00:00Z",
-    "ATime": "2024-01-01T00:00:00Z",
-    "Size": 1048576,
-    "Rs": [{"Pos": 0, "Size": 1048576}],
-    "Fingerprint": "xxx",
-    "Dirty": false
+func (wb *WriteBack) Add(id Handle, name string, size int64, modified bool, putFn PutFn) Handle {
+    wbItem, ok := wb.lookup[id]
+    if !ok {
+        wbItem = wb._newItem(id, name, size)        // 新建，expiry = now + WriteBack
+    } else {
+        if wbItem.uploading && modified {
+            wb._cancelUpload(wbItem)                 // 正在上传则取消，稍后重试
+        }
+        wb.items._update(wbItem, wb._newExpiry())    // ★ 每次修改都重置延迟
+    }
+    wbItem.putFn = putFn
+    wb._resetTimer()                                 // 重排定时器
+    return wbItem.id
 }
 ```
+
+**到期处理**：定时器到期触发 `processItems()`（`vfs/vfscache/writeback/writeback.go#L427-L459`），弹出所有已过期项，受 `--transfers` 并发上限约束，逐个起 goroutine 调用 `upload()`。
+
+**上传与重试**：`upload()`（`vfs/vfscache/writeback/writeback.go#L346-L386`）：
+
+```go
+func (wb *WriteBack) upload(ctx context.Context, wbItem *writeBackItem) {
+    putFn := wbItem.putFn
+    wbItem.tries++
+    wb.mu.Unlock()
+    err := putFn(ctx)                       // 执行 item.store()
+    wb.mu.Lock()
+    wbItem.uploading = false
+    wb.uploads--
+    if err != nil {
+        wbItem.delay *= 2                   // 指数退避
+        if wbItem.delay > maxUploadDelay {  // maxUploadDelay = 5min（writeback.go#L19）
+            wbItem.delay = maxUploadDelay
+        }
+        wb._pushItem(wbItem)                // 重新入队等待重试
+        wb.items._update(wbItem, time.Now().Add(wbItem.delay))
+    } else {
+        wb._delItem(wbItem)                 // 成功 → 移出 lookup
+    }
+    wb._resetTimer()
+    close(wbItem.done)
+}
+```
+
+**取消与重命名**：`Remove()`/`_remove()`（`vfs/vfscache/writeback/writeback.go#L285-L310`）取消进行中的上传；`Rename()`（`vfs/vfscache/writeback/writeback.go#L315-L341`）更新名字并重排，同时移除同名旧任务。
+
+### 4.7 缓存清理：Cache.cleaner()
+
+后台清理 goroutine 在 `Cache.New()`（`vfs/vfscache/cache.go#L80-L151`）启动，循环体 `cleaner()`（`vfs/vfscache/cache.go#L846-L867`）：按 `CachePollInterval`（默认 60s，`vfs/vfscommon/options.go#L60`）定时，或被 `KickCleaner()`（`vfs/vfscache/cache.go#L566-L590`）在 ENOSPC 时唤醒。
+
+`clean()`（`vfs/vfscache/cache.go#L791-L841`）依次执行：
+
+1. **按年龄清理** `purgeOld()`（`vfs/vfscache/cache.go#L680-L691`）：调用 `Item.RemoveNotInUse()`（`vfs/vfscache/item.go#L973-L1007`），删除 `ATime` 早于 `CacheMaxAge`（默认 1 小时，`vfs/vfscommon/options.go#L65`）且未打开/非脏的项。
+2. **按配额清理** `purgeOverQuota()`（`vfs/vfscache/cache.go#L759-L788`）：按 `ATime` 排序，从最旧起删除未使用项直到满足 `CacheMaxSize`/`CacheMinFreeSpace`（`vfs/vfscache/cache.go#L720-L755`）。
+3. **紧急清理** `purgeClean()`（`vfs/vfscache/cache.go#L633-L677`）：仍超配额时对非脏项调用 `Item.Reset()`（`vfs/vfscache/item.go#L1011-L1141`）清空内容释放空间，但保留 fd 与元数据以便后续重建。
+4. **失败重试** `retryFailedResets()`（`vfs/vfscache/cache.go#L609-L630`）重做之前因 ENOSPC 失败的 reset。
+
+`Reset()` 通过 `preAccess()`/`postAccess()`（`vfs/vfscache/item.go#L1146-L1168`）与 IO 线程互斥：reset 期间 `beingReset=true`，IO 线程在 `cond.Wait()` 等待；reset 时若 `pendingAccesses>0` 则跳过避免死锁（`vfs/vfscache/item.go#L1042-L1044`）。
+
+### 4.8 启动时恢复：reload()
+
+`Cache.reload()`（`vfs/vfscache/cache.go#L543-L563`）扫描磁盘缓存与元数据，对每个 dirty 项调用 `Item.reload()`（`vfs/vfscache/item.go#L822-L851`）：重新打开、触发写回、`AddVirtual` 注入目录树。这保证了进程崩溃重启后未上传的修改不会丢失。
 
 ---
 
-## 五、挂载访问支撑机制
+## 五、三者如何协同支撑挂载访问
 
 ### 5.1 挂载层与 VFS 层的交互
 
-以 FUSE 挂载为例，定义在 [cmd/mount/fs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/cmd/mount/fs.go)：
+FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）返回 `vfs.Root()`；`Statfs`（`cmd/mount/fs.go#L56-L72`）转发 `vfs.Statfs()`；文件/目录操作全部委托给 VFS 的 `Node`/`Handle`。错误经 `translateError()`（`cmd/mount/fs.go#L75-L107`）映射为 POSIX errno。
+
+因此挂载的「读、写、列目录」语义完全由 VFS 三大机制实现。
+
+### 5.2 典型场景：只读访问（如 `cat`）
+
+1. FUSE `open(O_RDONLY)` → `VFS.OpenFile()`（`vfs/vfs.go#L562-L588`）→ `File.Open()`（`vfs/file.go#L834-L929`）。
+2. `CacheMode<Full` 时选 `ReadFileHandle`，`openPending()` 用 `chunkedreader` 按需分块拉取（`vfs/read.go#L73-L89`），不占本地磁盘。
+3. `readahead` 由 `accounting` 缓冲提供，`ReadAt` 命中顺序窗口时等待（`vfs/read.go#L269-L271`）。
+4. 关闭时 `checkHash()` 校验完整性（`vfs/read.go#L348-L370`）。
+5. 目录列表走 `Dir.ReadDirAll()`（`vfs/dir.go#L1003-L1019`），命中缓存则不调远端 List。
+
+### 5.3 典型场景：写入新文件（如 `cp`）
+
+1. `open(O_WRONLY|O_CREATE)` → 若 `CacheMode>=Writes` 选 `RWFileHandle`（`vfs/file.go#L907-L912`）。
+2. `newRWFileHandle` 立即 `Truncate(0)`+`Dirty()`（`vfs/read_write.go#L62-L70`），并 `addObject` 加入目录虚拟条目（`vfs/dir.go#L445-L462`）——文件立即可见。
+3. 写入走 `item.WriteAt()` → 本地磁盘 → `_dirty()` 标脏并 `_save()` 元数据（`vfs/vfscache/item.go#L1378-L1411`、`L431-L447`）。
+4. 关闭 `item.Close()` → `_actualClose()` 因 `WriteBack>0` 走异步：`writeback.Add()` 入队，5s 后到期上传（`vfs/vfscache/item.go#L798-L807`、`vfs/vfscache/writeback/writeback.go#L427-L459`）。
+5. 上传成功 `_store()` 调 `storeFn`（即 `File.setObject`，`vfs/file.go#L544-L554`）更新目录对象引用，并 `AddVirtual`/升级虚拟条目。
+6. 挂载层 `flush` 立即返回，用户感知「秒存」；后台 `WaitForWriters()`（`vfs/vfs.go#L434-L464`）在卸载前等待所有写回完成。
+
+### 5.4 典型场景：随机读写（如 SQLite）
+
+1. `open(O_RDWR)` → `CacheMode>=Minimal` 选 `RWFileHandle`（`vfs/file.go#L898-L900`）。
+2. 首次读 `item._ensure()`（`vfs/vfscache/item.go#L1207-L1247`）按需下载缺失区间到本地文件，后续读写完全在本地磁盘进行。
+3. `Seek`/`WriteAt`/`Truncate` 全部由本地 fd 支持（`vfs/read_write.go#L301-L322`、`L329-L362`、`L401-L411`）。
+4. 关闭触发写回；若 `WriteBack<=0` 则同步上传（`vfs/vfscache/item.go#L678`、`L795-L797`），保证一致性敏感场景的数据安全。
+5. 缓存清理不会触碰 dirty/in-use 项（`vfs/vfscache/item.go#L980`、`L1027-L1029`），避免误删活跃文件。
+
+### 5.5 协同关系总览
 
 ```
-FUSE 内核请求
-    ↓
-mount.FS 包装 VFS
-    ├─ FS.Root() → 返回 VFS.Root()
-    ├─ Dir 包装 vfs.Dir
-    ├─ File 包装 vfs.File
-    └─ 错误翻译：translateError() → VFS 错误 → FUSE 错误码
+打开文件（File.Open）        目录缓存（Dir）              写回策略（vfscache）
+   │ 选择最优句柄              │ 维持合并视图                 │ 脏标记 + 延迟上传
+   │                           │                             │
+   ├── Read: 流式不落盘 ───────┤ 读路径命中缓存，少调 List ──┤ 关闭后异步回写
+   ├── Write: Pipe 直传 ──────┤ 本地修改即时可见(virtual) ──┤ 上传完成升级虚拟条目
+   └── RW: 本地缓存文件 ──────┤ 写时 addObject 注入目录 ────┤ reload 恢复未传数据
+                                                              │
+                          配额/年龄清理保护本地磁盘不爆 ───────┘
 ```
 
-### 5.2 打开文件如何支撑挂载访问
-
-#### 场景 1：只读访问（如 cat 文件）
-```
-用户: cat /mnt/remote/file.txt
-    ↓
-FUSE Lookup → VFS.Stat("file.txt")
-    ├─ 目录缓存查找
-    └─ 如缓存过期则刷新目录列表
-FUSE Open → File.Open(O_RDONLY)
-    └─ ReadFileHandle
-FUSE Read → ReadFileHandle.Read()
-    ├─ openPending() → 创建 chunkedreader
-    ├─ 从远程分块读取
-    └─ 校验哈希
-FUSE Release → ReadFileHandle.Close()
-```
-
-#### 场景 2：写入新文件（如 echo 内容到新文件）
-```
-用户: echo "hello" > /mnt/remote/new.txt
-    ↓
-FUSE Create → Dir.Create("new.txt", O_WRONLY|O_CREATE)
-    ├─ 创建 File 对象（o = nil，表示正在写入）
-    └─ 添加虚拟条目到目录缓存
-FUSE Open → File.Open(O_WRONLY)
-    └─ WriteFileHandle（无缓存模式）
-FUSE Write → WriteFileHandle.Write()
-    ├─ openPending() → 创建 pipe
-    └─ 写入 pipe，后台通过 Rcat 上传
-FUSE Release → WriteFileHandle.Close()
-    ├─ 关闭 pipeWriter
-    ├─ 等待 Rcat 完成
-    └─ file.setObject(o) → 更新为真实对象
-```
-
-#### 场景 3：随机读写（CacheMode >= Minimal）
-```
-用户: 编辑器打开并修改文档
-    ↓
-FUSE Open → File.Open(O_RDWR)
-    └─ RWFileHandle
-        ├─ cache.Item(path) → 获取缓存项
-        └─ item.Open(o) → 创建/打开本地缓存文件
-FUSE Read → RWFileHandle.ReadAt()
-    ├─ item.ReadAt() → 从本地缓存读取
-    └─ 如数据缺失，通过 downloaders 异步下载
-FUSE Write → RWFileHandle.WriteAt()
-    ├─ item.WriteAt() → 写入本地缓存
-    └─ item._dirty() → 标记为脏
-FUSE Release → RWFileHandle.Close()
-    ├─ item.Close(storeFn)
-    │   └─ 加入写回队列（WriteBack 秒后上传）
-    └─ 本地缓存保留，供后续访问
-```
-
-### 5.3 目录缓存如何支撑挂载访问
-
-#### 目录列表（ls 命令）
-```
-用户: ls /mnt/remote/
-    ↓
-FUSE Readdir → DirHandle.Readdir()
-    └─ Dir.ReadDirAll()
-        ├─ _readDir() → 检查缓存
-        │   ├─ 缓存有效：直接返回 items
-        │   └─ 缓存过期：从远程 list 并更新
-        ├─ 合并虚拟条目
-        └─ 按名称排序返回
-```
-
-**目录缓存的关键作用：**
-1. **减少 API 调用**：默认 5 分钟缓存，避免频繁 list 远程
-2. **保持一致性**：虚拟条目确保本地修改立即可见
-3. **快速查找**：`Stat()` 操作避免每次都访问远程
-4. **变更感知**：通过 `ChangeNotify` 或 `PollInterval` 感知远程变更
-
-### 5.4 写回策略如何支撑挂载访问
-
-#### 快速关闭体验
-异步写回使得 `close()` 调用立即返回，用户无需等待上传完成：
-- `WriteBack = 5s`：文件关闭后 5 秒才开始上传
-- 在此期间文件仍可被重新打开，避免重复上传
-
-#### 断点续传
-- 元数据持久化确保进程重启后仍能恢复脏文件
-- 重启时 `reload()` 扫描缓存目录，重新将脏文件加入写回队列
-
-#### 配额管理
-- `CacheMaxSize` 限制总缓存大小
-- `CacheMinFreeSpace` 确保本地磁盘有足够剩余空间
-- 自动清理最久未使用的文件
-
-#### 失败重试
-- 上传失败时指数退避重试（最大 5 分钟间隔）
-- 不阻塞用户操作，后台静默重试
-
-### 5.5 关键性能优化机制
-
-1. **分块读取**：`chunkedreader` 支持并行下载多个块
-2. **预读**：`ReadAhead` 选项提前读取后续数据
-3. **句柄缓存**：`HandleCaching`（默认 5 秒）保持文件句柄打开，避免频繁打开关闭
-4. **快速指纹**：`FastFingerprint` 使用快速哈希检测远程变更
-5. **稀疏文件**：本地缓存文件使用稀疏文件，节省磁盘空间
-
-### 5.6 并发与锁设计
-
-VFS 层采用精细的锁设计来保证并发安全：
-
-| 锁 | 用途 | 定义位置 |
-|----|------|---------|
-| `VFS.usageMu` | 保护磁盘使用统计 | [vfs.go:186](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfs.go#L186) |
-| `Dir.mu` | 保护目录条目 | [dir.go:32](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/dir.go#L32) |
-| `File.mu` | 保护文件元数据 | [file.go:49](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/file.go#L49) |
-| `File.muRW` | 保护打开/关闭/删除 | [file.go:47](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/file.go#L47) |
-| `Cache.mu` | 保护缓存映射 | [vfscache/cache.go:56](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/cache.go#L56) |
-| `Item.mu` | 保护缓存项 | [vfscache/item.go:59](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscache/item.go#L59) |
-
-**锁顺序约定**（避免死锁）：
-- `Dir.mu` → `File.mu`
-- `Cache.mu` → `Item.mu`
-- `downloader.mu` → `Item.mu`
-- `writeback.mu` → `Item.mu`
+三者通过 `CachePath`、虚拟条目、`storeFn` 回调紧密耦合：打开文件决定数据落点，目录缓存保证可见性与一致性，写回策略保证持久性与磁盘可控。
 
 ---
 
 ## 六、关键配置参数汇总
 
-| 参数 | 默认值 | 作用 | 定义 |
-|------|--------|------|------|
-| `DirCacheTime` | 5m | 目录缓存有效期 | [options.go:30](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L30) |
-| `CacheMode` | off | 缓存模式 | [options.go:55](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L55) |
-| `CacheMaxAge` | 1h | 缓存文件最大未使用时间 | [options.go:65](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L65) |
-| `CacheMaxSize` | off | 缓存最大总大小 | [options.go:70](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L70) |
-| `WriteBack` | 5s | 写回延迟 | [options.go:130](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L130) |
-| `WriteWait` | 1s | 顺序写等待超时 | [options.go:120](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L120) |
-| `ReadWait` | 20ms | 顺序读等待超时 | [options.go:125](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L125) |
-| `ChunkSize` | 128Mi | 读分块大小 | [options.go:80](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L80) |
-| `HandleCaching` | 5s | 文件句柄缓存时间 | [options.go:170](file:///d:/fz/0601-2/solo-dogfeeding/code/52-rclone/vfs/vfscommon/options.go#L170) |
+定义于 `vfs/vfscommon/options.go#L185-L219`，默认值见 `OptionsInfo`（`vfs/vfscommon/options.go#L13-L178`）。
+
+| 参数 | 字段 | 默认值 | 作用 | 关联代码 |
+| --- | --- | --- | --- | --- |
+| `--vfs-cache-mode` | `CacheMode` | `off` | 句柄选择与是否启用磁盘缓存 | `vfs/file.go#L891-L922` |
+| `--dir-cache-time` | `DirCacheTime` | `5m` | 目录列表缓存有效期 | `vfs/dir.go#L360-L367` |
+| `--poll-interval` | `PollInterval` | `1m` | 变更轮询间隔 | `vfs/vfs.go#L249-L255` |
+| `--vfs-cache-max-age` | `CacheMaxAge` | `1h` | 缓存项最大留存时间 | `vfs/vfscache/cache.go#L803` |
+| `--vfs-cache-max-size` | `CacheMaxSize` | `-1`(无限) | 缓存总大小上限 | `vfs/vfscache/cache.go#L738-L743` |
+| `--vfs-cache-min-free-space` | `CacheMinFreeSpace` | `-1`(不限制) | 目标最小剩余空间 | `vfs/vfscache/cache.go#L720-L733` |
+| `--vfs-cache-poll-interval` | `CachePollInterval` | `60s` | 清理器轮询间隔 | `vfs/vfscache/cache.go#L846-L867` |
+| `--vfs-read-chunk-size` | `ChunkSize` | `128M` | 只读分块大小 | `vfs/read.go#L79` |
+| `--vfs-read-chunk-streams` | `ChunkStreams` | `0` | 并发读流数 | `vfs/read.go#L79` |
+| `--vfs-write-back` | `WriteBack` | `5s` | 关闭后延迟写回时间；`<=0` 同步 | `vfs/vfscache/item.go#L678`、`writeback.go#L128-L135` |
+| `--vfs-write-wait` | `WriteWait` | `1000ms` | 顺序写等待窗口 | `vfs/write.go#L135` |
+| `--vfs-read-wait` | `ReadWait` | `20ms` | 顺序读等待窗口 | `vfs/read.go#L270` |
+| `--vfs-handle-caching` | `HandleCaching` | `5s` | 关闭后 fd 宽限期 | `vfs/vfscache/item.go#L693-L696` |
+| `--vfs-read-ahead` | `ReadAhead` | `0` | full 模式额外预读 | `vfs/vfscommon/options.go#L134-L137` |
+| `--read-only` | `ReadOnly` | `false` | 只读挂载 | `vfs/file.go#L625`、`vfs/dir.go#L947` |
 
 ---
 
 ## 七、总结
 
-VFS 抽象层通过三层机制协同支撑挂载访问：
+rclone VFS 通过三层机制协同把「云存储」伪装成「本地磁盘」：
 
-1. **文件打开机制**：根据缓存模式和访问模式选择合适的句柄类型，平衡性能和功能
-2. **目录缓存**：通过内存缓存和虚拟条目机制，减少 API 调用并保持一致性
-3. **写回策略**：异步延迟写回、失败重试、配额管理，提供类本地文件系统的使用体验
+1. **打开文件**（`File.Open`，`vfs/file.go#L834-L929`）以 `flags`+`CacheMode` 决策出 `Read`/`Write`/`RW` 三种句柄，在「零磁盘 IO 流式」「直传上传」「本地缓存随机读写」之间权衡，兼顾性能与功能。
+2. **目录缓存**（`Dir`，`vfs/dir.go`）以 `items`+`virtual` 维护「后端列表 ∪ 本地修改 − 本地删除」的合并视图，配合 `DirCacheTime`/`ChangeNotify` 减少远端 List 调用并保证本地修改即时可见。
+3. **写回策略**（`vfscache`，`vfs/vfscache/item.go`、`writeback.go`、`cache.go`）以脏标记+延迟队列实现「关闭即返回、后台异步上传」，用元数据持久化支持断点续传，用配额/年龄/紧急三级清理保护本地磁盘。
 
-这三者共同构成了 rclone 挂载功能的核心，使得云存储能够像本地磁盘一样被应用程序透明访问，同时通过智能缓存和重试机制应对网络存储的不可靠性。
+挂载层（`cmd/mount/fs.go`）仅做 FUSE 适配与错误映射，真正的文件语义全部由 VFS 三大机制承载，从而让任意支持 FUSE 的应用都能像操作本地文件一样操作云存储。

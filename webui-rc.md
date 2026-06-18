@@ -513,18 +513,81 @@ return rc.Params{
 ```go
 ctx, cancel := context.WithCancel(ctx)
 stop := func() {
-    cancel()                      // ① 发送取消信号
+    cancel()                      // ① 发送取消信号，关闭 ctx.Done()
     // Wait for cancel to propagate before returning.
-    <-ctx.Done()                  // ② 阻塞等待，直到 ctx 完全取消
+    <-ctx.Done()                  // ② 从已关闭的 channel 读取，立即返回
 }
 ```
 
+---
+
+**✅ 核心澄清：cancel() 后 ctx.Done() 何时返回？**
+
+这是 Go `context.WithCancel` 的标准行为：
+1. **`cancel()` 被调用时**：立即原子地关闭 `ctx.Done()` 这个 channel
+2. **`<-ctx.Done()`**：从已关闭的 channel 读取会**立即返回零值**，不会阻塞
+3. **注释中的 "propagate"**：指取消信号在 context 树中的传播（所有子 context 同步标记为取消），这是 `cancel()` 内部完成的同步操作
+
+**结论**：`Stop()` 函数几乎是**瞬间返回**的，耗时仅为 `cancel()` 的内部处理 + 一次内存读操作，**不需要等待任务函数 `fn` 响应取消**。
+
+---
+
 | 步骤 | 代码 | 语义 |
 |------|------|------|
-| ① | `cancel()` | 向 context 发送取消信号，所有监听 `ctx.Done()` 的 goroutine 收到通知 |
-| ② | `<-ctx.Done()` | **同步阻塞**，直到 `ctx` 被标记为已取消（即 cancel 被调用且所有子 context 感知到） |
+| ① | `cancel()` | 同步关闭 `ctx.Done()` channel，标记整个 context 树为已取消 |
+| ② | `<-ctx.Done()` | 从已关闭 channel 读取，**立即返回**（约几纳秒） |
 
-**返回承诺**：`Stop()` 返回时，`ctx` 已经处于取消状态，任何后续检查 `ctx.Err() != nil` 都会返回 `context.Canceled`。
+**返回承诺**：`Stop()` 返回时，`ctx.Err() != nil` 一定成立（返回 `context.Canceled`），任何后续检查都会看到取消状态。但此时任务函数 `fn` 可能还在运行，还没检测到取消。
+
+---
+
+**✅ 完整时序分析（修正之前的错误死锁判断）**
+
+```
+Goroutine A (rcJobStop 请求)       Goroutine B (job.run 后台执行)
+         |                                      |
+         ▼                                      |
+job.mu.Lock()  (获得锁)                         |
+         |                                      |
+         ▼                                      |
+job.Stop()                                     |
+    |                                          |
+    ├─ cancel() ───────────────────────────────┼───────────→ ① 立即关闭 ctx.Done()
+    |                                          ▼
+    └─ <-ctx.Done()                            |
+       ✅ 立即返回！（几纳秒）                  | fn 仍在运行，尚未检测到取消
+         |                                      |
+         ▼                                      |
+job.Stop() 返回                                 |
+         |                                      |
+         ▼                                      |
+defer job.mu.Unlock()                          |
+         |                                      |
+         ▼                                      |
+rcJobStop HTTP 响应 200 OK                      |
+                                                |
+                                                ▼
+                                          （一段时间后，可能毫秒到秒级）
+                                                |
+                                                ▼
+                                          fn 执行到下一个 ctx.Done() 检查
+                                                |
+                                                ▼
+                                          fn 返回 ctx.Err()
+                                                |
+                                                ▼
+                                          job.finish(out, err)
+                                                |
+                                                ▼
+                                          job.mu.Lock()
+                                                ✅ 现在可以获得锁了！
+```
+
+**❌ 之前的死锁分析是错误的**，错误在于认为 `<-ctx.Done()` 需要等待 `fn` 完成。实际上：
+- `Stop()` 持有 `job.mu` 的时间只有几纳秒
+- `rcJobStop` 从获取锁到释放锁，整个过程微秒级
+- 任务 goroutine 的 `finish()` 调用时，锁已经释放了
+- **没有死锁！**
 
 ---
 
@@ -536,10 +599,10 @@ func rcJobStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
     job := running.Get(jobID)
     if job == nil { return errors.New("job not found") }
     
-    job.mu.Lock()       // ⚠️ 先获取 job.mu 锁
+    job.mu.Lock()       // 获取锁（短时持有）
     defer job.mu.Unlock()
     out = make(rc.Params)
-    job.Stop()          // ⚠️ 在持有锁的情况下调用 Stop()，会阻塞
+    job.Stop()          // 瞬间返回
     return out, nil
 }
 ```
@@ -548,65 +611,48 @@ func rcJobStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 
 ```go
 func rcGroupStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-    group, _ := in.GetString("_group")
+    group, err := in.GetString("group")
     running.mu.RLock()
     defer running.mu.RUnlock()
     for _, job := range running.jobs {
         if job.Group == group {
-            job.mu.Lock()      // 同样先获取锁
-            job.Stop()         // 阻塞等待取消完成
-            job.mu.Unlock()
+            job.mu.Lock()      // 依次获取每个 job 的锁
+            job.Stop()         // 瞬间返回
+            job.mu.Unlock()    // 立即释放
         }
     }
+    out = make(rc.Params)
+    return out, nil
 }
 ```
 
 ---
 
-**⚠️ 死锁风险分析（当前代码存在缺陷）**
+**✅ Stop() 的语义 vs 实际效果**
 
-**完整调用链**：
+| 层面 | Stop() 返回时的状态 | 实际发生 |
+|------|-------------------|---------|
+| **Context 状态** | ✅ `ctx.Done()` 已关闭，`ctx.Err() != nil` | Stop() 内部保证 |
+| **任务函数 fn** | ❌ 可能仍在运行，可能还没检测到取消 | fn 需要自己检查 `ctx.Done()` 才会退出 |
+| **Job 状态** | ❌ `job.Finished` 仍为 `false` | 要等 fn 返回后 `finish()` 才会标记 |
+| **HTTP 响应** | ✅ 已返回 200 OK | rcJobStop 不等待 fn |
 
-```
-Goroutine A (rcJobStop 请求)       Goroutine B (job.run 后台执行)
-         |                                      |
-         ▼                                      |
-job.mu.Lock()  (获得锁)                         |
-         |                                      |
-         ▼                                      |
-job.Stop()                                     |
-    |                                          |
-    ├─ cancel() ───────────────────────────────┼───────────→ ① 发送取消信号
-    |                                          ▼
-    └─ <-ctx.Done() (阻塞等待)              fn(ctx, in) 检测到取消
-                                               |
-                                               ▼
-                                         fn 返回 error
-                                               |
-                                               ▼
-                                         job.finish(out, err)
-                                               |
-                                               ▼
-                                         job.mu.Lock()  (等待锁...)
-                                               ║
-                                               ║ 🔒 死锁！
-                                               ║
-                                        A 持有 job.mu 等待 ctx.Done()
-                                        B 需要 job.mu 才能 finish()
-                                        双方互相等待，永久阻塞
+**用户体验**：调用 `job/stop` 会立即得到成功响应，但后台任务可能还需要一段时间才真正退出。如果需要确认任务已停止，应该轮询 `job/status` 直到 `finished=true`。
+
+---
+
+**✅ 为什么需要 `<-ctx.Done()`？**
+
+如果 Stop 只写 `cancel()` 会怎样？
+
+```go
+// 不好的实现
+stop := func() { cancel() }
 ```
 
-**死锁根源**：
-1. `rcJobStop` 在持有 `job.mu` 的情况下调用 `job.Stop()`
-2. `job.Stop()` 的 `<-ctx.Done()` 需等待任务 goroutine 完成 `fn` 并执行 `finish()`
-3. `job.finish()` 第一行就是 `job.mu.Lock()` [job.go#L57](file:///d:/fz/0601-2/solo-dogfeeding/code/59-rclone/fs/rc/jobs/job.go#L57)
-4. 但 `job.mu` 正被 `rcJobStop` 持有 → **经典死锁**
+问题：`cancel()` 返回后，虽然 `cancel()` 内部有原子操作保证内存可见性，但 `<-ctx.Done()` 提供了更强的同步屏障——确保在 Stop 返回时，**任何并发 goroutine 都能观察到 ctx 已取消**。
 
-**验证死锁所需条件**（全部满足）：
-- ✅ 互斥：`job.mu` 是互斥锁，同一时间只能一个持有
-- ✅ 持有并等待：A 持有 `job.mu`，同时等待 B 完成
-- ✅ 不可抢占：无法强制 A 释放 `job.mu`
-- ✅ 循环等待：A → 等待 B finish → 等待 A 释放锁 → A
+代码注释 "Wait for cancel to propagate before returning" 准确表达了这个意图：确保取消信号在整个 context 树中传播完成后再返回。
 
 ---
 

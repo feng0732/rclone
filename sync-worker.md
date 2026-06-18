@@ -2,7 +2,7 @@
 
 ## 总览
 
-rclone 的 `sync` 命令将源端（fsrc）同步到目的端（fdst），使目的端与源端完全一致。核心实现在 [sync.go](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go) 中，由 `syncCopyMove` 结构体驱动，三个核心机制——**差异计算**、**传输队列**、**删除策略**——协同推进整个同步流程。
+rclone 的 `sync` 命令将源端（fsrc）同步到目的端（fdst），使目的端与源端完全一致。核心实现在 [fs/sync/sync.go](fs/sync/sync.go) 中，由 `syncCopyMove` 结构体驱动，三个核心机制——**差异计算**、**传输队列**、**删除策略**——协同推进整个同步流程。
 
 入口调用链：
 
@@ -16,7 +16,7 @@ cmd/sync/sync.go  →  sync.Sync()  →  runSyncCopyMove()  →  syncCopyMove.ru
 
 ### 1.1 March 引擎——目录并行遍历与匹配
 
-[March](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/march/march.go#L30-L49) 是 rclone 的目录并行遍历引擎。它同时遍历 fsrc 和 fdst 的目录树，对每个目录中的条目执行排序后双指针匹配：
+[March](fs/march/march.go#L30-L49) 是 rclone 的目录并行遍历引擎。它同时遍历 fsrc 和 fdst 的目录树，对每个目录中的条目执行排序后双指针匹配：
 
 ```
 srcChan ──┐
@@ -24,7 +24,7 @@ srcChan ──┐
 dstChan ──┘
 ```
 
-关键实现在 [matchListings](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/march/march.go#L292-L374)：
+关键实现在 [matchListings](fs/march/march.go#L292-L374)：
 
 - 从 `srcChan` 和 `dstChan` 分别读取条目
 - 对名字做 Unicode NFC 归一化和大小写归一化（如果目的端大小写不敏感）
@@ -34,66 +34,61 @@ dstChan ──┘
   - **srcName == dstName** → `match(dst, src)`：两端都有同名条目
 - 检测重复条目并跳过
 
-March 的 `Run` 方法（[march.go#L184-L272](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/march/march.go#L184-L272)）用 `checkers` 数量的 goroutine 并行处理目录遍历作业（`listDirJob`），以工作窃取模式递归调度子目录。
+March 的 `Run` 方法（[fs/march/march.go#L184-L272](fs/march/march.go#L184-L272)）用 `checkers` 数量的 goroutine 并行处理目录遍历作业（`listDirJob`），以工作窃取模式递归调度子目录。
 
 ### 1.2 Callback 接口——三路分发驱动同步
 
-`syncCopyMove` 实现了 [Marcher](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/march/march.go#L52-L59) 接口的三个方法，March 的匹配结果直接路由到不同的同步动作。
+`syncCopyMove` 实现了 [Marcher](fs/march/march.go#L52-L59) 接口的三个方法，March 的匹配结果直接路由到不同的同步动作。
 
-**三路分发的真实数据流向（对照代码）：
+三路分发的真实数据流向（对照代码）：
 
 | 分发结果 | 流入位置 | 数据去向 |
 |---------|---------|-----------|
-| **SrcOnly（文件） | [sync.go#L1245-L1268](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1245-L1268) | trackRenames=true → `trackRenamesCh<br/>
+| SrcOnly（文件） | [fs/sync/sync.go#L1245-L1268](fs/sync/sync.go#L1245-L1268) | trackRenames=true → `trackRenamesCh`<br>trackRenames=false → CompareOrCopyDest → `toBeUploaded` |
+| DstOnly（文件） | [fs/sync/sync.go#L1059-L1089](fs/sync/sync.go#L1059-L1089) | DeleteModeAfter → `dstFiles` map<br>DeleteModeDuring → `deleteFilesCh` |
+| Match（文件 vs 文件） | [fs/sync/sync.go#L1287-L1306](fs/sync/sync.go#L1287-L1306) | `toBeChecked` |
 
-**SrcOnly（文件） | [sync.go#L1253-L1267](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1253-L1267) | trackRenames=false → CompareOrCopyDest → `toBeUploaded` |
-| **DstOnly（文件） | [sync.go#L1059-L1089](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1059-L1089) | DeleteModeAfter → `dstFiles` map<br/>DeleteModeDuring → `deleteFilesCh` |
-| **Match（文件vs文件） | [sync.go#L1287-L1306](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1287-L1306) | `toBeChecked` |
-
-#### SrcOnly（[sync.go#L1236-L1282](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1236-L1282)
+#### SrcOnly（[fs/sync/sync.go#L1236-L1282](fs/sync/sync.go#L1236-L1282)）
 
 源端独有的条目：
 
 ```go
 if s.trackRenames {
-    // 保存到 trackRenamesCh，后续再处理
     select {
     case <-s.ctx.Done():
         return
     case s.trackRenamesCh <- x:
     }
 } else {
-    // 直接走 CompareOrCopyDest，检查是否能从 compare-dest/copy-dest 免除传输
     NoNeedTransfer, err := operations.CompareOrCopyDest(s.ctx, s.fdst, nil, x, s.compareCopyDest, s.backupDir)
     if !NoNeedTransfer {
-        // 直接放入 toBeUploaded，不经过 toBeChecked！
         ok := s.toBeUploaded.Put(s.inCtx, fs.ObjectPair{Src: x, Dst: nil})
     }
 }
 ```
 
-**关键发现**：SrcOnly 当 trackRenames=false 时，**直接进入 `toBeUploaded`，**不经过 `toBeChecked`。
+**关键发现**：SrcOnly 当 trackRenames=false 时，**直接进入 `toBeUploaded`**，不经过 `toBeChecked`。
 
-#### DstOnly（[sync.go#L1041-L1091](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1041-L1091)
+#### DstOnly（[fs/sync/sync.go#L1041-L1091](fs/sync/sync.go#L1041-L1091)）
 
 目的端独有的条目：
 
 - **文件**：根据 `deleteMode` 决定如何处理：
   - `DeleteModeAfter`：将对象加入 `dstFiles` map，留待同步结束后批量删除
-  - `DeleteModeDuring`/`DeleteModeOnly`：直接送入 `deleteFilesCh`，由后台 deleter goroutine 即时删除
+  - `DeleteModeDuring` / `DeleteModeOnly`：直接送入 `deleteFilesCh`，由后台 deleter goroutine 即时删除
 - **目录**：记录到 `dstEmptyDirs`，返回 `recurse=true` 继续递归（以便遍历子内容以供删除）
 
-#### Match（[sync.go#L1285-L1343](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1285-L1343)
+#### Match（[fs/sync/sync.go#L1285-L1343](fs/sync/sync.go#L1285-L1343)）
 
 两端都存在的条目：
 
-- **文件 vs 文件**：构造 `ObjectPair{Src, Dst}` 放入 `toBeChecked` 管道（[sync.go#L1296](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1296)），交给 checker goroutine 判定是否需要传输
-- **文件 vs 目录**或**目录 vs 文件**：报错，无法覆盖
-- **目录 vs 目录**：复制目录元数据/ModTime，返回 `recurse=true` 递归子目录
+- **文件 vs 文件**：构造 `ObjectPair{Src, Dst}` 放入 `toBeChecked` 管道（[fs/sync/sync.go#L1296](fs/sync/sync.go#L1296)），交给 checker goroutine 判定是否需要传输
+- **文件 vs 目录** 或 **目录 vs 文件**：报错，无法覆盖
+- **目录 vs 目录**：复制目录元数据 / ModTime，返回 `recurse=true` 递归子目录
 
 ### 1.3 NeedTransfer——文件级差异判定
 
-[NeedTransfer](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/operations/operations.go#L1733-L1801) 由 checker goroutine 调用，判断源文件是否需要传输到目的端。判定优先级：
+[NeedTransfer](fs/operations/operations.go#L1733-L1801) 由 checker goroutine 调用，判断源文件是否需要传输到目的端。判定优先级：
 
 1. **dst == nil** → 需要传输（目的端不存在）
 2. **--ignore-existing** → 跳过
@@ -101,7 +96,7 @@ if s.trackRenames {
 4. **--update-older** → 目的端更新则跳过；源端更新时用 `equal()` 判定
 5. **常规路径** → 调用 `Equal`
 
-`equal()` 的判定逻辑（[operations.go#L246-L359](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/operations/operations.go#L246-L359)：
+`equal()` 的判定逻辑（[fs/operations/operations.go#L246-L359](fs/operations/operations.go#L246-L359)）：
 
 ```
 size不同 → 不相等
@@ -115,20 +110,20 @@ mtime不同 → 比较哈希:
 
 ---
 
-## 二、传输队列：并行管道架构（纠正：不是依次串联！
+## 二、传输队列：并行管道架构（纠正：不是依次串联！）
 
 ### 2.1 pipe——带优先级排序的无界管道
 
-[pipe](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/pipe.go#L22-L31) 是同步引擎的核心数据结构，提供带背压的无界缓冲通道：
+[pipe](fs/sync/pipe.go#L22-L31) 是同步引擎的核心数据结构，提供带背压的无界缓冲通道：
 
 - **内部存储**：`queue []fs.ObjectPair` 切片 + 信号通道 `c chan struct{}`
-- **排序支持**：使用 `deheap`（双端堆）实现 `--order-by` 排序，支持 `name`/`size`/`modtime` 三种排序维度，以及 `mixed` 分数模式（一部分取最小端、一部分取最大端）
+- **排序支持**：使用 `deheap`（双端堆）实现 `--order-by` 排序，支持 `name` / `size` / `modtime` 三种排序维度，以及 `mixed` 分数模式（一部分取最小端、一部分取最大端）
 - **背压控制**：`Put` 时向 `c` 发送信号，`Get` 时从 `c` 接收；`c` 的容量由 `--max-backlog` 控制
-- **统计回调**：每次 Put/Get 更新队列项数和总大小，实时反映到 `stats`
+- **统计回调**：每次 Put / Get 更新队列项数和总大小，实时反映到 `stats`
 
 ### 2.2 真实管道架构（对照代码验证）
 
-三个 pipe 的关系是**并行汇聚**到 `toBeUploaded`，**不是依次串联**！
+三个 pipe 的关系是**三条路径并行汇聚**到 `toBeUploaded`，**不是依次串联**。
 
 ```
                           ┌──────────────┐
@@ -137,9 +132,9 @@ mtime不同 → 比较哈希:
                                  │
                                  ▼
 toBeChecked ────────────────────────────┐
-  (检查管道)                     │
-  唯一入口: Match 回调            │
-  [sync.go#L1296]                ▼
+  (检查管道)                              │
+  唯一入口: Match 回调                    │
+  [fs/sync/sync.go#L1296]                ▼
                               toBeUploaded ──────→ pairCopyOrMove
                                  ▲                    (传输管道)
                                  │                    消费者: transfer goroutines
@@ -153,23 +148,28 @@ toBeChecked ──────────────────────�
 toBeRenamed ─────────────────────┘
   (重命名管道)
   唯一入口: run() 中 track-renames 路径
-  [sync.go#L973]
+  [fs/sync/sync.go#L973]
   (March 结束后批量填充)
+                                 ▲
+                                 │
+SrcOnly(trackRenames=false) ─────┘
+  直接进入 toBeUploaded
+  [fs/sync/sync.go#L1263]
 ```
 
-**关键代码证据**（grep 结果）：
+**关键代码证据**（对照 Put 调用点）：
 
 | Pipe | Put 位置 | 说明 |
 |------|---------|------|
-| `toBeChecked.Put` | [sync.go#L1296](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1296) | 仅 Match 回调，唯一入口 |
-| `toBeUploaded.Put` | [sync.go#L1263](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1263) | SrcOnly (trackRenames=false) |
-| `toBeUploaded.Put` | [sync.go#L438](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L438), [L444](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L444), [L462](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L462) | pairChecker 输出 |
-| `toBeUploaded.Put` | [sync.go#L491](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L491) | pairRenamer 输出（失败时） |
-| `toBeRenamed.Put` | [sync.go#L973](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L973) | 仅 run() 中 track-renames 路径 |
+| `toBeChecked.Put` | [fs/sync/sync.go#L1296](fs/sync/sync.go#L1296) | 仅 Match 回调，唯一入口 |
+| `toBeUploaded.Put` | [fs/sync/sync.go#L1263](fs/sync/sync.go#L1263) | SrcOnly (trackRenames=false) |
+| `toBeUploaded.Put` | [fs/sync/sync.go#L438](fs/sync/sync.go#L438), [L444](fs/sync/sync.go#L444), [L462](fs/sync/sync.go#L462) | pairChecker 输出 |
+| `toBeUploaded.Put` | [fs/sync/sync.go#L491](fs/sync/sync.go#L491) | pairRenamer 输出（失败时） |
+| `toBeRenamed.Put` | [fs/sync/sync.go#L973](fs/sync/sync.go#L973) | 仅 run() 中 track-renames 路径 |
 
 ### 2.3 Goroutine 启停时序
 
-在 [run()](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L936-L1039) 中的启动顺序：
+在 [run()](fs/sync/sync.go#L936-L1039) 中的启动顺序：
 
 ```go
 s.startCheckers()     // 启动 checker goroutines（消费 toBeChecked，输出到 toBeUploaded）
@@ -182,21 +182,20 @@ s.startTrackRenames() // 启动 trackRenames 收集器（消费 trackRenamesCh�
 m.Run(s.ctx)          // March 遍历开始，向管道填充数据
 ```
 
-停止顺序（[sync.go#L967-L988](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L967-L988)）：
+停止顺序（[fs/sync/sync.go#L967-L988](fs/sync/sync.go#L967-L988)）：
 
 ```go
 s.stopTrackRenames()  // 关闭 trackRenamesCh，等待收集完成
 if s.trackRenames {
     s.makeRenameMap()
-    // 将 renameCheck 中的源文件批量送入 toBeRenamed
 }
 s.stopCheckers()      // 关闭 toBeChecked，等待 checker 完成
 if s.checkFirst {
     s.startTransfers() // --check-first 模式下此时才启动传输
 }
 s.stopRenamers()      // 关闭 toBeRenamed，等待 renamer 完成
-s.stopTransfers()    // 关闭 toBeUploaded，等待 transfer 完成
-s.stopDeleters()    // 关闭 deleteFilesCh，等待 deleter 完成
+s.stopTransfers()     // 关闭 toBeUploaded，等待 transfer 完成
+s.stopDeleters()      // 关闭 deleteFilesCh，等待 deleter 完成
 ```
 
 **关键时序保证**：
@@ -207,7 +206,7 @@ s.stopDeleters()    // 关闭 deleteFilesCh，等待 deleter 完成
 
 ### 2.4 pairChecker 内部逻辑
 
-[pairChecker](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L371-L476) 是检查管道的消费者：
+[pairChecker](fs/sync/sync.go#L371-L476) 是检查管道的消费者：
 
 ```
 从 toBeChecked 取出 {Src, Dst}
@@ -220,12 +219,12 @@ s.stopDeleters()    // 关闭 deleteFilesCh，等待 deleter 完成
        ├─ --fix-case → 尝试重命名
        ├─ --immutable → 报错
        ├─ backupDir != nil && Dst != nil → 先备份再传输
-       └─ 放入 toBeUploaded（[sync.go#L438/L444/L462](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L438)
+       └─ 放入 toBeUploaded（[fs/sync/sync.go#L438/L444/L462](fs/sync/sync.go#L438)）
 ```
 
 ### 2.5 pairRenamer 内部逻辑
 
-[pairRenamer](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L480-L497) 是重命名管道的消费者：
+[pairRenamer](fs/sync/sync.go#L480-L497) 是重命名管道的消费者：
 
 ```go
 func (s *syncCopyMove) pairRenamer(in *pipe, out *pipe, ...) {
@@ -233,10 +232,8 @@ func (s *syncCopyMove) pairRenamer(in *pipe, out *pipe, ...) {
         pair, ok := in.GetMax(s.inCtx, fraction)
         src := pair.Src
         if !s.tryRename(src) {
-            // 重命名失败，送入 toBeUploaded 正常传输
             ok = out.Put(s.inCtx, pair)
         }
-        // 重命名成功，不进入 toBeUploaded
     }
 }
 ```
@@ -247,7 +244,7 @@ func (s *syncCopyMove) pairRenamer(in *pipe, out *pipe, ...) {
 
 ### 3.1 启用条件与降级逻辑
 
-在 [newSyncCopyMove](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L240-L270) 中，`trackRenames` 有严格的启用和降级检查：
+在 [newSyncCopyMove](fs/sync/sync.go#L240-L270) 中，`trackRenames` 有严格的启用和降级检查：
 
 ```go
 if s.trackRenames {
@@ -287,22 +284,20 @@ if s.trackRenames {
 
 ### 3.2 与删除模式的交互边界
 
-在 [runSyncCopyMove](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1358-L1373) 中，`DeleteModeBefore` 与 `track-renames 的不兼容检测：
+在 [runSyncCopyMove](fs/sync/sync.go#L1358-L1373) 中，`DeleteModeBefore` 与 track-renames 的不兼容检测：
 
 ```go
 if deleteMode == fs.DeleteModeBefore && ci.TrackRenames {
     return nil, errors.New("can't use --track-renames with --delete-before")
 }
 if deleteMode == fs.DeleteModeBefore {
-    // 第一遍：DeleteModeOnly，仅删除
     do, _ := newSyncCopyMove(ctx, fdst, fsrc, fs.DeleteModeOnly, ...)
     do.run()
-    // 第二遍：DeleteModeOff，仅复制
     deleteMode = fs.DeleteModeOff
 }
 ```
 
-**边界总结**：
+边界总结：
 
 | 删除模式 | 与 track-renames 兼容性 | 原因 |
 |----------|------------------------|------|
@@ -318,7 +313,7 @@ SrcOnly (trackRenames=true)
     │
     ▼
 trackRenamesCh ──→ startTrackRenames 收集到 renameCheck 切片
-    │                      ([sync.go#L586-L590](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L586-L590)
+    │                      ([fs/sync/sync.go#L586-L590](fs/sync/sync.go#L586-L590))
     │
     ▼
 March.Run() 结束
@@ -331,33 +326,33 @@ makeRenameMap()
     │  先构建 possibleSizes: 源端文件的 size 集合
     │  遍历 dstFiles，仅对 size 在 possibleSizes 中的对象计算 renameID
     │  以 renameID 为 key 推入 renameMap: map[string][]fs.Object
-    │                      ([sync.go#L855-L892](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L855-L892)
+    │                      ([fs/sync/sync.go#L855-L892](fs/sync/sync.go#L855-L892))
     │
     ▼
 遍历 renameCheck，逐个送入 toBeRenamed
-    │                      ([sync.go#L970-L977](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L970-L977)
+    │                      ([fs/sync/sync.go#L970-L977](fs/sync/sync.go#L970-L977))
     │
     ▼
 pairRenamer 消费 toBeRenamed
     │
     ├─ tryRename() 成功 → 服务端 Move 重命名
-    │                        从 dstFiles 中移除，不进入 toBeUploaded
+    │                      从 dstFiles 中移除，不进入 toBeUploaded
     │
     └─ tryRename() 失败 → 送入 toBeUploaded 正常传输
-                              ([sync.go#L491](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L491)
+                            ([fs/sync/sync.go#L491](fs/sync/sync.go#L491))
 ```
 
 ### 3.4 匹配 key 构造、候选筛选与重命名的完整链路
 
 track-renames 的匹配过程分三个阶段，由三个函数各司其职：
 
-#### 阶段一：renameID——构造匹配 key（[sync.go#L775-L804](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L775-L804)）
+#### 阶段一：renameID——构造匹配 key（[fs/sync/sync.go#L775-L804](fs/sync/sync.go#L775-L804)）
 
 `renameID` 为源端和目的端对象生成相同的 key 体系，用于 map 精确查找。
 
 **核心规则：size 总是参与，hash 和 leaf 按策略写入 key 字符串，modtime 永远不写入 key——它在候选弹出时按时间窗口比较。**
 
-代码中的关键注释（[sync.go#L795-L796](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L795-L796)）：
+代码中的关键注释（[fs/sync/sync.go#L795-L796](fs/sync/sync.go#L795-L796)）：
 
 ```go
 // for renamesStrategy.modTime() we don't add to the hash but we check the times in
@@ -366,7 +361,7 @@ track-renames 的匹配过程分三个阶段，由三个函数各司其职：
 
 各策略下 renameID 的实际输出：
 
-| --track-renames-strategy | renameID 输出 | 说明 |
+| `--track-renames-strategy` | renameID 输出 | 说明 |
 |--------------------------|--------------|------|
 | `hash` | `"12345,SHA256:abc..."` | size + 逗号 + hash 值 |
 | `modtime` | `"12345"` | **仅有 size**，modtime 在 popRenameMap 中按 modifyWindow 比较 |
@@ -376,13 +371,13 @@ track-renames 的匹配过程分三个阶段，由三个函数各司其职：
 | `modtime,leaf` | `"12345,photo.jpg"` | leaf 写入 key，modtime 在弹出时二次筛选 |
 | `hash,modtime,leaf` | `"12345,SHA256:abc...,photo.jpg"` | hash+leaf 写入 key，modtime 在弹出时二次筛选 |
 
-**为什么 modtime 不写入 key？** 因为 modtime 是连续值，文件重命名后 modtime 可能因精度/时区差异而不完全相同，无法做精确的字符串匹配。按 modifyWindow 容差比较才能正确匹配。
+**为什么 modtime 不写入 key？** 因为 modtime 是连续值，文件重命名后 modtime 可能因精度 / 时区差异而不完全相同，无法做精确的字符串匹配。按 modifyWindow 容差比较才能正确匹配。
 
 **renameID 返回空字符串的两种情况**：
 1. hash 策略下，对象的 hash 计算失败或返回空
 2. 此时该对象无法参与重命名匹配，`tryRename` 直接返回 false
 
-#### 阶段二：makeRenameMap——构建目的端索引（[sync.go#L855-L892](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L855-L892)）
+#### 阶段二：makeRenameMap——构建目的端索引（[fs/sync/sync.go#L855-L892](fs/sync/sync.go#L855-L892)）
 
 March 遍历结束后，为 dstFiles 中可能与源端重命名的对象建立索引：
 
@@ -399,40 +394,34 @@ March 遍历结束后，为 dstFiles 中可能与源端重命名的对象建立�
 - 同一文件无论在源端还是目的端，renameID 输出相同（前提是两端使用同一种 hash）
 - modtime 策略下 key 仅含 size，多个同 size 的目的端对象会共享一个 key，形成候选列表
 
-#### 阶段三：tryRename → popRenameMap——查找、筛选、弹出（[sync.go#L896-L927](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L896-L927) + [sync.go#L815-L851](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L815-L851)）
+#### 阶段三：tryRename → popRenameMap——查找、筛选、弹出
 
-`tryRename` 不直接操作 renameMap，而是调用 `popRenameMap` 一站式完成"查找 → modtime 筛选 → 弹出"：
+[tryRename](fs/sync/sync.go#L896-L927) 不直接操作 renameMap，而是调用 [popRenameMap](fs/sync/sync.go#L815-L851) 一站式完成"查找 → modtime 筛选 → 弹出"：
 
 ```go
 func (s *syncCopyMove) tryRename(src fs.Object) bool {
-    // 1. 计算源端的 renameID（与目的端用同一个函数）
     hash := s.renameID(src, s.trackRenamesStrategy, ...)
     if hash == "" {
-        return false   // 无法生成 key，直接放弃
+        return false
     }
 
-    // 2. 调用 popRenameMap：按 key 查找 + modtime 筛选 + 弹出
     dst := s.popRenameMap(hash, src)
     if dst == nil {
-        return false   // 无匹配候选，放弃
+        return false
     }
 
-    // 3. 检查目标路径是否已有同名文件
     dstOverwritten, _ := s.fdst.NewObject(s.ctx, src.Remote())
-
-    // 4. 服务端 Move：将 dst 从旧路径移到 src.Remote() 路径
     _, err := operations.Move(s.ctx, s.fdst, dstOverwritten, src.Remote(), dst)
     if err != nil {
-        return false   // Move 失败，放弃
+        return false
     }
 
-    // 5. 从 dstFiles 中移除，避免被 DeleteModeAfter 删除
     delete(s.dstFiles, dst.Remote())
     return true
 }
 ```
 
-`popRenameMap` 的内部逻辑（[sync.go#L815-L851](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L815-L851)）：
+`popRenameMap` 的内部逻辑：
 
 ```go
 func (s *syncCopyMove) popRenameMap(hash string, src fs.Object) (dst fs.Object) {
@@ -440,9 +429,8 @@ func (s *syncCopyMove) popRenameMap(hash string, src fs.Object) (dst fs.Object) 
     defer s.renameMapMu.Unlock()
     dsts, ok := s.renameMap[hash]
     if ok && len(dsts) > 0 {
-        i := 0  // 默认取第一个候选
+        i := 0
 
-        // modtime 策略：遍历候选列表，找到第一个 modtime 在 modifyWindow 内的
         if s.trackRenamesStrategy.modTime() {
             i = -1
             srcModTime := src.ModTime(s.ctx)
@@ -450,15 +438,14 @@ func (s *syncCopyMove) popRenameMap(hash string, src fs.Object) (dst fs.Object) 
                 dt := dst.ModTime(s.ctx).Sub(srcModTime)
                 if dt < s.modifyWindow && dt > -s.modifyWindow {
                     i = j
-                    break      // 找到第一个匹配即停止
+                    break
                 }
             }
             if i < 0 {
-                return nil   // 所有候选的 modtime 都不匹配
+                return nil
             }
         }
 
-        // 从候选列表中弹出匹配项
         dst = dsts[i]
         dsts = slices.Delete(dsts, i, i+1)
         if len(dsts) > 0 {
@@ -471,7 +458,7 @@ func (s *syncCopyMove) popRenameMap(hash string, src fs.Object) (dst fs.Object) 
 }
 ```
 
-**匹配流程总结**：
+匹配流程总结：
 
 ```
 源端 src 对象
@@ -480,7 +467,7 @@ func (s *syncCopyMove) popRenameMap(hash string, src fs.Object) (dst fs.Object) 
 renameID(src) → key 字符串（size + [hash] + [leaf]，modtime 不写入）
     │
     ▼
-renameMap[key] → 候选列表 []fs.Object（可能是多个同 size/同 hash 的目的端对象）
+renameMap[key] → 候选列表 []fs.Object
     │
     ├─ 候选列表为空 → tryRename 返回 false → pairRenamer 送入 toBeUploaded
     │
@@ -493,7 +480,7 @@ renameMap[key] → 候选列表 []fs.Object（可能是多个同 size/同 hash �
               ├─ 找到 → 弹出该候选，继续 Move
               │
               └─ 未找到 → popRenameMap 返回 nil → tryRename 返回 false
-                                                         → pairRenamer 送入 toBeUploaded
+                                                        → pairRenamer 送入 toBeUploaded
 ```
 
 **tryRename 失败的三种情况**：
@@ -510,7 +497,7 @@ renameMap[key] → 候选列表 []fs.Object（可能是多个同 size/同 hash �
 
 ### 4.1 DeleteMode 定义
 
-[deletemode.go](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/deletemode.go#L4-L14) 定义了五种删除模式：
+[fs/deletemode.go](fs/deletemode.go#L4-L14) 定义了五种删除模式：
 
 | 模式 | 值 | 含义 |
 |------|---|------|
@@ -522,14 +509,12 @@ renameMap[key] → 候选列表 []fs.Object（可能是多个同 size/同 hash �
 
 ### 4.2 DeleteModeBefore——两遍扫描策略
 
-[runSyncCopyMove](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1352-L1379) 中处理 `DeleteModeBefore`：
+[runSyncCopyMove](fs/sync/sync.go#L1352-L1379) 中处理 `DeleteModeBefore`：
 
 ```go
 if deleteMode == fs.DeleteModeBefore {
-    // 第一遍：DeleteModeOnly，仅删除目的端多余文件
     do, _ := newSyncCopyMove(ctx, fdst, fsrc, fs.DeleteModeOnly, ...)
     do.run()
-    // 第二遍：DeleteModeOff，仅复制
     deleteMode = fs.DeleteModeOff
 }
 do, _ := newSyncCopyMove(ctx, fdst, fsrc, deleteMode, ...)
@@ -540,7 +525,7 @@ return do.run()
 
 ### 4.3 DeleteModeDuring——边传边删
 
-`DstOnly` 回调中对文件直接发送到 `deleteFilesCh`（[sync.go#L1067-L1073](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1067-L1073)：
+`DstOnly` 回调中对文件直接发送到 `deleteFilesCh`（[fs/sync/sync.go#L1067-L1073](fs/sync/sync.go#L1067-L1073)）：
 
 ```go
 case fs.DeleteModeDuring, fs.DeleteModeOnly:
@@ -551,11 +536,11 @@ case fs.DeleteModeDuring, fs.DeleteModeOnly:
     }
 ```
 
-后台 [deleter goroutine](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L603-L611) 消费 `deleteFilesCh`，调用 `DeleteFilesWithBackupDir` 执行删除。
+后台 [deleter goroutine](fs/sync/sync.go#L603-L611) 消费 `deleteFilesCh`，调用 `DeleteFilesWithBackupDir` 执行删除。
 
 ### 4.4 DeleteModeAfter——默认策略
 
-`DstOnly` 回调中将对象存入 `dstFiles` map（[sync.go#L1062-L1066](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L1062-L1066)），在 `run()` 的末尾阶段批量调用 [deleteFiles](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L627-L666)：
+`DstOnly` 回调中将对象存入 `dstFiles` map（[fs/sync/sync.go#L1062-L1066](fs/sync/sync.go#L1062-L1066)），在 `run()` 的末尾阶段批量调用 [deleteFiles](fs/sync/sync.go#L627-L666)：
 
 ```go
 if s.deleteMode == fs.DeleteModeAfter {
@@ -567,10 +552,10 @@ if s.deleteMode == fs.DeleteModeAfter {
 
 ### 4.5 空目录清理
 
-在文件删除之后，[deleteEmptyDirectories](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L670-L710) 按路径长度从长到短（最深目录优先）删除空目录：
+在文件删除之后，[deleteEmptyDirectories](fs/sync/sync.go#L670-L710) 按路径长度从长到短（最深目录优先）删除空目录：
 
 ```go
-sort.Sort(entries)        // 按路径排序
+sort.Sort(entries)
 for i := len(entries)-1; i >= 0; i-- {
     err := operations.TryRmdir(ctx, f, dir.Remote())
 }
@@ -578,7 +563,7 @@ for i := len(entries)-1; i >= 0; i-- {
 
 ### 4.6 backup-dir 保护
 
-如果设置了 `--backup-dir`，所有删除操作不会真正删除，而是移动到备份目录。这由 [DeleteFileWithBackupDir](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/operations/operations.go#L550-L578) 实现：
+如果设置了 `--backup-dir`，所有删除操作不会真正删除，而是移动到备份目录。这由 [DeleteFileWithBackupDir](fs/operations/operations.go#L550-L578) 实现：
 
 ```go
 if backupDir != nil {
@@ -590,7 +575,7 @@ if backupDir != nil {
 
 ### 4.7 错误安全守卫
 
-删除操作受错误状态保护（[sync.go#L628-L641](file:///d:/fz/0601-2/solo-dogfeeding/code/55-rclone/fs/sync/sync.go#L628-L641)）：
+删除操作受错误状态保护（[fs/sync/sync.go#L628-L641](fs/sync/sync.go#L628-L641)）：
 
 ```go
 if accounting.Stats(s.ctx).Errored() && !s.ci.IgnoreErrors {
@@ -607,83 +592,71 @@ if accounting.Stats(s.ctx).Errored() && !s.ci.IgnoreErrors {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                          syncCopyMove.run()                        │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                    March.Run() — 目录遍历                         │  │
+│                        syncCopyMove.run()                               │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                  March.Run() —— 目录遍历                           │  │
+│  │                                                                  │  │
+│  │   fsrc 目录 ──┐                                                  │  │
+│  │               ├── matchListings() ──→ 三路分发                   │  │
+│  │   fdst 目录 ──┘                                                  │  │
+│  │                                                                  │  │
+│  │   SrcOnly (文件)                                                 │  │
+│  │     │                                                            │  │
+│  │     ├─ trackRenames=true  → trackRenamesCh → renameCheck         │  │
+│  │     │                                                           │  │
+│  │     └─ trackRenames=false → CompareOrCopyDest → toBeUploaded     │  │
 │  │                                                                │  │
-│  │   fsrc 目录 ──┐                                           │  │
-│  │                   ├── matchListings() ──→ 三路分发             │  │
-│  │   fdst 目录 ──┘                                           │  │
-│  │                                                                │  │
-│  │   SrcOnly (文件)                                            │  │
-│  │     │                                                          │  │
-│  │     ├─ trackRenames=true  ──→ trackRenamesCh ──→ renameCheck │  │
-│  │     │                          (收集，不立即处理)                 │  │
-│  │     │                                                          │  │
-│  │     └─ trackRenames=false ──→ CompareOrCopyDest ──→ toBeUploaded │  │
-│  │                                                             │  │
-│  │   DstOnly (文件)                                            │  │
-│  │     │                                                          │  │
-│  │     ├─ DeleteModeAfter  ──→ dstFiles map (留待后删)         │  │
-│  │     ├─ DeleteModeDuring ──→ deleteFilesCh → deleter goroutine │  │
-│  │     └─ DeleteModeOnly   ──→ deleteFilesCh → deleter goroutine │  │
-│  │                                                                │  │
-│  │   Match (文件vs文件) ──→ toBeChecked ──→ pairChecker ──→ toBeUploaded │  │
-│  │                                                                │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ┌──────────── 差异计算 & 传输队列 ────────────┐                │
-│  │                                                     │                │
-│  │  toBeChecked ──→ pairChecker ──┐            │                │
-│  │                    │                  │            │                │
-│  │                    ├─ NeedTransfer() 判定            │                │
-│  │                    ├─ CompareOrCopyDest() 免除       │            │                │
-│  │                    └─ backupDir 备份后传输 ────┘            │                │
-│  │                                                     │                │
-│  │  [trackRenames 路径 — 与上面并行！]                   │                │
-│  │  trackRenamesCh ──→ renameCheck ──(March结束)──→ makeRenameMap │
-│  │                                                     │                │
-│  │  makeRenameMap: 为 dstFiles 中与 src size 匹配的对象计算 hash │  │
-│  │    构建 renameMap: renameID → []dstObject            │                │
-│  │                                                     │                │
-│  │  renameCheck ──→ toBeRenamed ──→ pairRenamer ──┐            │
-│  │                                                     │            │
-│  │                                                     ├─ tryRename 成功 → 服务端重命名，从 dstFiles 移除 │  │
-│  │                                                     └─ tryRename 失败 → toBeUploaded │  │
-│  │                                                     │                │
-│  │  toBeUploaded ──→ pairCopyOrMove ──→ Copy/Move │                │
-│  │    (汇聚点：SrcOnly + pairChecker + pairRenamer)  │                │
-│  │                                                     │                │
-│  │  --order-by 排序: name/size/modtime + mixed 分数    │                │
-│  │  --check-first: 先完成所有检查再启动传输             │                │
-│  └─────────────────────────────────────────────────────┘                │
-│                                                                     │
-│  ┌──────────── 删除策略 ────────────┐                │
-│  │                                                     │                │
-│  │  DeleteModeBefore: 两遍扫描（先删后传）              │                │
-│  │    第一遍 DeleteModeOnly → 仅删除                  │                │
-│  │    第二遍 DeleteModeOff → 仅复制                    │                │
-│  │    ❌ 不兼容 track-renames                          │                │
-│  │                                                     │                │
-│  │  DeleteModeDuring: deleteFilesCh → deleter goroutine│                │
-│  │    边传边删，节省时间但有风险                        │                │
-│  │                                                     │                │
-│  │  DeleteModeAfter: dstFiles map → deleteFiles() │                │
-│  │    ✅ 兼容 track-renames（强制启用）                  │                │
-│  │    最安全，传输完成后才删除                          │                │
-│  │                                                     │                │
-│  │  删除后 → deleteEmptyDirectories() (最深目录优先)    │                │
-│  │  错误守卫 → 有错误时不执行删除                       │                │
-│  │  backup-dir → 删除变更为移动到备份目录               │                │
-│  └─────────────────────────────────────────────────────┘                │
-│                                                                     │
-│  最终阶段:                                                          │
-│    1. 设置目录 ModTime (setDirModTimeAfter)                         │
-│    2. 清理空目录 (dstEmptyDirs)                                   │
-│    3. 清理源端空目录 (DoMove + deleteEmptySrcDirs)                 │
-│    4. 检查 max-duration 超时                                        │
-│    5. track-renames 强制 DeleteModeAfter（确保重命名检测完整）          │
+│  │   DstOnly (文件)                                                 │  │
+│  │     │                                                            │  │
+│  │     ├─ DeleteModeAfter  → dstFiles map (留待后删)                │  │
+│  │     ├─ DeleteModeDuring → deleteFilesCh → deleter goroutine      │  │
+│  │     └─ DeleteModeOnly   → deleteFilesCh → deleter goroutine      │  │
+│  │                                                                  │  │
+│  │   Match (文件vs文件) → toBeChecked → pairChecker → toBeUploaded  │  │
+│  │                                                                  │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  ┌────────────── 差异计算 & 传输队列 ──────────────┐                 │
+│  │                                                   │                 │
+│  │  toBeChecked → pairChecker → toBeUploaded        │                 │
+│  │              (路径 1)                             │                 │
+│  │                                                   │                 │
+│  │  SrcOnly(trackRenames=false) → toBeUploaded      │                 │
+│  │              (路径 2)                             │                 │
+│  │                                                   │                 │
+│  │  [trackRenames 路径 —— 与上面两条并行！]           │                 │
+│  │  trackRenamesCh → renameCheck                    │                 │
+│  │                     ↓ (March 结束)                │                 │
+│  │              makeRenameMap 构建索引                │                 │
+│  │                     ↓                             │                 │
+│  │              toBeRenamed → pairRenamer ──┐       │                 │
+│  │                                           │       │                 │
+│  │                      tryRename 成功 → 服务端重命名 │                 │
+│  │                      tryRename 失败 → toBeUploaded │                 │
+│  │              (路径 3)                        │                 │
+│  │                                                   │                 │
+│  │  toBeUploaded → pairCopyOrMove → Copy/Move       │                 │
+│  │    (三条路径汇聚点：SrcOnly + pairChecker + pairRenamer)             │
+│  │                                                   │                 │
+│  │  --order-by 排序 + --check-first 支持             │                 │
+│  └───────────────────────────────────────────────────┘                 │
+│                                                                         │
+│  ┌────────────── 删除策略 ────────────────┐                           │
+│  │                                         │                           │
+│  │  DeleteModeBefore: 两遍扫描（先删后传） │                           │
+│  │  DeleteModeDuring: deleteFilesCh 即时删 │                           │
+│  │  DeleteModeAfter: dstFiles map 延后删   │                           │
+│  │  错误守卫 → 有错误时不执行删除          │                           │
+│  │  backup-dir → 删除变更为移动到备份目录   │                           │
+│  └─────────────────────────────────────────┘                           │
+│                                                                         │
+│  最终阶段:                                                              │
+│    1. 设置目录 ModTime                                                  │
+│    2. 清理空目录 (dstEmptyDirs)                                         │
+│    3. 清理源端空目录 (DoMove + deleteEmptySrcDirs)                      │
+│    4. 检查 max-duration 超时                                            │
+│    5. track-renames 强制 DeleteModeAfter                                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -693,7 +666,7 @@ if accounting.Stats(s.ctx).Errored() && !s.ci.IgnoreErrors {
 
 ### 6.1 并行汇聚架构，不是线性流水线
 
-**关键纠正**：之前的 "三级管道依次串联" 是错误的。真实架构是**两路并行汇聚到 `toBeUploaded`：
+**关键纠正**：之前的"三级管道依次串联"是错误的。真实架构是**三条路径并行汇聚**到 `toBeUploaded`：
 
 - **路径 1**：Match → toBeChecked → pairChecker → toBeUploaded
 - **路径 2**：SrcOnly (trackRenames=false) → toBeUploaded
@@ -702,14 +675,14 @@ if accounting.Stats(s.ctx).Errored() && !s.ci.IgnoreErrors {
 这种架构的优势：
 - SrcOnly 不需要经过检查队列，减少不必要的 hash 计算
 - track-renames 是可选的独立路径，不影响正常传输路径
-- toBeUploaded 作为统一的传输调度入口，统一应用 --order-by 排序
+- toBeUploaded 作为统一的传输调度入口，统一应用 `--order-by` 排序
 
 ### 6.2 track-renames 的两阶段设计
 
-track-renames 采用"先收集、后处理的两阶段设计：
+track-renames 采用"先收集、后处理"的两阶段设计：
 
-1. **收集阶段**（March 遍历期间，SrcOnly 文件存入 trackRenamesCh，仅收集不处理
-2. **处理阶段**（March 结束后），构建 renameMap，逐个尝试重命名
+1. **收集阶段**（March 遍历期间）：SrcOnly 文件存入 trackRenamesCh，仅收集不处理
+2. **处理阶段**（March 结束后）：构建 renameMap，逐个尝试重命名
 
 这样设计的原因：
 - 重命名检测需要完整的 dstFiles map，必须等遍历完成

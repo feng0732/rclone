@@ -496,3 +496,573 @@ ListR 的 `FastListBugFix` 机制展示了对第三方 API 缺陷的优雅处理
 | **变更处理** | changeNotifyRunner | [drive.go#L3238-L3323](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3238-L3323) |
 | **快捷方式解引用** | resolveShortcut | [drive.go#L2391-L2417](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2391-L2417) |
 | **目录叶子查找** | FindLeaf | [drive.go#L1730-L1751](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1730-L1751) |
+
+---
+
+## 八、Drive API 调用参数差异全解
+
+rclone 在调用 Google Drive 不同 API 时使用的参数集合各不相同，体现了对各 API 语义的精确适配。
+
+### 8.1 七大类 API 调用参数矩阵
+
+| API 调用 | 典型场景 | `SupportsAllDrives` | `DriveId` | `Corpora` | `IncludeItemsFromAllDrives` | `Spaces` | `RestrictToMyDrive` | 其他关键参数 |
+|---------|---------|---------------------|-----------|-----------|----------------------------|----------|--------------------|-------------|
+| **Files.List** | 文件列表查询 | ✅ 始终 true | 共享盘时设置 | 共享盘时 `"drive"` | ✅ 始终 true | appDataFolder 时设 | ❌ 无 | `Q`, `PageSize`, `Fields` |
+| **Files.Get** | 单文件获取 | ✅ 始终 true | ❌ 不设 | ❌ 不设 | ❌ 无 | ❌ 无 | ❌ 无 | `Fields` |
+| **Files.Create** | 创建文件/目录 | ✅ 始终 true | ❌ 不设 | ❌ 不设 | ❌ 无 | ❌ 无 | ❌ 无 | `Fields`, 父目录ID在 body |
+| **Files.Update** | 更新文件/移动/恢复 | ✅ 始终 true | ❌ 不设 | ❌ 不设 | ❌ 无 | ❌ 无 | ❌ 无 | `Fields`, body 数据 |
+| **Files.Delete** | 永久删除 | ✅ 始终 true | ❌ 不设 | ❌ 不设 | ❌ 无 | ❌ 无 | ❌ 无 | `Fields` 设空 |
+| **Files.EmptyTrash** | 清空回收站 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | 无额外参数 |
+| **Drives.List** | 列出所有共享盘 | ❌ 隐式支持 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | `PageSize`, `PageToken` |
+| **Drives.Get** | 获取单个共享盘详情 | ❌ 隐式支持 | 路径参数 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | `Fields` |
+| **About.Get** | 获取存储配额 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | `Fields("storageQuota")` |
+| **Changes.GetStartPageToken** | 获取变更起始游标 | ✅ 始终 true | 共享盘时设置 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | 无 |
+| **Changes.List** | 拉取变更列表 | ✅ 始终 true | 共享盘时设置 | ❌ 无 | ✅ 始终 true | appDataFolder 时设 | ✅ SharedWithMe 时 false | `PageSize`, `Fields` |
+
+### 8.2 关键参数深度解读
+
+**`SupportsAllDrives(true)`** — 「声明支持」开关
+- 自 Google Drive API v3 2020 年升级后，所有需要访问共享盘的调用都必须显式声明
+- 代码中在 `Files.*`（除 List 外有时省略，但核心操作都有）、`Changes.*` 上都设置
+- 注意：`Drives.*` API 本身就是共享盘专属，不需要这个参数
+
+**`DriveId` + `Corpora("drive")`** — 查询范围限定
+- 只在 `Files.List` 和 `Changes.*` 上使用（查询类 API）
+- `DriveId` 告诉 API 「只查这个共享盘里的内容」
+- `Corpora` 设定查询语料库范围：`"user"`（个人盘，默认）/ `"drive"`（共享盘）/ `"allDrives"`（全部）
+- 代码中共享盘模式下两者**成对出现**，确保查询范围一致
+
+**`IncludeItemsFromAllDrives(true)`** — 结果集开关
+- 告诉 API「返回结果中可以包含共享盘项目」
+- 与 `DriveId` 配合：`DriveId` 限定范围，`IncludeItems` 允许结果中出现共享盘项目
+- 个人盘查询共享给我的共享盘内容时也需要设这个
+
+**`RestrictToMyDrive`** — 变更检测独有
+- 仅 `Changes.List` 有此参数
+- 设为 `true` 时只返回"我的云端硬盘"中的变更（排除共享内容）
+- 代码中：`changesCall.RestrictToMyDrive(!f.opt.SharedWithMe)`
+  - SharedWithMe 模式 → false → 不限制，包含共享文件的变更
+  - 非 SharedWithMe 模式 → true → 只看自己的盘
+
+**`Spaces`** — 存储空间选择
+- `"drive"`（默认，普通文件）/ `"appDataFolder"`（应用数据文件夹）/ `"photos"`（谷歌相册）
+- 代码中仅在 `rootFolderID == "appDataFolder"` 时设置为 `"appDataFolder"`
+- 在 Files.List 和 Changes.List 中都有相应设置
+
+### 8.3 参数设置的代码位置对照
+
+| 参数 | Files.List 位置 | Changes.List 位置 | 备注 |
+|------|----------------|------------------|------|
+| `SupportsAllDrives` | [drive.go#L1101](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1101) | [drive.go#L3249](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3249) | 查询类 API 设置 |
+| `IncludeItemsFromAllDrives` | [drive.go#L1102](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1102) | [drive.go#L3250](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3250) | 查询类 API 设置 |
+| `DriveId` | [drive.go#L1104](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1104) | [drive.go#L3252](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3252) | 共享盘时设置 |
+| `Corpora("drive")` | [drive.go#L1105](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1105) | ❌ 无 | 仅 Files.List 需要 |
+| `Spaces("appDataFolder")` | [drive.go#L1109](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1109) | [drive.go#L3256](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3256) | appDataFolder 模式 |
+| `RestrictToMyDrive` | ❌ 无 | [drive.go#L3258](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3258) | 仅变更检测 |
+
+---
+
+## 九、缓存未命中场景边界分析
+
+`dirCache` 是文件查询与变更检测的桥梁，但它本质上是一个**惰性填充的缓存**——只有被访问过的路径才会进入缓存。当缓存未命中时，三大模块的行为边界差异显著。
+
+### 9.1 dirCache 的填充时机与生命周期
+
+**填充路径（正向 + 反向同时写入）**：
+```
+itemToDirEntry()
+  → 遇到 folder 类型 → dirCache.Put(remote, item.Id)
+  → 同时写入 cache[path]=id 和 invCache[id]=path
+```
+
+只有 `ListP`、`ListR` 等列表操作会触发填充。单次文件查询（NewObject）**不会**向 dirCache 写入新目录条目。
+
+**清空路径**：
+- `DirCacheFlush()` → `ResetRoot()` → 全部清空，回到 trueRoot 状态
+- `FlushDir(dir)` → 清空某目录及其所有子项（用于移动/删除后）
+- VFS 挂载时 `ForgetAll()` 也会级联触发
+
+### 9.2 缓存未命中的五种典型场景
+
+#### 场景 1：首次启动，冷启动状态
+
+```
+初始状态: dirCache 只有 { "": rootFolderID }
+  ↓
+用户访问 a/b/c.txt
+  ↓
+dirCache.FindDir("a/b")  // 未命中
+  → _findDir("a/b")
+    → 先递归找 "a" → 未命中 → FindLeaf(root, "a") → 调用 list()
+    → 找到后 Put("a", aId)
+    → 再找 "b" → 未命中 → FindLeaf(aId, "b") → 调用 list()
+    → 找到后 Put("a/b", bId)
+  ↓
+返回 bId，继续找文件 c.txt
+```
+
+**代价**：每深一级目录多一次 API 调用。冷启动阶段的列表操作是缓存填充的黄金时期。
+
+#### 场景 2：变更检测遇到新文件（新路径不在缓存）
+
+外部客户端在 `docs/` 下新建了 `report.docx`，而 `docs/` 已经在缓存中：
+
+```
+change = { fileId: newId, file: { name: "report.docx", parents: [docsId] } }
+  ↓
+① 旧路径: dirCache.GetInv(newId) → ❌ 未命中（新文件无旧路径）
+  → 不加入 pathsToClear
+  ↓
+② 新路径: for parent in parents {
+     dirCache.GetInv(docsId) → ✅ 命中 → "docs"
+     → 拼接: "docs/report.docx" → 加入 pathsToClear
+   }
+  ↓
+notifyFunc("docs/report.docx", EntryObject)
+```
+
+**效果**：VFS 层收到通知后会失效对应路径缓存。下次用户 ls docs 时触发 ListP 重新拉取，就能看到新文件。
+
+#### 场景 3：变更检测遇到移动到未缓存目录
+
+文件从 `a/` 移动到 `b/c/`，而 `b/c/` 从未被访问过：
+
+```
+change = { fileId: fileId, file: { name: "x.txt", parents: [bcId] } }
+  ↓
+① 旧路径: dirCache.GetInv(fileId) → ✅ 命中 → "a/x.txt"
+  → 加入 pathsToClear
+  ↓
+② 新路径: for parent in parents {
+     dirCache.GetInv(bcId) → ❌ 未命中
+     → 跳过，不加入 pathsToClear
+   }
+  ↓
+只通知了 "a/x.txt"（旧位置失效）
+新位置 "b/c/x.txt" 完全不知道
+```
+
+**后果**：
+- 旧位置的 VFS 缓存会失效
+- 新位置不会主动通知，用户如果不主动进入 `b/c/` 目录，就看不到文件
+- 只有当用户主动 `ls b/c/` 触发 ListP 后，新位置才会被发现
+
+#### 场景 4：文件被移动到更深的未缓存路径树
+
+与场景 3 类似，但影响范围更大——整个子树都在盲区。
+
+```
+文件夹 docs/ 被移动到 archive/2023/
+  ↓
+① dirCache 中所有 docs/ 下的子项 → GetInv 能查到旧路径
+  → 所有旧路径都能被通知失效
+  ↓
+② 新父目录 archive/2023/ → 不在缓存中
+  → 新位置完全不可见
+  ↓
+结果: 用户感知到 "docs/ 消失了"，但不知道它去了哪里
+```
+
+#### 场景 5：深层目录的孙子文件变更
+
+```
+dirCache 中有: a/ → aId
+            a/b/ → 不在缓存（从未 list 过）
+  ↓
+a/b/c.txt 被外部修改
+  ↓
+① 旧路径: GetInv(fileId) → ❌ 未命中（从未访问过）
+  ↓
+② 新路径: parents = [abId] → GetInv(abId) → ❌ 未命中
+  ↓
+结果: 完全没有通知 ★
+用户完全不知道 a/b/c.txt 变了
+```
+
+**这是变更通知最大的盲区**：对于从未 list 过的子目录内的变化，变更检测无能为力。这也是 rclone 的 VFS 还需要配合 `PollInterval` 和 `refresh` 机制的原因。
+
+### 9.3 缓存未命中的设计哲学
+
+rclone 的变更通知设计遵循**「尽力而为」**原则：
+- 能在缓存中找到路径 → 精确通知
+- 找不到 → 静默跳过，不做额外 API 调用
+- 不尝试「递归反查父目录路径」（代价太高）
+
+这种设计的权衡：
+- ✅ 不增加额外 API 调用，不影响性能
+- ✅ 不阻塞变更处理流水线
+- ❌ 存在通知盲区（未访问过的目录树）
+- ❌ 移动类变更可能只通知一半（旧位置）
+
+---
+
+## 十、删除事件在变更通知中的处理边界
+
+删除事件是变更通知中最容易被忽视、也是行为最特殊的一类。
+
+### 10.1 删除事件的两种形态
+
+Google Drive API 的变更事件中，删除有两种表现形式：
+
+| 删除方式 | change.File | change.Removed | 说明 |
+|---------|------------|---------------|------|
+| **移入回收站**（Trashed） | 非 nil，`file.trashed=true` | false | 文件还在，标记为已删除 |
+| **永久删除**（Permanently Deleted） | nil | true | 文件彻底消失，没有 file 信息 |
+
+> 注意：rclone 当前代码**没有读取 `change.Removed` 字段**，完全依赖 `change.File != nil` 来区分。
+
+### 10.2 代码中的处理逻辑
+
+[drive.go#L3271-L3302](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3271-L3302)
+
+```go
+for _, change := range changeList.Changes {
+    // ① 找旧路径（只看 fileId，不依赖 change.File）
+    if path, ok := f.dirCache.GetInv(change.FileId); ok {
+        // 根据 mimeType 判断类型；如果 change.File 为 nil，默认按目录处理
+        if change.File != nil && change.File.MimeType != driveFolderType {
+            pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
+        } else {
+            pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryDirectory})
+        }
+    }
+
+    // ② 找新路径（只有 change.File != nil 时才尝试）
+    if change.File != nil {
+        // ... 计算新路径 ...
+    }
+}
+```
+
+**关键点解读**：
+
+1. **旧路径查找不依赖 `change.File`**
+   - 只需要 `change.FileId`
+   - 无论文件是被移到回收站还是永久删除，只要 fileId 在 dirCache 中，就能找到旧路径并发出通知
+
+2. **永久删除时 `change.File == nil`**
+   - 新路径计算块完全跳过（`if change.File != nil` 不进入）
+   - 只发旧路径通知（失效）
+   - 符合预期：删除了就是没了，不需要新路径
+
+3. **类型判定的 fallback**
+   - 如果 `change.File == nil`（永久删除），`mimeType` 判断走 else 分支 → **默认按目录处理**
+   - 这个细节对 VFS 影响不大，因为无论是 EntryObject 还是 EntryDirectory，最终都是清除缓存
+
+### 10.3 删除事件的级联盲区
+
+**最大的坑：删除目录不会产生子文件的变更事件**
+
+Google Drive API 的行为：删除一个目录时，**只产生一条该目录的变更记录**，目录内的所有子文件、子目录**不会**各自产生变更事件。
+
+```
+删除 docs/ 目录（内含 report.docx, data.csv, subdir/ 等）
+  ↓
+Google Drive 只产生 1 条 change（docs/ 本身）
+  ↓
+rclone 处理:
+  GetInv(docsId) → 命中 → "docs" 通知
+  子文件 report.docx → 没有 change → 不会被通知
+  子目录 subdir/ → 没有 change → 不会被通知
+  ↓
+dirCache 中 "docs/report.docx"、"docs/subdir/" 等条目 → 仍留在缓存中 ★
+```
+
+**后果**：
+- VFS 中 `docs/` 目录本身会被标记为失效
+- 但 `docs/report.docx` 等子项的 dirCache 条目**仍然存在**
+- VFS 可能在一段时间内还能查到这些子项的元数据（读缓存）
+- 直到用户主动再次 list `docs/` → 触发 404 → 才会知道整个目录都没了
+
+### 10.4 回收站 vs 永久删除的行为差异
+
+| 行为 | 移入回收站（trashed=true） | 永久删除（permanent delete） |
+|------|--------------------------|----------------------------|
+| change.File | ✅ 存在，`trashed=true` | ❌ nil |
+| 旧路径通知 | ✅ 有（前提是在缓存） | ✅ 有（前提是在缓存） |
+| 新路径通知 | ❌ 无（parents 不变） | ❌ 无（没 file） |
+| 子文件变更事件 | ❌ 无（只有目录自身） | ❌ 无（只有目录自身） |
+| TrashedOnly 模式下可见 | ✅ 是 | ❌ 否 |
+| 可恢复 | ✅ untrash | ❌ 不可恢复 |
+
+### 10.5 与查询模块的联动：TrashedOnly 模式
+
+当 `--drive-trashed-only` 启用时，查询和变更检测的行为都发生变化：
+
+**查询侧（list）**：
+- `trashedOnly=true` 传递给 `list()`
+- 查询条件从 `trashed=false` 变成 `trashed=true`
+- 同时对文件夹特殊处理：`(mimeType='folder' or trashed=true)` 确保目录结构可见
+
+**变更检测侧**：
+- 没有特殊处理
+- 移入回收站的文件 → 旧路径通知（因为在缓存中）→ VFS 失效
+- 用户下次 list → 会在 TrashedOnly 模式下看到这些文件
+
+---
+
+## 十一、根目录对象特殊场景解析
+
+「根目录对象」指的是 `parents` 数组为空的文件或目录——它们直接位于某个存储空间的最顶层。
+
+### 11.1 什么情况下会出现根对象？
+
+**场景 1：Shared With Me 模式的根级别**
+
+[drive.go#L1021-L1030](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1021-L1030)
+
+当 `--drive-shared-with-me` 开启时，"共享给我"的文件和文件夹在 Google Drive 中**没有 `parents` 属性**（它们不在你的目录树里）。
+
+```
+SharedWithMe 模式下列表:
+  list() 中遇到 dirID == rootFolderID 时
+  → 用 "sharedWithMe=true" 替代 "'root' in parents" 查询
+  → 返回的文件 parents 数组为空
+```
+
+**场景 2：StarredOnly 模式**
+
+类似地，加星标的文件可能来自任何位置，根列表时也用 `starred=true` 查询。
+
+**场景 3：应用数据文件夹（appDataFolder）**
+
+应用数据文件夹是一个特殊的隔离空间，其根就是它自己。
+
+**场景 4：共享盘根目录下的对象（实际上有 parents）**
+
+共享盘的根本身是一个 drive，其下的文件 parents 指向根目录 ID，**通常不为空**。所以严格来说不算是「根对象」。
+
+### 11.2 列表查询中的特殊处理
+
+在 `list()` 函数中，根目录查询有特殊分支：
+
+[drive.go#L1021-L1033](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L1021-L1033)
+
+```go
+if (f.opt.SharedWithMe || f.opt.StarredOnly) && dirID == f.rootFolderID {
+    if f.opt.SharedWithMe {
+        _, _ = parentsQuery.WriteString("sharedWithMe=true")
+    }
+    if f.opt.StarredOnly {
+        if f.opt.SharedWithMe {
+            _, _ = parentsQuery.WriteString(" and ")
+        }
+        _, _ = parentsQuery.WriteString("starred=true")
+    }
+} else {
+    _, _ = fmt.Fprintf(parentsQuery, "'%s' in parents", dirID)
+}
+```
+
+**核心逻辑**：
+- 如果是根目录 + SharedWithMe/StarredOnly → 用特殊标志查询，不用 parents 过滤
+- 其他情况 → 标准的 `'dirID' in parents` 查询
+- 注意：只有**根目录这一级**有特殊处理。深入共享文件夹内部时，仍然用正常的 parents 查询
+
+### 11.3 变更检测中的根对象处理
+
+[drive.go#L3289-L3301](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L3289-L3301)
+
+```go
+if len(change.File.Parents) > 0 {
+    for _, parent := range change.File.Parents {
+        if parentPath, ok := f.dirCache.GetInv(parent); ok {
+            newPath := path.Join(parentPath, change.File.Name)
+            pathsToClear = append(pathsToClear, entryType{path: newPath, entryType: changeType})
+        }
+    }
+} else { // a true root object that is changed
+    pathsToClear = append(pathsToClear, entryType{path: change.File.Name, entryType: changeType})
+}
+```
+
+**这段代码的意图**：
+- `parents > 0` → 有父目录 → 通过父目录路径 + 文件名 计算完整路径
+- `parents == 0` → 根对象 → **直接用文件名作为路径**（相对根目录）
+
+**潜在问题**：
+1. **SharedWithMe 根目录的新文件** → 直接用文件名作为路径 → 正确（因为就在根视图下）
+2. **但如果文件本来就不在 rclone 的视图范围内呢？** → 会产生一条路径通知，但 VFS 可能根本没有这个路径
+3. **多个根对象同名的情况** → 通知可能只对应其中一个，语义模糊
+
+### 11.4 ListR 中的根目录特殊处理
+
+在 `listRRunner` 中，对根目录也有特殊判断：
+
+[drive.go#L2102-L2144](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/backend/drive/drive.go#L2102-L2144)
+
+```go
+if f.opt.SharedWithMe && len(item.Parents) == 0 && len(paths) == 1 && paths[0] == "" {
+    item.Parents = dirs  // 人为补上 parents
+}
+// ...
+if len(paths) == 1 {
+    i = 0                  // 根目录时直接用第一个（也是唯一的）路径
+    earlyExit = true       // 只插入一次
+}
+```
+
+**这段代码解释**：
+- SharedWithMe 模式下，根目录返回的文件 `parents` 为空
+- 为了后续能正常匹配路径，人为把 `dirs`（也就是 root ID）塞进去
+- 根目录只有一个路径，所以不需要二分查找，直接用索引 0
+- `earlyExit = true` 表示只插入一次（即使文件有多个 parents）
+
+### 11.5 根目录 ID 别名机制
+
+dirCache 还有一个 `SetRootIDAlias` 机制，用于处理根 ID 的不同表示形式：
+
+[dircache.go#L129-L141](file:///d:/fz/0601-2/solo-dogfeeding/code/45-rclone/lib/dircache/dircache.go#L129-L141)
+
+```go
+func (dc *DirCache) SetRootIDAlias(rootID string) {
+    dc.rootID = rootID
+    dc.Put("", dc.rootID)
+}
+```
+
+这个函数用于当发现"root"这个ID只是别名、实际有另一个真实ID时，可以更新缓存而不清空。在 Google Drive 中：
+- `"root"` 是一个魔法别名，实际对应你的根目录
+- `getRootID()` 会把 `"root"` 解析成真实 ID（一串字母数字）
+- 但 rclone 初始化时直接用配置值作为 rootFolderID，可能是 `"root"` 也可能是真实 ID
+
+---
+
+## 十二、边界场景串联全景：当共享盘 + 变更通知 + 缓存未命中交织
+
+最后，我们用一个综合场景把所有边界情况串联起来。
+
+### 场景：共享盘下深层目录的外部删除事件
+
+```
+初始状态:
+  - 配置了共享盘 TeamDriveX
+  - 用户 VFS 挂载后访问过 docs/ 目录，但没进入 docs/2024/
+  - dirCache 中有: "" → rootId, "docs" → docsId
+  - dirCache 中没有: "docs/2024" 及其子项
+
+外部操作:
+  某人在 Google Drive 网页端永久删除了 docs/2024/ 整个目录
+  （内含 report.docx、data/ 等一堆文件）
+```
+
+#### 第 1 步：变更检测收到事件
+
+```
+Changes.List 返回:
+  change[0]: { fileId: docs2024Id, file: nil, removed: true }  // 只有这一条！
+  (子文件和子目录都没有独立 change)
+```
+
+#### 第 2 步：changeNotifyRunner 处理
+
+```
+对 change (docs2024Id):
+
+  ① 旧路径:
+     dirCache.GetInv(docs2024Id) → ❌ 未命中！
+     （因为用户从未进入过 docs/2024/，不在缓存里）
+     → 不加入 pathsToClear
+     → 旧路径通知: 无
+
+  ② 新路径:
+     change.File == nil → 跳过
+     → 新路径通知: 无
+
+结果: 零通知 ★
+用户什么都感知不到
+```
+
+#### 第 3 步：用户后续操作
+
+```
+用户输入: ls docs/
+  → ListP("docs")
+  → list([docsId])
+  → 返回 2023/ 目录、2025/ 目录（没有 2024/ 了）
+  → itemToDirEntry 更新 dirCache
+    → "docs/2023" 已存在，刷新
+    → "docs/2025" 已存在，刷新
+    → "docs/2024" 消失了（不再返回，所以 Put 不会发生）
+  → 但 dirCache 中 "docs/2024" 这条记录还在吗？
+    → 不在！因为 dirCache 是惰性缓存，列表操作只会 Put 当前存在的项
+    → 已消失的项不会自动从 cache 中删除 ★
+    → 但如果 VFS 做了 diff，会发现少了 2024/ 并删除对应条目
+```
+
+#### 第 4 步：如果用户之前缓存了 docs/2024/report.docx
+
+```
+如果用户之前进入过 docs/2024/
+→ dirCache 中有 "docs/2024" → docs2024Id
+→ 也有 "docs/2024/report.docx" → reportId（不对，dirCache 只存目录）
+
+等等，dirCache 只存目录，不存文件！
+  → dirCache.invCache 中只有目录ID → 路径 的映射
+  → 文件ID 不在 dirCache 里 ★
+
+回到删除 docs/2024 的 change:
+  GetInv(docs2024Id) → 如果命中 → 通知 "docs/2024" 目录失效
+  → 子文件呢？不在 dirCache 里，没法通过 GetInv 通知
+  → 但 VFS 层收到目录失效通知后，会级联失效该目录下的所有文件缓存
+```
+
+### 关键洞察总结
+
+| 边界因素 | 影响程度 | 说明 |
+|---------|---------|------|
+| **dirCache 只存目录** | ⭐⭐⭐⭐⭐ | 变更通知中，文件级别的 GetInv 永远不会命中（因为文件不在 dirCache 里）。文件只能通过「父目录路径 + 文件名」的方式定位。 |
+| **删除目录不产生子变更** | ⭐⭐⭐⭐ | Google API 只发一条目录变更，子项都没有。这是 API 限制，rclone 无法突破。 |
+| **缓存未命中 = 通知盲区** | ⭐⭐⭐⭐ | 没 list 过的目录，其下的所有变更都无法被翻译为路径通知。 |
+| **共享盘参数需处处一致** | ⭐⭐⭐⭐ | Files.List 和 Changes.List 都需要设置共享盘参数，遗漏任一都会导致数据不一致。 |
+| **根对象的 parents 为空** | ⭐⭐⭐ | SharedWithMe/Starred 模式下根级文件 parents 为空，需要特殊处理路径拼接。 |
+| **永久删除时 file 为 nil** | ⭐⭐ | 只有 fileId 可用，依赖旧缓存路径。如果不在缓存中就彻底找不到。 |
+
+### 最终串联关系图（边界版）
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Google Drive API (边界行为)                      │
+│  - 删除目录只产生1条change                                          │
+│  - 永久删除时 change.File == nil                                    │
+│  - 共享盘需要 SupportsAllDrives+DriveId                             │
+│  - SharedWithMe根级文件parents为空                                  │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    list() / Changes.List()                          │
+│  ★ 每次调用都必须正确设置共享盘参数                                  │
+│  ★ list() 负责填充 dirCache                                         │
+│  ★ Changes.List 只返回 fileId + 有限字段                            │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+┌─────────────────────────┐     ┌─────────────────────────────────┐
+│   填充 dirCache         │     │   changeNotifyRunner            │
+│   (只有目录，只有访问过的)│     │   - GetInv(fileId) → 旧路径     │
+│                         │     │   - GetInv(parent) → 拼新路径   │
+│   Put(path, id)         │     │   - 命中 → 通知                 │
+│   双向写入 cache+inv    │     │   - 未命中 → 静默跳过 ★         │
+└─────────────────────────┘     └─────────────────────────────────┘
+              │                               │
+              └───────────────┬───────────────┘
+                              ▼
+                    ┌──────────────────┐
+                    │   dirCache (仅目录)│
+                    │   路径 ↔ ID 双向  │
+                    │   惰性填充        │
+                    │   不级联失效      │
+                    └──────────────────┘
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │   VFS 层          │
+                    │   - 接收 notify   │
+                    │   - 失效对应路径  │
+                    │   - 下次访问重拉  │
+                    └──────────────────┘
+```
+
+**一句话总结**：变更通知的可靠性上限 = dirCache 的覆盖范围。dirCache 覆盖到哪里，变更通知就能精确到哪里；没覆盖到的地方，就是盲区。

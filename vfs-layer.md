@@ -498,15 +498,17 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
     // ...
     if item.info.Dirty {
         if syncWriteBack {
-            item._store(item.c.ctx, storeFn)      // 同步上传
+            checkErr(item._store(item.c.ctx, storeFn))  // 同步上传
         } else {
             // 异步：加入写回队列
             item.c.writeback.SetID(&item.writeBackID)
             id := item.writeBackID
+            item.mu.Unlock()                       // Add 可能阻塞，需释放锁
             item.c.writeback.Add(id, item.name, item.info.Size, item.modified,
                 func(ctx context.Context) error {
                     return item.store(ctx, storeFn)  // vfs/vfscache/item.go#L667-L671
                 })
+            item.mu.Lock()
         }
     }
     item.modified = false
@@ -528,6 +530,11 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
         unlockMutexForCall(&item.mu, func() {
             o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)  // 上传到远端
         })
+        if err != nil {
+            // ErrorCantUploadEmptyFiles 视为成功；其他上传错误提前返回
+            // 此时 storeFn 不会被调用，目录条目保持 vAddFile 状态等待重试
+            return ...
+        }
         item.o = o
         item._updateFingerprint()                              // 更新指纹
     }
@@ -639,7 +646,7 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
 3. 写入走 `item.WriteAt()` → 本地磁盘 → `_dirty()` 标脏并 `_save()` 元数据（`vfs/vfscache/item.go#L1378-L1411`、`L431-L447`）。
 4. 关闭 `item.Close()` → `_actualClose()` 因 `WriteBack>0` 走异步：`writeback.Add()` 入队，5s 后到期上传（`vfs/vfscache/item.go#L798-L807`、`vfs/vfscache/writeback/writeback.go#L427-L459`）。
 5. 上传成功后目录条目更新按句柄类型分两条路径，最终殊途同归：
-   - **RW 句柄（磁盘缓存写回）**：`Item._store()`（`vfs/vfscache/item.go#L1331-L1376`）上传完成后调用传入的 `storeFn(o)`，该函数即 `File.setObject`（`vfs/file.go#L544-L554`）。
+   - **RW 句柄（磁盘缓存写回）**：`Item._store()`（`vfs/vfscache/item.go#L617-L663`）上传完成后调用传入的 `storeFn(o)`，该函数即 `File.setObject`（`vfs/file.go#L544-L554`）。
    - **Write 句柄（Pipe 直传）**：`WriteFileHandle.close()`（`vfs/write.go#L187-L213`）等待 `<-fh.result` 返回成功后，同样执行 `fh.file.setObject(fh.o)`。
    
    `File.setObject` 的执行链为：更新 `f.o` → 释放 `File.mu` → 调用 `d.addObject(f)`（`vfs/dir.go#L445-L462`）。`addObject` 将节点写入 `d.items[leaf] = f`，并标记 `d.virtual[leaf] = vAddFile`（首次出现时累加父链 `_virtuals` 计数）。此时用户侧 `readdir` 立即可见该文件（因为 `items` 已更新）。
@@ -653,7 +660,7 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
 
 1. `open(O_RDWR)` → `CacheMode>=Minimal` 选 `RWFileHandle`（`vfs/file.go#L898-L900`）。
 2. 首次读 `item._ensure()`（`vfs/vfscache/item.go#L1207-L1247`）按需下载缺失区间到本地文件，后续读写完全在本地磁盘进行。
-3. `Seek`/`WriteAt`/`Truncate` 全部由本地 fd 支持（`vfs/read_write.go#L301-L322`、`L329-L362`、`L401-L411`）。
+3. `Seek`/`_writeAt`/`Truncate` 全部由本地 fd 支持（`vfs/read_write.go#L301-L322`、`L329-L362`、`L401-L411`），公开方法 `WriteAt`（`vfs/read_write.go#L365-L373`）仅做锁保护后委托给 `_writeAt`。
 4. 关闭触发写回；若 `WriteBack<=0` 则同步上传（`vfs/vfscache/item.go#L678`、`L795-L797`），保证一致性敏感场景的数据安全。
 5. 缓存清理不会触碰 dirty/in-use 项（`vfs/vfscache/item.go#L980`、`L1027-L1029`），避免误删活跃文件。
 
@@ -681,18 +688,18 @@ FUSE 层 `cmd/mount/fs.go` 极薄：`FS.Root()`（`cmd/mount/fs.go#L42-L49`）�
 | 参数 | 字段 | 默认值 | 作用 | 关联代码 |
 | --- | --- | --- | --- | --- |
 | `--vfs-cache-mode` | `CacheMode` | `off` | 句柄选择与是否启用磁盘缓存 | `vfs/file.go#L891-L922` |
-| `--dir-cache-time` | `DirCacheTime` | `5m` | 目录列表缓存有效期 | `vfs/dir.go#L360-L367` |
-| `--poll-interval` | `PollInterval` | `1m` | 后端支持 ChangeNotify 时通过 channel 传递的轮询间隔；不支持时仅警告不生效 | `vfs/vfs.go#L247-L255` |
-| `--vfs-cache-max-age` | `CacheMaxAge` | `1h` | 缓存项最大留存时间 | `vfs/vfscache/cache.go#L803` |
-| `--vfs-cache-max-size` | `CacheMaxSize` | `-1`(无限) | 缓存总大小上限 | `vfs/vfscache/cache.go#L738-L743` |
-| `--vfs-cache-min-free-space` | `CacheMinFreeSpace` | `-1`(不限制) | 目标最小剩余空间 | `vfs/vfscache/cache.go#L720-L733` |
-| `--vfs-cache-poll-interval` | `CachePollInterval` | `60s` | 清理器轮询间隔 | `vfs/vfscache/cache.go#L846-L867` |
+| `--dir-cache-time` | `DirCacheTime` | `5m` | 目录列表缓存有效期 | `vfs/vfscommon/options.go#L29-L32` |
+| `--poll-interval` | `PollInterval` | `1m` | 后端支持 ChangeNotify 时通过 channel 传递的轮询间隔；不支持时仅警告不生效 | `vfs/vfscommon/options.go#L39-L42`、`vfs/vfs.go#L247-L255` |
+| `--vfs-cache-max-age` | `CacheMaxAge` | `1h` | 缓存项最大留存时间 | `vfs/vfscommon/options.go#L64-L67` |
+| `--vfs-cache-max-size` | `CacheMaxSize` | `-1`(无限) | 缓存总大小上限 | `vfs/vfscommon/options.go#L69-L72` |
+| `--vfs-cache-min-free-space` | `CacheMinFreeSpace` | `-1`(不限制) | 目标最小剩余空间 | `vfs/vfscommon/options.go#L74-L77` |
+| `--vfs-cache-poll-interval` | `CachePollInterval` | `60s` | 清理器轮询间隔 | `vfs/vfscommon/options.go#L59-L62` |
 | `--vfs-read-chunk-size` | `ChunkSize` | `128M` | 只读分块大小 | `vfs/read.go#L79` |
 | `--vfs-read-chunk-streams` | `ChunkStreams` | `0` | 并发读流数 | `vfs/read.go#L79` |
-| `--vfs-write-back` | `WriteBack` | `5s` | 关闭后延迟写回时间；`<=0` 同步 | `vfs/vfscache/item.go#L678`、`writeback.go#L128-L135` |
+| `--vfs-write-back` | `WriteBack` | `5s` | 关闭后延迟写回时间；`<=0` 同步 | `vfs/vfscommon/options.go#L129-L132`、`vfs/vfscache/item.go#L678`、`vfs/vfscache/writeback/writeback.go#L128-L135` |
 | `--vfs-write-wait` | `WriteWait` | `1000ms` | 顺序写等待窗口 | `vfs/write.go#L135` |
 | `--vfs-read-wait` | `ReadWait` | `20ms` | 顺序读等待窗口 | `vfs/read.go#L270` |
-| `--vfs-handle-caching` | `HandleCaching` | `5s` | 关闭后 fd 宽限期 | `vfs/vfscache/item.go#L693-L696` |
+| `--vfs-handle-caching` | `HandleCaching` | `5s` | 关闭后 fd 宽限期 | `vfs/vfscommon/options.go#L169-L172`、`vfs/vfscache/item.go#L693-L696` |
 | `--vfs-read-ahead` | `ReadAhead` | `0` | full 模式额外预读 | `vfs/vfscommon/options.go#L134-L137` |
 | `--read-only` | `ReadOnly` | `false` | 只读挂载 | `vfs/file.go#L625`、`vfs/dir.go#L947` |
 

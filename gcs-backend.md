@@ -191,29 +191,63 @@ func (o *Object) setMetaData(info *storage.Object) {
     o.gzipped   = info.ContentEncoding == "gzip"
 
     // MD5: GCS 返回 base64 编码 → 转为 hex
-    md5sumData, _ := base64.StdEncoding.DecodeString(info.Md5Hash)
-    o.md5sum = hex.EncodeToString(md5sumData)
+    md5sumData, err := base64.StdEncoding.DecodeString(info.Md5Hash)
+    if err != nil {
+        fs.Logf(o, "Bad MD5 decode: %v", err)
+    } else {
+        o.md5sum = hex.EncodeToString(md5sumData)
+    }
 
     // mtime 读取优先级：
     // 1. metadata["mtime"] (RFC3339Nano 格式，rclone 自定义)
     // 2. metadata["goog-reserved-file-mtime"] (Unix 秒，GSUtil 兼容)
     // 3. info.Updated (对象最后更新时间)
+    //
+    // ⚠️ 注意：前两级 mtime 解析成功后会直接 return，跳过后续 gzip 处理
     if mtimeString, ok := info.Metadata[metaMtime]; ok {
-        o.modTime, _ = time.Parse(timeFormat, mtimeString)
-    } else if mtimeGsutilString, ok := info.Metadata[metaMtimeGsutil]; ok {
-        unixTimeSec, _ := strconv.ParseInt(mtimeGsutilString, 10, 64)
-        o.modTime = time.Unix(unixTimeSec, 0)
+        modTime, err := time.Parse(timeFormat, mtimeString)
+        if err == nil {
+            o.modTime = modTime
+            return                                    // ← 早返回：跳过 gzip size/md5 清零
+        }
+        fs.Debugf(o, "Failed to read mtime from metadata: %s", err)
+    }
+
+    if mtimeGsutilString, ok := info.Metadata[metaMtimeGsutil]; ok {
+        unixTimeSec, err := strconv.ParseInt(mtimeGsutilString, 10, 64)
+        if err == nil {
+            o.modTime = time.Unix(unixTimeSec, 0)
+            return                                    // ← 早返回：跳过 gzip size/md5 清零
+        }
+        fs.Debugf(o, "Failed to read GSUtil mtime from metadata: %s", err)
+    }
+
+    // 只有前两级都失败时才走到这里
+    modTime, err := time.Parse(timeFormat, info.Updated)
+    if err != nil {
+        fs.Logf(o, "Bad time decode: %v", err)
     } else {
-        o.modTime, _ = time.Parse(timeFormat, info.Updated)
+        o.modTime = modTime
     }
 
     // 若启用 Decompress 且对象是 gzip 压缩的，size 和 md5 未知
+    // ⚠️ 这段代码只有在没有自定义 mtime（或自定义 mtime 解析失败）时才会执行
     if o.gzipped && o.fs.opt.Decompress {
         o.bytes = -1
         o.md5sum = ""
     }
 }
 ```
+
+#### mtime 早返回与 gzip 清零的交互影响
+
+rclone 上传的对象**总是**会写入 `metadata["mtime"]` 和 `metadata["goog-reserved-file-mtime"]`（见 `metadataFromModTime`）。因此对于 rclone 自己上传的 gzip 压缩对象，`setMetaData` 在第一级就成功解析并 `return`，**永远不会执行**末尾的 `o.bytes = -1; o.md5sum = ""`。
+
+实际行为：
+- **由 rclone 上传的 gzip 对象** + `--gcs-decompress`：`bytes` 和 `md5sum` 保留为压缩后的值（错误的，因为解压后大小和哈希都会变）
+- **非 rclone 上传的 gzip 对象**（无自定义 mtime）+ `--gcs-decompress`：`bytes = -1`，`md5sum = ""`（正确的行为）
+
+只有当对象通过第三方工具上传、没有写入自定义 mtime metadata 时，才能正确进入 gzip 清零分支。
 
 ### 3.2 元数据写入：`metadataFromModTime` 和 `Update`
 
@@ -292,11 +326,31 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) (err error) 
 
 ## 4. 错误转换机制
 
-错误转换分布在两个层面：**重试判定**（`shouldRetry`）和 **语义错误映射**（将 GCS 特定错误转为 `fs.Error*`）。
+错误转换分布在三个层面：**Pacer 调用方式选择**（`Call` vs `CallNoRetry`）、**重试判定**（`shouldRetry`）、**语义错误映射**（将 GCS 特定错误转为 `fs.Error*`）。
 
-### 4.1 重试判定：`shouldRetry`
+### 4.1 Pacer 调用方式：`Call` vs `CallNoRetry`
 
-每个 GCS API 调用都通过 `f.pacer.Call()` 包装，其中重试逻辑由 `shouldRetry` 决定：
+GCS 后端使用两种不同的 Pacer 调用模式，差异在于是否在低层进行多次重试：
+
+| 方法 | 底层行为 | 使用场景 |
+|------|---------|---------|
+| `pacer.Call(fn)` | `p.call(fn, retries)`，默认 retries=3，低层循环重试 + 指数退避 | 读操作（List、Get、Copy）和写操作中幂等的 Delete |
+| `pacer.CallNoRetry(fn)` | `p.call(fn, 1)`，**只执行 1 次**，若需重试则把错误包装为 `fserrors.RetryError` 抛给上层 | **上传操作**（Objects.Insert 的 Media 上传） |
+
+`CallNoRetry` 的实现（见 [lib/pacer/pacer.go:L255-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/42-rclone/lib/pacer/pacer.go#L255-L257)）：
+```go
+func (p *Pacer) CallNoRetry(fn Paced) error {
+    return p.call(fn, 1)  // 只尝试 1 次
+}
+```
+
+当 `fn` 返回 `(true, err)`（表示希望重试）时，`call(..., 1)` 不会再循环，而是将 err 包装为 `fserrors.RetryError`（实现了 `Retrier` 接口）返回，由上层（`fs/operations` 的 sync/copy 逻辑）决定是否高层重试。
+
+**为什么上传用 CallNoRetry：** `Objects.Insert(...).Media(in)` 从 `io.Reader` 流式上传，Reader 消费后不可重放，低层重试会读到空数据或损坏数据，因此必须把重试交给上层（上层会重新打开源文件 Reader）。
+
+### 4.2 重试判定：`shouldRetry`
+
+所有 API 调用都通过 `shouldRetry` 决定是否应重试，它作为 `Paced` 函数的返回值 `(again, err)` 中的 `again`：
 
 ```go
 // [googlecloudstorage.go:L470-L494]
@@ -332,7 +386,22 @@ func shouldRetry(ctx context.Context, err error) (again bool, errOut error) {
 - `io.EOF` / `io.ErrUnexpectedEOF` → 重试
 - 错误字符串包含特定短语（如 "use of closed network connection"）→ 重试
 
-### 4.2 HTTP 状态码 → 语义错误
+### 4.3 GCS 各操作的 Pacer 调用方式
+
+| 操作 | 代码位置 | 调用方式 | 原因 |
+|------|---------|---------|------|
+| `Objects.List`（列目录） | `list()` L689 | `pacer.Call` | 幂等读，可安全低层重试 |
+| `Objects.Get`（读元数据） | `readObjectInfo()` L1288 | `pacer.Call` | 幂等读 |
+| `Buckets.List`（列 bucket） | `listBuckets()` L814 | `pacer.Call` | 幂等读 |
+| `Buckets.Insert`（建 bucket） | `makeBucket()` L1065 | `pacer.Call` | 幂等（结果是"已存在或刚创建"） |
+| `Buckets.Delete`（删 bucket） | `Rmdir()` L1110 | `pacer.Call` | 幂等删除 |
+| `Objects.Delete`（删对象） | `Remove()` L1507 | `pacer.Call` | 幂等删除 |
+| `Objects.Copy`（改 mtime） | `SetModTime()` L1360 | `pacer.Call` | 幂等写 |
+| `Objects.Rewrite`（服务端复制） | `Copy()` L1168 | `pacer.Call` | 幂等写 |
+| **`Objects.Insert.Media`（上传）** | **`Update()` L1484** | **`pacer.CallNoRetry`** | **Reader 流不可重放，低层重试会读空数据** |
+| HTTP GET（下载） | `Open()` L1409 | `pacer.Call` | 幂等读，通过 HTTP Range 重试 |
+
+### 4.4 HTTP 状态码 → 语义错误
 
 将 GCS 返回的 `*googleapi.Error` 转为 rclone 通用错误常量（定义于 [fs/fs.go:L27-L56](file:///d:/fz/0601-2/solo-dogfeeding/code/42-rclone/fs/fs.go#L27-L56)）：
 
@@ -374,7 +443,7 @@ if bucket == "" {
 }
 ```
 
-### 4.3 错误映射总览
+### 4.5 错误映射总览
 
 | GCS 错误 / 条件 | rclone 通用错误 | 位置 |
 |-----------------|----------------|------|
@@ -388,14 +457,24 @@ if bucket == "" {
 | context 取消/超时 | 透传，不重试 | `shouldRetry()` L471 |
 | 通用网络错误（EOF、连接关闭等） | 触发 `fserrors.ShouldRetry` → 重试 | `shouldRetry()` L476 |
 
-### 4.4 Pacer 调用模式
+### 4.6 Pacer 调用模式
 
-所有 GCS API 调用都遵循统一模式：
+读/写/删除操作使用低层重试的 `Call` 模式：
 
 ```go
 err = f.pacer.Call(func() (bool, error) {
     result, err = f.svc.SomeOperation(...).Context(ctx).Do()
     return shouldRetry(ctx, err)  // 返回 (是否重试, 错误)
+})
+```
+
+上传操作使用仅执行 1 次的 `CallNoRetry` 模式（因为流式 Reader 不可重放）：
+
+```go
+err = o.fs.pacer.CallNoRetry(func() (bool, error) {
+    insertObject := o.fs.svc.Objects.Insert(bucket, &object).Media(in, ...)
+    newObject, err = insertObject.Do()
+    return shouldRetry(ctx, err)  // 返回 true 时，pacer 将 err 包装为 RetryError 抛给上层
 })
 ```
 
@@ -427,7 +506,7 @@ fs.Fs.Put(in, src)
     ├─ metadataFromModTime(src.ModTime())                      [构建 mtime metadata]
     ├─ 遍历 options.Header() → 填充 CacheControl/ContentType/StorageClass/x-goog-meta-*
     └─ f.svc.Objects.Insert(bucket, object).Media(in).Do()     [调用 GCS API]
-        └─ f.pacer.Call(shouldRetry)                            [速率控制+重试]
+        └─ f.pacer.CallNoRetry(shouldRetry)                     [速率控制 + 仅 1 次低层尝试，失败包装为 RetryError 交上层]
 ```
 
 ### 6.2 下载对象 (`Object.Open`)

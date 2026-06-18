@@ -447,7 +447,7 @@ func shouldRetry(ctx context.Context, err error) (again bool, errOut error) {
 | `Objects.Copy`（改 mtime） | `SetModTime()` L1360 | `pacer.Call` | 幂等写 |
 | `Objects.Rewrite`（服务端复制） | `Copy()` L1168 | `pacer.Call` | 幂等写 |
 | **`Objects.Insert.Media`（上传）** | **`Update()` L1484** | **`pacer.CallNoRetry`** | **Reader 流不可重放，低层重试会读空数据** |
-| HTTP GET（初始下载请求） | `Open()` L1409 | `pacer.Call` | 低层重试（`LowLevelRetries` 次），仅对请求阶段生效；流已建立后的读取失败不由这层处理 |
+| HTTP GET（初始下载请求） | `Open()` L1409 | `pacer.Call` | **内层 Pacer 请求重试**（`LowLevelRetries` 次），仅对"发请求→收响应"阶段生效；流已建立后的读取失败由外层 ReOpen Range 续读处理 |
 
 ### 4.4 HTTP 状态码 → 语义错误
 
@@ -559,20 +559,20 @@ fs.Fs.Put(in, src)
 
 ### 6.2 下载对象：两层重试机制
 
-下载过程涉及两层**不同层级**的重试，分别处理 HTTP 请求建立阶段和数据流读取阶段：
+下载过程涉及**内外两层**不同层级的重试，分别处理 HTTP 请求建立阶段和数据流读取阶段。命名按调用栈从外到内：
 
 ```
 operations.Open(src, options)          # 上层统一入口（见 fs/operations/reopen.go:L123）
   │
-  ├─ 第一层：ReOpen 封装（operations.ReOpen，maxTries = LowLevelRetries）
-  │   ├─ 初始调用 Object.Open() → ↓ 进入第二层
+  ├─ 外层：ReOpen Range 续读包装（maxTries = LowLevelRetries）
+  │   ├─ 初始调用 Object.Open() → ↓ 进入内层
   │   └─ 读流失败后 Range 续读：
   │       ReOpen.Read() → io.Copy 读 h.rc.Read() 出错
   │         → h.reopen()
   │             ├─ h.rangeOption.Start = h.start + h.offset     # 续传起点
   │             └─ h.src.Open(ctx, opts...) 重新建立 HTTP 连接
   │
-  └─ 第二层：Object.Open 低层重试（仅请求阶段）
+  └─ 内层：Object.Open Pacer 请求重试（仅请求阶段）
       Object.Open(options)
         ├─ fs.FixRangeOption(options, bytes)                     [处理 Range 请求]
         ├─ gzipped && !Decompress → Accept-Encoding: gzip
@@ -586,12 +586,12 @@ operations.Open(src, options)          # 上层统一入口（见 fs/operations/
 
 | 层级 | 重试什么 | 何时生效 | 重试次数 | 实现位置 |
 |------|---------|---------|---------|---------|
-| **第一层：Pacer 低层重试** | HTTP 请求建立（`client.Do` 返回错误或 5xx） | Body 未开始读取之前 | `LowLevelRetries` | `Object.Open` 内 `pacer.Call` |
-| **第二层：ReOpen Range 续读** | Body 读取过程中 `Read()` 返回错误（连接中断等） | Body 已开始读取后 | `LowLevelRetries` | `operations.ReOpen.Read` → `reopen()` |
+| **外层：ReOpen Range 续读包装** | Body 读取过程中 `Read()` 返回错误（连接中断等） | Body 已开始读取后 | `LowLevelRetries` | `operations.ReOpen.Read` → `reopen()` |
+| **内层：Object.Open Pacer 请求重试** | HTTP 请求建立（`client.Do` 返回错误或 5xx） | Body 未开始读取之前 | `LowLevelRetries` | `Object.Open` 内 `pacer.Call` |
 
 为什么需要两层：
-- Pacer 只能重试"发出请求→收到响应"这一完整 round-trip；一旦 `client.Do` 成功返回 `http.Response.Body`，后续从 Body 流式读取的失败 Pacer 管不到
-- ReOpen 包装层追踪已读取的 `offset`，失败后自动构造 `Range: bytes=<offset>-` 续传请求重新 `Object.Open`
+- 内层 Pacer 只能重试"发出请求→收到响应"这一完整 round-trip；一旦 `client.Do` 成功返回 `http.Response.Body`，后续从 Body 流式读取的失败 Pacer 管不到
+- 外层 ReOpen 包装层追踪已读取的 `offset`，失败后自动构造 `Range: bytes=<offset>-` 续传请求重新 `Object.Open`
 
 ### 6.3 列出目录 (`Fs.ListP`)
 ```

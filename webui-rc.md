@@ -641,18 +641,154 @@ func rcGroupStop(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 
 ---
 
-**✅ 为什么需要 `<-ctx.Done()`？**
+### ✅ 深度分析：`<-ctx.Done()` 的同步语义与真实作用
 
-如果 Stop 只写 `cancel()` 会怎样？
+#### 背景：Go 内存模型与 channel 同步
+
+根据 Go 内存模型：
+> **A send on a channel happens before the corresponding receive from that channel completes.**
+> （对一个 channel 的发送 happens-before 从该 channel 的接收完成）
+
+> **The closing of a channel happens before a receive that returns a zero value because the channel is closed.**
+> （关闭一个 channel happens-before 从该 channel 接收零值）
+
+这意味着：**从已关闭 channel 的读取不仅能立即返回，还建立了明确的 happens-before 关系**。
+
+---
+
+#### cancel() 内部已有的同步机制
+
+Go 标准库 `context.cancelCtx.cancel()` 的内部实现（逻辑等价）：
 
 ```go
-// 不好的实现
-stop := func() { cancel() }
+type cancelCtx struct {
+    Context
+    mu       sync.Mutex    // 保护以下字段
+    done     chan struct{} // 懒创建
+    err      error         // 取消原因
+    children map[canceler]struct{}
+}
+
+func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+    c.mu.Lock()              // ① 加锁
+    c.err = err              // ② 设置错误
+    close(c.done)            // ③ 关闭 done channel
+    for child := range c.children {  // ④ 递归取消子 context
+        child.cancel(false, err)
+    }
+    c.mu.Unlock()            // ⑤ 解锁 ← 内存屏障点
+}
 ```
 
-问题：`cancel()` 返回后，虽然 `cancel()` 内部有原子操作保证内存可见性，但 `<-ctx.Done()` 提供了更强的同步屏障——确保在 Stop 返回时，**任何并发 goroutine 都能观察到 ctx 已取消**。
+**cancel() 自身的同步保证**：
+- 由于 `c.mu.Unlock()` 的存在，`cancel()` 返回时，所有写入（err、done 关闭、子 context 取消）都对其他 goroutine 可见
+- 从功能上说，`cancel()` 本身已经提供了完整的内存同步
 
-代码注释 "Wait for cancel to propagate before returning" 准确表达了这个意图：确保取消信号在整个 context 树中传播完成后再返回。
+---
+
+#### `<-ctx.Done()` 提供的额外同步保障
+
+既然 `cancel()` 已经有同步了，为什么还要读一次 `ctx.Done()`？
+
+##### 1. 语义上的 happens-before 屏障
+
+虽然 `cancel()` 内部的 mutex 已经提供了同步，但那是**内部实现细节**。`<-ctx.Done()` 则是**公开的同步契约**：
+
+| 层面 | `cancel()` 返回 | `<-ctx.Done()` 返回 |
+|------|---------------|-------------------|
+| 内部实现 | 有 mutex 解锁保证内存可见 | — |
+| 公开契约 | ❌ 文档不保证 | ✅ Go 内存模型保证 |
+| 可依赖度 | 依赖标准库实现 | 依赖语言规范 |
+
+**关键区别**：
+- 依赖 `cancel()` 内部的 mutex 同步 = 依赖具体实现
+- 依赖 `<-ctx.Done()` 的 channel 同步 = 依赖 Go 语言规范
+
+##### 2. 防御性编程：不依赖 cancel() 的内部实现
+
+想象以下场景：
+- 自定义 context 实现（`canceler` 接口），cancel 可能只是设置原子标志而不是关 channel
+- 未来 Go 版本优化了 cancel 实现
+- context 被包装了多层
+
+在这些情况下，`cancel()` 返回不一定保证内存可见性。但 `<-ctx.Done()` 作为 channel 读取，**永远**提供 happens-before 保证。
+
+##### 3. 与 rcJobStop 中锁的交互
+
+`rcJobStop` 的调用链：
+```go
+job.mu.Lock()       // 获取 Job 的互斥锁
+job.Stop()          // 内部: cancel() + <-ctx.Done()
+job.mu.Unlock()     // 释放锁
+```
+
+**问题**：`job.mu.Unlock()` 本身已经提供了内存屏障。那 `<-ctx.Done()` 是不是多余的？
+
+**答案**：对**同一个** goroutine 来说是多余的。但对**其他并发 goroutine** 来说：
+
+- `job.mu.Unlock()` 建立的是："调用 Stop 的 goroutine" 和 "下一个获取 job.mu 的 goroutine" 之间的 happens-before
+- `<-ctx.Done()` 建立的是："调用 cancel 的 goroutine" 和 "**任何**读取 ctx.Done 的 goroutine" 之间的 happens-before
+
+这是两个不同的同步维度。
+
+---
+
+#### 4. 真实作用总结
+
+| 作用类型 | 具体说明 |
+|---------|---------|
+| **📖 文档化代码** | "Wait for cancel to propagate" 注释 + 显式读取 = 清晰表达设计意图 |
+| **🛡 防御性编程** | 不依赖 `cancel()` 的内部实现细节，只依赖 context 的公开契约 |
+| **🔗 显式同步屏障** | 通过 channel 读建立 happens-before，确保后续操作一定能看到取消状态 |
+| **🔮 未来兼容** | 如果 context 实现变化或使用自定义 context，语义依然成立 |
+| **🐛 防 bug** | 防止有人未来修改代码时意外移除了 cancel 调用（虽然不太可能） |
+
+---
+
+#### 5. 类比：timer.Stop 的经典模式
+
+这和 Go 中 `time.Timer.Stop()` 的经典用法异曲同工：
+
+```go
+if !timer.Stop() {
+    <-timer.C  // 排空 channel，防止误触发
+}
+```
+
+两者都是"调用 + 读取"的配对模式，目的不同但思路一致：
+- `timer.Stop()` + `<-timer.C` → 防止停止后还收到过期事件
+- `cancel()` + `<-ctx.Done()` → 确保取消完全生效后再返回
+
+---
+
+#### 6. 在 rclone 代码中的实际意义
+
+回到 rclone 的 `job.Stop()`：
+
+```go
+stop := func() {
+    cancel()
+    // Wait for cancel to propagate before returning.
+    <-ctx.Done()
+}
+```
+
+**调用 Stop() 后保证了什么？**
+
+1. ✅ `ctx.Done()` 一定返回已关闭 channel（立即返回零值）
+2. ✅ `ctx.Err()` 一定返回非 nil（`context.Canceled`）
+3. ✅ 任何并发 goroutine 读取这些值都会看到取消状态
+4. ✅ 取消信号在 context 树中已完全传播
+
+**没有保证什么？**
+
+1. ❌ 任务函数 `fn` 已经检测到取消
+2. ❌ 任务已经停止执行
+3. ❌ `job.Finished == true`
+
+---
+
+**一句话总结**：`<-ctx.Done()` 不是为了"等待任务停止"，而是为了**用公开的、有语言规范保证的方式，建立一个明确的同步点**，确保 `Stop()` 返回时，ctx 的取消状态在内存中对所有 goroutine 可见——尽管 `cancel()` 内部可能已经提供了相同的保证，但这行代码让这个契约变得**显式、可验证、不依赖实现细节**。
 
 ---
 

@@ -646,35 +646,37 @@ pairChecker 接收一个 pair (src, dst)
     │
     ├─ src.Storable() == false → 跳过
     │
-    ├─ 1. NeedTransfer(dst, src)  → 初步判定是否需要传输
+    ├─ 1. NeedTransfer(dst, src)  → 初步判定 needTransfer
     │   │
-    │   ├─ 需要传输 (needTransfer=true)
-    │   │   │
-    │   │   ├─ 2. CompareOrCopyDest — 检查 compare-dest/copy-dest
-    │   │   │   ├─ copy-dest 命中且服务端复制成功 → needTransfer=false
-    │   │   │   ├─ compare-dest 命中 → needTransfer=false
-    │   │   │   └─ 未命中 → needTransfer 保持 true
-    │   │   │
-    │   │   ├─ 3. FixCase（仅 --fix-case 且大小写不同时触发）
-    │   │   │   ├─ 需要传输且目标已不存在 → pair.Dst = nil
-    │   │   │   └─ 目标仍存在 → Move 改名，pair.Dst 指向新名
-    │   │   │
-    │   │   ├─ 4. Immutable 检查 → 已存在且不匹配 → 报错，不传输
-    │   │   │
-    │   │   └─ 5. backup-dir 处理（目标存在且 --backup-dir 时）
-    │   │       ├─ MoveBackupDir 成功 → pair.Dst = nil，进入上传队列
-    │   │       └─ MoveBackupDir 失败 → 报错，不进入上传队列
-    │   │
-    │   └─ 无需传输 (needTransfer=false) → 已匹配
-    │       │
-    │       └─ [仅 DoMove] 已匹配对象删源
-    │           ├─ SameObject(src, dst) → 不删（同一文件）
-    │           ├─ --ignore-existing → 不删
-    │           ├─ --check-first + --order-by → 放入上传队列（src==dst 表示删源）
-    │           └─ 其他 → 直接 DeleteFile(src)
+    │   └─ [仅 needTransfer=true] 2. CompareOrCopyDest
+    │       ├─ compare-dest 命中 → NoNeedTransfer=true → needTransfer=false
+    │       ├─ copy-dest 命中且复制成功 → NoNeedTransfer=true → needTransfer=false
+    │       ├─ copy-dest 命中但复制失败 → NoNeedTransfer=false，无错误 → 继续
+    │       ├─ copy-dest 中 MoveBackupDir 失败 → 返回错误 → 记录但继续
+    │       ├─ compare/copy-dest NewObject 失败 → 返回错误 → 记录但继续
+    │       └─ 未命中 → needTransfer 保持 true
     │
-    └─ tr.Done() 记录检查统计
+    ├─ 3. FixCase（--fix-case && pair.Dst != nil && 大小写不同时触发，与 needTransfer 无关）
+    │   ├─ needTransfer=true 且目标已不存在 → pair.Dst = nil（NeedTransfer 可能已删掉目标）
+    │   └─ pair.Dst != nil → Move 改名，pair.Dst 指向新名
+    │
+    ├─ [needTransfer=true] 4. Immutable 检查 + backup-dir + 进入上传队列
+    │   ├─ Immutable 且 pair.Dst != nil → 报错，不传输
+    │   │
+    │   └─ 非 Immutable
+    │       ├─ pair.Dst != nil && backupDir != nil → MoveBackupDir
+    │       │   ├─ 成功 → pair.Dst = nil，Put 进入上传队列
+    │       │   └─ 失败 → 报错，**不 Put，不传输**
+    │       └─ 其他情况 → 直接 Put 进入上传队列
+    │
+    └─ [needTransfer=false] 5. 已匹配对象删源（仅 DoMove）
+        ├─ SameObject(src, dst) → 不删
+        ├─ --ignore-existing → 不删
+        ├─ --check-first + --order-by → Put 进上传队列延迟删（src==dst）
+        └─ 其他 → 直接 DeleteFile(src)
 ```
+
+> **关键纠正**：FixCase 不在 `if needTransfer` 块内，而是在 NeedTransfer/CompareOrCopyDest 之后、第二个 `if needTransfer` 之前。**无论 needTransfer 是 true 还是 false，FixCase 都会执行**（只要 `--fix-case` 开启且文件名大小写不同）。
 
 #### 路径一：目标已存在 + backup-dir
 
@@ -713,9 +715,14 @@ func MoveBackupDir(ctx context.Context, backupDir fs.Fs, dst fs.Object) (err err
 3. 调用 **服务端 Move** 将原目标文件移到备份目录
 4. Move 成功 → pair.Dst 置空 → 新文件可以"创建式"上传（而非覆盖式）
 
-**失败回退**：
-- MoveBackupDir 失败 → 报错且**不进入上传队列**，原目标文件保留在原位
-- 新文件不会被复制，避免"备份失败但新文件覆盖了旧文件"的数据丢失
+**失败回退与残留状态**：
+- MoveBackupDir 失败 → 记录错误 + `processError`，但**不 return、不 continue**，只是跳过 `out.Put`
+- **不进入上传队列** → 新文件不会被传输
+- **原目标文件保留在原位** → 旧数据安全，未被覆盖
+- **源文件也保留** → 因为走的是 `needTransfer=true` 分支，不会到 else 分支的删源逻辑
+- 最终状态：目标=旧版本，源=原样，文件未传输
+
+> 这种"备份失败就不传输"的设计是一种**保守策略**：宁愿不传，也不冒丢失旧版本的风险。
 
 **与 Suffix 的特殊关系**：
 - 只设 `--suffix` 不设 `--backup-dir` 时，`backupDir = fdst`（用目标目录本身当备份目录）
@@ -750,10 +757,37 @@ copyDest(fdst, dst, src, CopyDestFs, backupDir)
         └─ 目标已存在且与源相同 → NoNeedTransfer=true（跳过）
 ```
 
-**关键点**：
+**报错后的继续条件**：
+
+pairChecker 中对 CompareOrCopyDest 返回错误的处理（[sync.go:385-392](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/sync/sync.go#L385-L392)）：
+```go
+NoNeedTransfer, err := operations.CompareOrCopyDest(...)
+if err != nil {
+    s.processError(err)
+    s.logger(s.ctx, operations.TransferError, pair.Src, pair.Dst, err)
+}
+if NoNeedTransfer {
+    needTransfer = false
+}
+```
+
+**核心事实：无论 CompareOrCopyDest 报什么错，pairChecker 都不会跳过这个文件，只是记录错误后继续向下执行。** 没有 return，没有 continue。
+
+不同错误类型的具体后果：
+
+| 错误来源 | NoNeedTransfer | err | 后续行为 |
+|----------|---------------|-----|----------|
+| copy-dest 中 Copy 失败 | false | nil（被吞掉） | 继续正常从源端上传 |
+| copy-dest 中 MoveBackupDir 失败 | false | 非空 | 记录错误，needTransfer 保持 true，继续执行 FixCase、backup-dir、正常上传 |
+| compare/copy-dest 中 NewObject 失败（非 NotFound） | false | 非空 | 记录错误，needTransfer 保持 true，继续执行 |
+| compare-dest 命中 | true | nil | needTransfer=false，进入"已匹配"分支 |
+| copy-dest 命中且复制成功 | true | nil | needTransfer=false，进入"已匹配"分支 |
+
+> 特别注意：copy-dest 的 Copy 失败时，`copyDest` 函数内部直接 `return false, nil`（[operations.go:1690-1692](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/operations.go#L1690-L1692)），**错误被吞掉**，对上层透明降级。只有 MoveBackupDir 失败才会往上返回错误。
+
+**关键点总结**：
 - copy-dest 必须与目标**同配置同远程**（SameConfig 检查，启动时校验）
 - 复制走服务端 Copy（`features.Copy`），零带宽
-- **复制失败时不报错，只是降级到正常从源端传输**（[operations.go:1690-1692](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/operations/operations.go#L1690-L1692)）
 - 与 backup-dir 联动：目标存在时先移到备份目录再从 copy-dest 复制
 
 **compare-dest vs copy-dest 的区别**：
@@ -762,10 +796,21 @@ copyDest(fdst, dst, src, CopyDestFs, backupDir)
 | 行为 | 只比较，命中则跳过 | 命中则从 dest 服务端复制到目标 |
 | 服务端操作 | 不需要 | 需要 `features.Copy` |
 | 与 backup-dir 联动 | 不联动 | 联动（目标存在先备份） |
+| Copy 失败处理 | — | 吞掉错误，降级到正常上传 |
+| MoveBackupDir 失败处理 | — | 返回错误，pairChecker 记录后继续 |
 
 #### 路径三：已匹配对象删源（Move 场景）
 
 **触发条件**：`needTransfer=false && s.DoMove`（文件已匹配，不需要传输，但在 Move 模式下需要删源）
+
+**与 FixCase 的先后关系**：
+FixCase 在 `if needTransfer { ... }` 和 `else { ... }` 两个分支**之前**执行。所以当 `needTransfer=false`（内容已匹配）时，先经过 FixCase（可能修正目标文件名大小写），然后才到 else 分支的删源逻辑。
+
+典型场景（Move + --fix-case）：
+1. NeedTransfer 判定内容相同 → needTransfer=false
+2. FixCase 发现大小写不同 → 将目标文件重命名为源的大小写
+3. 到 else 分支 → DeleteFile(src) 删除源文件
+4. 最终效果：文件"移动"并修正了大小写
 
 代码位置：[sync.go:451-471](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/sync/sync.go#L451-L471)
 
@@ -803,32 +848,43 @@ if s.DoMove {
 
 #### 路径四：大小写改名（FixCase + MoveCaseInsensitive）
 
-有两处大小写改名逻辑，**发生在不同阶段**，容易混淆：
+有两处大小写改名逻辑，**发生在不同抽象层、不同阶段**，容易混淆：
 
-| 改名类型 | 触发位置 | 用途 |
-|----------|----------|------|
-| FixCase（sync 层） | pairChecker，NeedTransfer 之后 | 修正目标端文件名大小写以匹配源 |
-| MoveCaseInsensitive（operations 层） | Move 函数内部 | 处理大小写不敏感文件系统上的同名重命名 |
+| 改名类型 | 触发位置 | 执行时机 | 用途 |
+|----------|----------|----------|------|
+| FixCase（sync 层） | pairChecker | NeedTransfer/CompareOrCopyDest 之后，第二个 `if needTransfer` 之前 | 修正目标端已有文件的大小写以匹配源 |
+| MoveCaseInsensitive（operations 层） | Move 函数内部 | 服务端 Move 路径中 | 处理大小写不敏感文件系统上的同名重命名 |
 
 **FixCase（--fix-case）**
 
 代码位置：[sync.go:394-416](file:///d:/fz/0601-2/solo-dogfeeding/code/57-rclone/fs/sync/sync.go#L394-L416)
 
-触发条件：
-- `--fix-case` 开启
-- 非 `--immutable` 模式
+触发条件（四个条件全部满足）：
+- `--fix-case` 开启（`s.ci.FixCase`）
+- 非 `--immutable` 模式（`!s.ci.Immutable`）
 - 目标存在（`pair.Dst != nil`）
 - 源和目标仅大小写不同（`src.Remote() != pair.Dst.Remote()`）
 
-执行流程：
-1. 如果 needTransfer=true → 检查目标是否还在（NeedTransfer 可能已删除了目标以便重新上传）
-   - 目标已不存在 → `pair.Dst = nil`（后续重新创建正确大小写的文件）
-   - 目标仍存在 → 继续改名
-2. 调用 `operations.Move(...)` 将目标文件重命名为源的大小写形式
-3. 成功 → `pair.Dst = newDst`（指向新名字对象）
-4. 失败 → 报错，但流程继续
+> **关键事实**：FixCase 不在任何 `if needTransfer` 块内。无论 needTransfer 是 true 还是 false，只要四个条件满足就会执行。
 
-> 注意：FixCase 发生在 backup-dir 处理**之前**。如果 FixCase 成功且 needTransfer=false，就不会触发 backup-dir。
+执行流程：
+1. 如果 `needTransfer=true` → 额外检查目标是否还存在
+   - NeedTransfer 的 equal 检查可能已经删掉了目标（如某些后端修改 modtime 需要删了重传）
+   - 目标已不存在 → `pair.Dst = nil`（后续重新创建正确大小写的文件），不执行改名
+   - 目标仍存在 → 继续改名
+2. `pair.Dst != nil` → 调用 `operations.Move(...)` 将目标文件重命名为源的大小写形式
+3. 成功 → `pair.Dst = newDst`（指向新名字对象）
+4. 失败 → 报错（`processError` + `Errorf`），但**流程继续向下**
+
+FixCase 对后续流程的影响：
+
+| 场景 | FixCase 后 needTransfer | 后续行为 |
+|------|------------------------|----------|
+| 原 needTransfer=true，FixCase 成功 | true（不变） | 继续到 backup-dir 处理 → 进入上传队列 |
+| 原 needTransfer=false，FixCase 成功 | false（不变） | 到 else 分支 → （Move 模式下）删源 |
+| FixCase 失败 | 不变 | 继续向下，pair.Dst 仍指向旧名 |
+
+> FixCase 在 backup-dir 处理**之前**执行。如果 FixCase 成功且 needTransfer=false，就不会触发 backup-dir。
 
 **MoveCaseInsensitive（operations 层）**
 
@@ -864,15 +920,17 @@ if s.DoMove {
 
 按 pairChecker 中实际代码顺序排列：
 
-| 顺序 | 步骤 | 改变什么 | 失败后果 |
-|------|------|----------|----------|
-| 1 | NeedTransfer | 决定 needTransfer 标志 | 不适用（总是有结果） |
-| 2 | CompareOrCopyDest | 可能将 needTransfer 改为 true→false；可能从 copy-dest 服务端复制；可能调用 backup-dir | copy-dest 复制失败 → 降级到正常上传，不报错 |
-| 3 | FixCase | 可能移动 pair.Dst 的文件名；可能置 nil | 改名失败 → 报错，继续流程 |
-| 4 | Immutable 检查 | 可能阻止传输 | 已存在且不匹配 → 报错，不传输 |
-| 5 | backup-dir | 可能将 pair.Dst 移到备份目录并置 nil | 移备份失败 → 报错，不进入上传队列 |
-| 6 | （进入上传队列） | — | — |
-| — | 已匹配删源（仅 DoMove） | 可能删除源文件 | 删除失败 → 报错，源保留 |
+| 顺序 | 步骤 | 触发条件 | 改变什么 | 失败后果 |
+|------|------|----------|----------|----------|
+| 1 | NeedTransfer | 总是执行 | 决定 needTransfer 标志 | 不适用（总是有结果） |
+| 2 | CompareOrCopyDest | needTransfer=true 且配置了 compare/copy-dest | 可能将 needTransfer 改为 true→false；可能从 copy-dest 服务端复制；可能调用 backup-dir | 返回错误 → 只记录，**继续向下执行**，不跳过 |
+| 3 | FixCase | --fix-case 开启、pair.Dst 存在、大小写不同 | 可能移动 pair.Dst 的文件名；可能置 nil | 改名失败 → 报错，继续流程 |
+| 4 | Immutable 检查 | needTransfer=true 且 --immutable | 可能阻止传输 | 已存在且不匹配 → 报错，不传输 |
+| 5 | backup-dir | needTransfer=true 且 pair.Dst 存在且配置了 backup-dir | 可能将 pair.Dst 移到备份目录并置 nil | 移备份失败 → 报错，**不进入上传队列**，也不删源 |
+| 6 | 进入上传队列 | needTransfer=true（且非 immutable 阻止、非 backup-dir 失败） | pair 进入 s.toBeUploaded | — |
+| 7 | 已匹配删源 | needTransfer=false 且 DoMove=true | 可能删除源文件 | 删除失败 → 报错，源保留 |
+
+> 关键纠正：FixCase 在第 3 步，独立于 needTransfer 分支；CompareOrCopyDest 报错后不会跳过文件，而是继续执行后续步骤；backup-dir 失败后文件不传输也不删源，旧目标保留原位。
 
 ---
 

@@ -1,6 +1,10 @@
 # 本地文件系统后端代码梳理
 
-本文档梳理 rclone 本地文件系统后端（local backend）的核心实现，重点关注路径归一化、权限处理和跨平台差异的实现边界。
+本文档梳理 rclone 本地文件系统后端（local backend）的核心实现，重点关注**路径归一化**、**权限处理**和**跨平台差异**的实现边界。
+
+所有代码引用均使用仓库相对路径。
+
+---
 
 ## 目录
 
@@ -9,26 +13,52 @@
 3. [权限处理](#权限处理)
 4. [跨平台差异实现边界](#跨平台差异实现边界)
 5. [关键数据结构](#关键数据结构)
+6. [设计原则总结](#设计原则总结)
 
 ---
 
 ## 整体架构
 
-本地文件系统后端位于 [backend/local/](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/) 目录，核心文件包括：
+本地文件系统后端位于 `backend/local/` 目录，核心文件及职责：
 
 | 文件 | 职责 |
 |------|------|
-| [local.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go) | 主实现，Fs/Object/Directory 结构及核心方法 |
-| [metadata.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/metadata.go) | 元数据读写的通用逻辑 |
-| [xattr.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/xattr.go) | 扩展属性（xattr）读写 |
-| [symlink.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/symlink.go) | 符号链接处理 |
-| [lchmod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/lchmod.go) | 符号链接权限修改 |
+| `backend/local/local.go` | 主实现，Fs/Object/Directory 结构及核心方法 |
+| `backend/local/metadata.go` | 元数据读写的通用逻辑（与平台无关部分） |
+| `backend/local/xattr.go` | 扩展属性（xattr）读写（非 OpenBSD/非 plan9） |
+| `backend/local/xattr_unsupported.go` | xattr 不支持的平台桩 |
+| `backend/local/symlink.go` | 循环符号链接检测（Unix） |
+| `backend/local/symlink_other.go` | 符号链接其他平台桩 |
+| `backend/local/lchmod.go` | 符号链接权限修改（windows/plan9/js/linux 不支持） |
+| `backend/local/lchmod_unix.go` | 符号链接权限修改（Unix 非 Linux） |
+| `backend/local/lchtimes.go` | 符号链接时间修改（plan9/js 不支持） |
+| `backend/local/lchtimes_unix.go` | 符号链接时间修改（Unix） |
+| `backend/local/lchtimes_windows.go` | 符号链接时间修改（Windows） |
+| `backend/local/setbtime.go` | btime 设置（非 Windows 不支持） |
+| `backend/local/setbtime_windows.go` | btime 设置（Windows） |
+| `backend/local/remove_other.go` | 文件删除（非 Windows） |
+| `backend/local/remove_windows.go` | 文件删除（Windows，带重试） |
+| `backend/local/read_device_unix.go` | 设备号读取（Unix 系列） |
+| `backend/local/read_device_other.go` | 设备号读取（其他平台桩） |
+| `backend/local/about_windows.go` | 磁盘空间查询（Windows） |
+| `backend/local/about_unix.go` | 磁盘空间查询（Unix） |
+| `backend/local/clone_darwin.go` | Reflink 克隆（macOS） |
+
+平台特定元数据文件：
+
+| 文件 | 平台 (build tag) | 说明 |
+|------|-----------------|------|
+| `backend/local/metadata_windows.go` | windows | Windows 平台元数据 |
+| `backend/local/metadata_linux.go` | linux | Linux 平台元数据（含 statx/fstatat 双路径） |
+| `backend/local/metadata_bsd.go` | darwin \|\| freebsd \|\| netbsd | macOS/FreeBSD/NetBSD 元数据 |
+| `backend/local/metadata_unix.go` | openbsd \|\| solaris | OpenBSD/Solaris 元数据 |
+| `backend/local/metadata_other.go` | dragonfly \|\| plan9 \|\| js \|\| aix | 其他平台桩 |
 
 辅助库：
 
-- [lib/file/](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/lib/file/) - 文件操作工具（UNC路径、预分配、稀疏文件等）
-- [lib/encoder/](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/lib/encoder/) - 文件名编码转换
-- [fs/fspath/](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/fs/fspath/) - 路径解析工具
+- `lib/file/` — 文件操作工具（UNC路径、预分配、稀疏文件等）
+- `lib/encoder/` — 文件名编码转换
+- `fs/fspath/` — 路径解析工具
 
 ---
 
@@ -51,7 +81,7 @@ local (OS原生编码, 原生分隔符)
 
 ### 2. 根路径归一化
 
-核心函数：[cleanRootPath](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L1695-L1738)
+核心函数：`cleanRootPath`（`backend/local/local.go`）
 
 处理流程：
 
@@ -79,7 +109,7 @@ filepath.Abs: 转换为绝对路径
 
 ### 3. UNC 路径转换
 
-实现：[lib/file/unc_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/lib/file/unc_windows.go)
+实现：`lib/file/unc_windows.go`（Windows）、`lib/file/unc.go`（非 Windows）
 
 转换规则：
 
@@ -90,11 +120,11 @@ filepath.Abs: 转换为绝对路径
 | `\\?\C:\already\unc` | 原样返回 |
 | 非 Windows 平台 | 原样返回 |
 
-非 Windows 平台：[unc.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/lib/file/unc.go) 中 `UNCPath` 为恒等函数。
+非 Windows 平台：`UNCPath` 为恒等函数。
 
 ### 4. remote ↔ local 路径转换
 
-**remote → local**：[localPath](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L770-L772)
+**remote → local**：`localPath` 方法（`backend/local/local.go`）
 
 ```go
 func (f *Fs) localPath(name string) string {
@@ -102,7 +132,7 @@ func (f *Fs) localPath(name string) string {
 }
 ```
 
-**local → remote**：[cleanRemote](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L753-L768)
+**local → remote**：`cleanRemote` 方法（`backend/local/local.go`）
 
 ```
 输入: dir (父目录remote), filename (本地文件名)
@@ -118,7 +148,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 ### 5. 文件名编码（Encoder）
 
-实现：[lib/encoder/encoder.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/lib/encoder/encoder.go)
+实现：`lib/encoder/encoder.go`
 
 本地后端默认使用 `encoder.OS`，针对不同 OS 启用不同编码规则：
 
@@ -130,7 +160,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 ### 6. 路径解析（fspath）
 
-实现：[fs/fspath/path.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/fs/fspath/path.go)
+实现：`fs/fspath/path.go`
 
 `Parse` 函数判断路径是本地路径还是远程路径：
 
@@ -150,8 +180,8 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 | 操作 | 权限 | 位置 |
 |------|------|------|
-| 创建普通文件 | 0666 | [local.go#L1466](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L1466) |
-| 创建目录 | 0777 | [local.go#L793](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L793) |
+| 创建普通文件 | 0666 | `backend/local/local.go`（Update 方法） |
+| 创建目录 | 0777 | `backend/local/local.go`（Mkdir 方法） |
 
 > 上述权限会被操作系统的 umask 修正，实际权限 = mode & ~umask。
 
@@ -163,14 +193,14 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 符号链接权限修改（lChmod）
 
-核心函数：`lChmod` - 修改符号链接本身的权限而非目标。
+核心函数：`lChmod` — 修改符号链接本身的权限而非目标。
 
 | 平台 | 支持情况 | 实现文件 |
 |------|----------|----------|
-| Linux | ❌ 不支持 | （同 lchmod.go） |
-| Windows | ❌ 不支持 | [lchmod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/lchmod.go) |
-| macOS/BSD 等 Unix | ✅ 支持 | [lchmod_unix.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/lchmod_unix.go) |
-| plan9/js | ❌ 不支持 | （同 lchmod.go） |
+| Linux | ❌ 不支持 | 归入 lchmod.go (windows \|\| plan9 \|\| js \|\| linux) |
+| Windows | ❌ 不支持 | `backend/local/lchmod.go` |
+| macOS/FreeBSD/NetBSD/OpenBSD/Solaris 等 | ✅ 支持 | `backend/local/lchmod_unix.go` |
+| plan9/js | ❌ 不支持 | 归入 lchmod.go |
 
 **Linux 不支持原因**：Linux 的 `fchmodat` 系统调用不接受 `AT_SYMLINK_NOFOLLOW` 标志，会返回 `ENOTSUP`。
 
@@ -178,7 +208,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 ### 3. 所有权处理（Chown）
 
-实现位置：[metadata.go#L118-L137](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/metadata.go#L118-L137)
+实现位置：`writeMetadataToFile` 方法（`backend/local/metadata.go`）
 
 | 平台 | 支持情况 | 说明 |
 |------|----------|------|
@@ -192,7 +222,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 目录列表权限
 
-[List 方法](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L622-L751) 中：
+`List` 方法（`backend/local/local.go`）中：
 
 - 目录打开权限错误（Permission denied）：
   - 记录错误日志
@@ -201,7 +231,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 单独文件 stat 失败
 
-- 非 Windows 平台使用 `Readdirnames` 逐个 `Lstat`
+- 非 Windows/Plan9 平台使用 `Readdirnames` 逐个 `Lstat`
 - 单个文件 stat 失败不终止整个目录遍历
 - 被过滤规则排除的文件不报告错误
 
@@ -209,7 +239,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 隐藏文件更新
 
-[Update 方法](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L1466-L1479)：
+`Update` 方法（`backend/local/local.go`）：
 
 - 以 `O_CREATE|O_TRUNC` 打开失败且为 Permission denied 时
 - 尝试以 `O_WRONLY|O_TRUNC`（不带 CREATE）重新打开
@@ -217,7 +247,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 目录删除权限
 
-[Rmdir 方法](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L870-L874)：
+`Rmdir` 方法（`backend/local/local.go`）：
 
 - Windows 上删除目录遇 `ErrPermission` 时
 - 先 `Chmod` 为 `0o600` 再尝试删除
@@ -231,7 +261,7 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 大小写敏感性
 
-[caseInsensitive](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L523-L537)
+`caseInsensitive` 方法（`backend/local/local.go`）
 
 默认判定：
 
@@ -247,21 +277,82 @@ path.Join 拼接 + encoder.ToStandardName 编码
 
 #### 单文件系统边界（one_file_system）
 
-[readDevice](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/read_device_unix.go)
+`readDevice` 函数：
 
-- 仅 Unix 系列支持读取设备号（`stat.Dev`）
-- 启用 `--one-file-system` 时，跨设备的目录被跳过
-- Windows/plan9/js 等平台 `readDevice` 始终返回 `devUnset`
+- Unix 系列（darwin/dragonfly/freebsd/linux/netbsd/openbsd/solaris）：从 `syscall.Stat_t.Dev` 读取设备号
+- 其他平台：始终返回 `devUnset`
 
-### 2. 符号链接差异
+启用 `--one-file-system` 时，跨设备的目录被跳过。
+
+### 2. 时间类型支持
+
+时间类型有两套独立的实现路径：
+
+1. **`time_type` 选项**（用于 `ModTime()` 返回值）：使用 `readTime` 函数，从 `os.FileInfo.Sys()` 读取
+2. **Metadata API**（用于 `--metadata` 标志）：使用 `readMetadataFromFile` 函数
+
+#### 2.1 time_type 选项（readTime 函数）
+
+`readTime` 函数各平台实现：
+
+| 时间类型 | Windows | Linux | macOS/FreeBSD/NetBSD | OpenBSD/Solaris | Dragonfly/plan9/js/aix |
+|---------|---------|-------|----------------------|-----------------|------------------------|
+| mtime | ✅ | ✅ | ✅ | ✅ | ✅ |
+| atime | ✅ | ✅ | ✅ | ✅ | ❌ |
+| btime (创建/出生) | ✅ (CreationTime) | ❌ | ✅ (Birthtimespec) | ❌ | ❌ |
+| ctime (状态变更) | ❌ | ✅ | ✅ | ✅ | ❌ |
+
+实现文件：
+- Windows: `backend/local/metadata_windows.go`
+- Linux: `backend/local/metadata_linux.go`
+- macOS/FreeBSD/NetBSD: `backend/local/metadata_bsd.go`
+- OpenBSD/Solaris: `backend/local/metadata_unix.go`
+- 其他: `backend/local/metadata_other.go`
+
+**关键修正**：Linux 的 `readTime` 函数**不支持 btime**。因为标准 `syscall.Stat_t` 在 Linux 上没有 birth time 字段，只有通过 `statx()` 系统调用（用于 Metadata API）才能获取 btime。
+
+#### 2.2 Metadata API（readMetadataFromFile）
+
+| 字段 | Windows | Linux (statx) | Linux (fstatat) | macOS/BSD | OpenBSD/Solaris | 其他 |
+|------|---------|--------------|-----------------|-----------|-----------------|------|
+| mode | ✅ (简化) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| uid | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| gid | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| rdev | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| atime | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| mtime | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| btime | ✅ | ✅ (内核 4.11+) | ❌ | ✅ | ❌ | ❌ |
+| ctime | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+**说明**：
+
+- **Linux btime**：通过 `statx()` 系统调用获取（内核 4.11+），旧内核回退到 `fstatat()` 则不支持 btime
+- **ctime 在 Metadata API 中普遍缺失**：虽然很多平台的 stat 结构有 ctime，但 `readMetadataFromFile` 未将其写入元数据 map
+- **Android 特殊处理**：Linux 代码中排除了 Android 平台（`runtime.GOOS != "android"`），Android 始终走 fstatat 路径
+
+#### 2.3 时间设置（写入）
+
+| 操作 | Windows | Unix (非 Windows) |
+|------|---------|------------------|
+| 设置 mtime/atime | ✅ | ✅ |
+| 设置 btime | ✅ | ❌ |
+| 符号链接设置 mtime/atime | ✅ | ✅ |
+| 符号链接设置 btime | ✅ | ❌ |
+
+实现：
+- btime 设置：`backend/local/setbtime_windows.go`（Windows 支持）、`backend/local/setbtime.go`（其他平台空实现）
+- 符号链接时间设置：`backend/local/lchtimes_windows.go`、`backend/local/lchtimes_unix.go`
+
+### 3. 符号链接差异
 
 | 特性 | Unix | Windows |
 |------|------|---------|
-| 符号链接类型 | `os.ModeSymlink` | `os.ModeSymlink \| os.ModeIrregular` |
+| 符号链接类型标志 | `os.ModeSymlink` | `os.ModeSymlink \| os.ModeIrregular` |
 | Junction Points | N/A | 视为符号链接处理 |
-| 循环检测 | `ELOOP` 错误 | 无专门检测 |
-| lchmod | 部分支持 | 不支持 |
+| 循环检测 | `ELOOP` 错误 (syscall) | 无专门检测 |
+| lchmod | 部分支持 (Linux 除外) | 不支持 |
 | lchown | 支持 | 不支持 |
+| lchtimes | 支持 (非 plan9/js) | 支持 |
 
 Windows 特殊处理：
 
@@ -272,46 +363,17 @@ if runtime.GOOS == "windows" {
 }
 ```
 
-参见：[local.go#L699-L702](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L699-L702)
-
-循环符号链接检测（Unix  only）：[symlink.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/symlink.go) - 通过 `syscall.ELOOP` 判断。
-
-### 3. 时间类型支持
-
-[time_type 选项](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L295-L317)
-
-| 时间类型 | Windows | macOS | Linux | BSD | plan9/js |
-|---------|---------|-------|-------|-----|----------|
-| mtime | ✅ | ✅ | ✅ | ✅ | ✅ |
-| atime | ✅ | ✅ | ✅ | ✅ | ❌ |
-| btime (创建/出生) | ✅ (CreationTime) | ✅ | ✅ (statx, 4.11+) | ✅ | ❌ |
-| ctime (状态变更) | ❌ | ✅ | ✅ | ✅ | ❌ |
-
-**注意**：`btime` 在 Linux 上需要内核 4.11+ 支持的 `statx()` 系统调用，旧内核回退到 `fstatat()` 且不返回 btime。
-
-实现文件：
-- Windows: [metadata_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/metadata_windows.go)
-- Linux: [metadata_linux.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/metadata_linux.go)
-- Unix (通用): [metadata_unix.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/metadata_unix.go)
-- BSD: [metadata_bsd.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/metadata_bsd.go)
+循环符号链接检测（Unix only）：通过 `syscall.ELOOP` 判断（`backend/local/symlink.go`）。
 
 ### 4. 元数据（Metadata）
 
 #### 系统元数据
 
-| 字段 | Windows | Linux | macOS | BSD |
-|------|---------|-------|-------|-----|
-| mode | ✅ (简化) | ✅ | ✅ | ✅ |
-| uid | ❌ | ✅ | ✅ | ✅ |
-| gid | ❌ | ✅ | ✅ | ✅ |
-| rdev | ❌ | ✅ | ✅ | ✅ |
-| atime | ✅ | ✅ | ✅ | ✅ |
-| mtime | ✅ | ✅ | ✅ | ✅ |
-| btime | ✅ | ✅ (statx) | ✅ | ✅ |
+参见上表「Metadata API」部分。
 
 #### 扩展属性（xattr）
 
-实现：[xattr.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/xattr.go)
+实现：`backend/local/xattr.go`
 
 | 平台 | 支持用户 xattr | 说明 |
 |------|---------------|------|
@@ -321,7 +383,7 @@ if runtime.GOOS == "windows" {
 | NetBSD | ✅ | |
 | Solaris | ✅ | |
 | Windows | ❌ | pkg/xattr#47 未解决 |
-| OpenBSD | ❌ | 编译排除 |
+| OpenBSD | ❌ | 编译排除 (build tag: !openbsd && !plan9) |
 | Plan9 | ❌ | 编译排除 |
 
 xattr 前缀：`user.`（Unix 惯例）
@@ -330,15 +392,15 @@ xattr 前缀：`user.`（Unix 惯例）
 
 ### 5. 文件删除行为
 
-- **Unix**：直接 `os.Remove`，一次尝试
-- **Windows**：[remove_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/remove_windows.go)
+- **非 Windows**：直接 `os.Remove`，一次尝试（`backend/local/remove_other.go`）
+- **Windows**：`backend/local/remove_windows.go`
   - 遇 `ERROR_SHARING_VIOLATION` 时指数退避重试
   - 最多重试 10 次
   - 初始等待 1ms，每次翻倍
 
 ### 6. 文件打开行为
 
-实现：[lib/file/file_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/lib/file/file_windows.go)
+实现：`lib/file/file_windows.go`（Windows）、`lib/file/file_other.go`（非 Windows）
 
 **Windows 特殊点**：
 - 共享模式：`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`
@@ -358,7 +420,7 @@ xattr 前缀：`user.`（Unix 惯例）
 
 ### 8. 目录读取策略
 
-[List 方法](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/backend/local/local.go#L649-L690)
+`List` 方法（`backend/local/local.go`）
 
 **Windows/Plan9**：使用 `Readdir()` 批量读取 FileInfo
 - 优点：性能好，一次系统调用获得全部信息
@@ -370,7 +432,7 @@ xattr 前缀：`user.`（Unix 惯例）
 
 ### 9. 保留名称检查
 
-[IsReserved](file:///d:/fz/0601-2/solo-dogfeeding/code/48-rclone/lib/file/file_windows.go#L72-L101)（仅 Windows）
+`IsReserved` 函数（`lib/file/file_windows.go`，仅 Windows）
 
 检查以下非法命名：
 
@@ -412,6 +474,9 @@ type Fs struct {
 | UTFNorm | Unicode NFC 规范化 | 全平台（主要 macOS） |
 | TimeType | 返回的时间类型 | 支持度因 OS 而异 |
 | Enc | 文件名编码器 | 全平台（默认值因 OS 而异） |
+| NoClone | 禁用 reflink 克隆 | macOS only (功能仅 macOS 有) |
+| FatalIfNoSpace | 磁盘满时返回致命错误 | 全平台 |
+| NoCheckUpdated | 不上传时检查文件变化 | 全平台 |
 
 ### Object 结构
 
@@ -430,12 +495,18 @@ type Object struct {
 
 ---
 
-## 总结
+## 设计原则总结
 
 本地文件系统后端的跨平台策略遵循以下设计原则：
 
 1. **分层抽象**：核心逻辑在 `local.go`，平台差异通过 build tag 分离到 `_windows.go`/`_unix.go`/`_other.go` 等文件
+
 2. **优雅降级**：高级特性（xattr、btime、reflink 等）不可用时静默降级，不报错
+
 3. **路径双轨制**：remote 路径（标准化）与 local 路径（OS 原生）分离，通过 encoder 转换
+
 4. **Windows 特殊照顾**：UNC 路径、共享模式、保留名称、隐藏文件、删除重试等
+
 5. **动态检测**：部分特性（如 Linux statx）运行时探测，不可用则回退
+
+6. **两套时间 API**：`time_type` 选项和 Metadata API 使用不同的实现路径，支持范围不完全一致

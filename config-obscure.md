@@ -106,55 +106,100 @@ type Storage interface {
 
 ### 2.3 密码获取失败的返回与重试机制
 
-**文件**：[fs/config/crypt.go:120-178](file:///d:/fz/0601-2/solo-dogfeeding/code/60-rclone/fs/config/crypt.go#L120-L178)
+**文件**：[fs/config/crypt.go:87-178](file:///d:/fz/0601-2/solo-dogfeeding/code/60-rclone/fs/config/crypt.go#L87-L178)
 
-`Decrypt()` 函数的核心控制流：
+#### 密码来源的执行时机：循环外 vs 循环内
+
+`Decrypt()` 函数将密码来源严格分为两个阶段，这是最关键的实现边界：
 
 ```go
-for {
-    // 步骤1：获取密钥（按优先级选择来源）
-    if 临时密钥文件存在 → 读取并删除 → 尝试解密
-    else if configKey已缓存 → 尝试解密
-    else if --password-command → 已在函数开头执行，失败不会到这里
-    else if RCLONE_CONFIG_PASS → 已在函数开头执行，失败不会到这里
-    else if AskPassword → 交互提示输入密码
+// ============================================================
+// 阶段一：循环外 — 只执行一次（L87-L118）
+// ============================================================
+if len(configKey) == 0 {
+    // A. --password-command：仅在这里执行一次
+    pass, err := GetPasswordCommand(ctx)
+    if err != nil {
+        return nil, err                          // 命令执行失败：直接返回
+    }
+    if pass != "" {
+        usingPasswordCommand = true               // 打上标记，循环内用此判断
+        SetConfigPassword(pass)
+        // 命令执行成功 → 进入解密循环
+    } else {
+        // B. RCLONE_CONFIG_PASS：仅在这里读取一次
+        envPassword := os.Getenv("RCLONE_CONFIG_PASS")
+        if envPassword != "" {
+            usingEnvPassword = true              // 打上标记，循环内用此判断
+            SetConfigPassword(envPassword)
+        }
+    }
+}
 
-    // 步骤2：尝试解密
+// ============================================================
+// 阶段二：解密循环 — 解密失败进入循环重试（L131-L177）
+// ============================================================
+var out []byte
+for {
+    // C. 临时密钥文件：每次循环都重新读取环境变量 + 文件
+    if envKeyFile := os.Getenv("_RCLONE_CONFIG_KEY_FILE"); len(envKeyFile) > 0 {
+        读取文件 → 删除文件 → 获得 configKey
+        // 读取/删除失败：立即返回错误，不重试
+    } else if len(configKey) == 0 {
+        // D. 通过 usingPasswordCommand 标记判断，不重新执行命令
+        if usingPasswordCommand {
+            return nil, errors.New("using --password-command derived password, ...")
+        }
+        // E. 通过 usingEnvPassword 标记判断，不重新读取环境变量
+        if usingEnvPassword {
+            return nil, errors.New("using RCLONE_CONFIG_PASS env password, ...")
+        }
+        // F. AskPassword=false：所有来源耗尽，直接返回
+        if !ci.AskPassword {
+            return nil, errors.New("unable to decrypt configuration and not allowed to ask ...")
+        }
+        // G. 交互提示：每次循环都重新调用用户输入
+        getConfigPassword("Enter configuration password:")
+    }
+
+    // 尝试解密
     out, ok = secretbox.Open(nil, box[24:], &nonce, &key)
     if ok {
         break  // 解密成功，退出循环
     }
 
-    // 步骤3：解密失败，决定是否重试
+    // 解密失败：清空 configKey，强制下一轮重新获取
     fs.Errorf(nil, "Couldn't decrypt configuration, most likely wrong password.")
-    configKey = nil  // 清空错误密钥，强制下一轮重新获取
+    configKey = nil
 }
 ```
 
 #### 各密码来源的失败返回路径
 
-| 密码来源 | 失败条件 | 返回行为 | 重试行为 |
-|---------|---------|---------|---------|
-| **`configKey` 内存缓存** | 解密失败（MAC验证不通过） | 不返回，清空 `configKey` | **进入下一轮循环**，从下一优先级来源重新获取 |
-| **`_RCLONE_CONFIG_KEY_FILE` 临时文件** | 文件不存在或读取失败 | 立即返回错误，不重试 | **不重试**，文件读取失败即终止 |
-| | 文件读取成功但删除失败 | 立即返回错误 | **不重试** |
-| | 解密失败（密钥错误） | 不返回，清空 `configKey` | **进入下一轮循环**，从下一优先级重新获取 |
-| **`--password-command`** | 命令执行失败 | 立即返回 `"password command failed: ..."` | **不重试** |
-| | 命令返回空字符串 | 立即返回 `"--password-command returned empty string"` | **不重试** |
-| | 命令执行成功但解密失败 | 立即返回 `"using --password-command derived password, unable to decrypt configuration"` | **不重试** |
-| **`RCLONE_CONFIG_PASS` 环境变量** | 解密失败 | 立即返回 `"using RCLONE_CONFIG_PASS env password, unable to decrypt configuration"` | **不重试** |
-| **交互提示（AskPassword=true）** | 密码错误 | 打印错误到 stderr，不返回 | **无限重试**，循环提示直到正确 |
-| **交互提示（AskPassword=false）** | 所有来源均失败 | 立即返回 `"unable to decrypt configuration and not allowed to ask for password ..."` | **不重试** |
+| 密码来源 | 执行时机 | 失败条件 | 返回行为 | 重试行为 |
+|---------|---------|---------|---------|---------|
+| **`--password-command`** | **循环外** 仅一次 | 命令执行失败（L88-L91） | 立即返回 `"password command failed: ..."` | **不重试**，根本不进入循环 |
+| | | 命令返回空字符串（L209-L211） | 立即返回 `"--password-command returned empty string"` | **不重试**，根本不进入循环 |
+| | | 命令执行成功但解密失败（循环内 L149-L151） | 检测 `usingPasswordCommand==true`，直接返回错误 | **不重试**，通过布尔标记短路，不重新执行命令 |
+| **`RCLONE_CONFIG_PASS`** | **循环外** 仅一次 | 解密失败（循环内 L152-L154） | 检测 `usingEnvPassword==true`，直接返回错误 | **不重试**，通过布尔标记短路，不重新读取环境变量 |
+| **`configKey` 内存缓存** | 循环入口判断 | 解密失败（MAC 验证不通过） | 不返回，清空 `configKey` | **进入下一轮循环**，从下一优先级来源重新获取 |
+| **`_RCLONE_CONFIG_KEY_FILE` 临时文件** | **循环内** 每次重读 | 文件不存在或读取失败 | 立即返回错误 | **不重试**，文件 I/O 失败即终止 |
+| | | 文件读取成功但删除失败 | 立即返回错误 | **不重试** |
+| | | 解密失败（密钥错误） | 不返回，清空 `configKey` | **进入下一轮循环**，从下一优先级重新获取 |
+| **交互提示 AskPassword=true** | **循环内** 每次重调 | 密码错误 | 打印错误到 stderr，不返回 | **无限重试**，`getConfigPassword()` 内部也有循环直到输入合法 |
+| **AskPassword=false** | 循环内兜底判断 | 以上所有来源均无有效密钥 | 立即返回提示设置环境变量 | **不重试** |
 
-#### 关键安全设计
+#### 关键安全设计结论
 
-1. **`--password-command` 和环境变量绝不重试** — 避免重复执行命令导致的侧信道泄露，也避免环境变量被反复读取
+1. **`--password-command` 绝不重复执行** — 通过 `usingPasswordCommand` 布尔标记实现：循环外执行一次，循环内一旦解密失败直接 return，**绝不重新执行外部命令**。这避免了命令重复执行的侧信道泄露，也避免了恶意命令被多次触发。
 
-2. **解密失败后强制清空 `configKey`** — `configKey = nil`，确保下一轮循环不会重复使用错误密钥
+2. **`RCLONE_CONFIG_PASS` 绝不重新读取** — 通过 `usingEnvPassword` 布尔标记实现：循环外读取一次，循环内一旦解密失败直接 return，**绝不重新读环境变量**。这避免了环境变量在循环中被反复暴露给其他进程的读取窗口。
 
-3. **交互模式无限重试的合理性** — 在本地场景下，攻击者若已能访问加密配置文件，暴力破解防护意义不大；此设计面向的是用户输错密码的场景
+3. **解密失败后强制清空 `configKey`** — `configKey = nil`，确保下一轮循环 `len(configKey) == 0` 判断成立，不会在循环中重复使用错误密钥。
 
-4. **临时密钥文件立即删除** — 无论读取成功或失败，都尝试删除临时文件，减少泄露窗口
+4. **交互模式无限重试的合理性** — 在本地场景下，攻击者若已能访问加密配置文件，暴力破解防护意义不大；此设计面向用户输错密码的正常场景。
+
+5. **临时密钥文件立即删除** — 无论读取成功或失败，`os.Remove(envKeyFile)` 都会被执行，尽量缩小泄露时间窗口。
 
 ### 2.4 临时密钥文件传递的安全风险与边界
 

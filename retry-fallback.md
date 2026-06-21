@@ -6,9 +6,10 @@ Rclone 的重试机制采用**洋葱式多层嵌套**设计，从最外层命令
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│ L1: cmd.Run()        命令级重试 (--retries, 默认 3 次)              │
+│ L1: cmd.Run()        命令级重试 (--retries, 默认 3 次, 仅当 cmd.Run 第一参数为 true 时生效) │
 │   └─ 处理: FatalError / NoRetryError / RetryAfter / 全局错误统计    │
 │   └─ 退避: --retries-interval 固定间隔                               │
+│   └─ 注意: lsd/ls等列表命令传 false → 本层完全禁用                  │
 │     ┌───────────────────────────────────────────────────────────┐ │
 │     │ L2: sync.processError()  同步级错误分类                     │ │
 │     │   └─ 分类: fatalErr > err > noRetryErr 优先级              │ │
@@ -457,23 +458,37 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 
 ### 7.1 重试决策流程
 
+`cmd.Run` 函数签名：
+```go
+func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error)
 ```
-命令执行完毕
+
+**第一个参数 `Retry` 是总开关**。调用方传入 `false` 时，整个命令级重试完全禁用（无论 `ci.Retries` 设为多少）。
+
+```
+命令执行入口（cmd.Run 被调用）
     │
-    ├─ 无错误 → 成功退出
+    ├─ 进入 for try := 1; try <= ci.Retries; try++ 循环
     │
-    ├─ 有错误 → 进入重试判定：
-    │     │
-    │     ├─ HadFatalError() → true → 打印"Fatal error received" → 停止重试
-    │     │
-    │     ├─ HadRetryError() → false → 打印"Can't retry any of the errors" → 停止重试
-    │     │   (所有错误都是 NoRetryError)
-    │     │
-    │     ├─ RetryAfter() 非零 → time.Sleep() 直到服务器指定时间
-    │     │
-    │     ├─ RetriesInterval > 0 → 固定间隔 sleep
-    │     │
-    │     └─ try < ci.Retries → ResetErrors() + 重新执行整个命令
+    ├─ 执行 f() → 实际业务逻辑
+    │
+    ├─ ↓ 关键判断 ↓
+    │   if !Retry || !accounting.GlobalStats().Errored() {
+    │       break  // Retry=false 时直接退出循环
+    │   }
+    │
+    ├─ ↓ 以下逻辑仅在 Retry=true 且有错误时才会执行 ↓
+    │
+    │   ├─ HadFatalError() → true → 打印"Fatal error received" → 停止重试
+    │   │
+    │   ├─ HadRetryError() → false → 打印"Can't retry any of the errors" → 停止重试
+    │   │   (所有错误都是 NoRetryError)
+    │   │
+    │   ├─ RetryAfter() 非零 → time.Sleep() 直到服务器指定时间
+    │   │
+    │   ├─ RetriesInterval > 0 → 固定间隔 sleep
+    │   │
+    │   └─ try < ci.Retries → ResetErrors() + 重新执行整个命令
 ```
 
 ### 7.2 与 accounting 统计系统的深度绑定
@@ -641,60 +656,212 @@ f.shouldRetry(ctx, err)  →  返回 (bool, error)
 
 > **重要澄清**：S3 的 `shouldRetry()` **不会将错误包装为 `pacer.RetryAfterError`**，即没有「服务器建议延迟」的特殊处理路径。S3 的退避完全由 `pacer.NewS3()` 算法根据连续重试次数自动指数增长，不依赖服务器返回的 Retry-After 头。搜索整个 S3 后端代码，不存在任何 `RetryAfterError`、`SlowDown`、`InternalError` 的特殊分支——这与 Google Drive 不同。
 
-### 8.5 完整执行路径（一次 ListBuckets 的生命周期）
+### 8.5 完整调用链：从 `rclone lsd s3:` 入口到 `listBuckets`
+
+以用户执行 `rclone lsd s3:` 为例，完整追踪从命令入口到 S3 桶列出的每一层调用，以及哪些重试层真正生效。
+
+#### 8.5.1 命令入口：`cmd.Run` 的第一个参数决定一切
+
+在 `cmd/lsd/lsd.go` L58-L68：
+
+```go
+Run: func(command *cobra.Command, args []string) {
+    ci := fs.GetConfig(context.Background())
+    cmd.CheckArgs(1, 1, command, args)
+    if recurse {
+        ci.MaxDepth = 0
+    }
+    fsrc := cmd.NewFsSrc(args)  // 此处会初始化 S3 Fs（含 pacer.SetRetries(2)）
+    // 关键！第一个参数是 false → 不启用命令级重试
+    cmd.Run(false, false, command, func() error {
+        return operations.ListDir(context.Background(), fsrc, os.Stdout)
+    })
+},
+```
+
+`cmd.Run` 函数签名（`cmd/cmd.go` L240）：
+```go
+func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error)
+```
+
+**第一个参数 `Retry=false` 是核心**。在 `cmd.Run` 内部（`cmd/cmd.go` L261）：
+```go
+for try := 1; try <= ci.Retries; try++ {
+    cmdErr = f()
+    // ...
+    if !Retry || !accounting.GlobalStats().Errored() {  // ← Retry=false，这里直接 true
+        if try > 1 {
+            fs.Errorf(nil, "Attempt %d/%d succeeded", try, ci.Retries)
+        }
+        break  // ← 第一次执行完就 break，不会进入重试循环
+    }
+    // ... 后面的重试逻辑永远不会执行
+}
+```
+
+> **结论**：L1 命令级重试**完全禁用**。无论 `ci.Retries` 设为多少（默认 3），循环只会执行 1 次。
+
+#### 8.5.2 完整调用链路追踪（共 11 层函数调用）
 
 ```
 用户执行: rclone lsd s3:
-  ↓
-cmd.Run() [L1, ci.Retries=3]
-  ↓
-list 操作
-  ↓
-s3.(*Fs).List() → list.WithListP()
-  ↓
-s3.(*Fs).listBuckets()
   │
-  │  返回类型: entries fs.DirEntries, err error
+  ▼
+L0  cmd/lsd/lsd.go Run()
+  ├─ cmd.CheckArgs(1, 1, command, args)
+  ├─ fsrc := cmd.NewFsSrc(args)  // 初始化 S3 Fs: pc.SetRetries(2)
+  └─ cmd.Run(false, false, ...) // ← Retry=false，禁用 L1 重试
   │
-  └─ f.pacer.Call() [L5, retries=2 ← S3 显式设置]
-      │
-      ├─ pacer.beginCall(): 取 pacer 令牌（connTokens 通常为 nil，S3 不限并发）
-      ├─ pacerInvoker() 进入:
-      │   ↓
-      │   f.c.ListBuckets(ctx, &s3.ListBucketsInput{})
-      │     → AWS SDK 内部已含自身重试机制
-      │     → 返回 (*s3.ListBucketsOutput, error)
-      │   ↓
-      │   f.shouldRetry(ctx, err)
-      │     → 判定链: Context → smithy.APIError → HTTP 429/500/503 → ShouldRetry
-      │     → 返回 (retry=true/false, err)
-      │   ↓
-      │   若 retry=true:
-      │     Debugf("low level retry %d/2 (error %v)")
-      │     err = fserrors.RetryError(err)  ← 包装语义标记，供上层判定
-      │   ↓
-      ├─ pacer.endCall(retry, err):
-      │   ├─ retry=true: ConsecutiveRetries++
-      │   ├─ retry=false: ConsecutiveRetries = 0
-      │   ├─ S3.Calculator.Calculate(state):
-      │   │   ├─ retry=true → sleepTime 指数上升（×2，截断在 maxSleep）
-      │   │   └─ retry=false → sleepTime 衰减（可降到 0）
-      │   └─ 更新 state.SleepTime
-      │
-      └─ 循环最多 2 次 → 返回最终 err（可能是包装后的 RetryError）
-  ↓
-（如果 Pacer 仍失败且被包装为 RetryError）
-  ↓
-L3 或 L2 层检测到 IsRetryError(err)=true → 继续更高级别重试
-  ↓
-... 重复直到成功或所有层耗尽 ...
-  ↓
-cmd.Run() 最终判定:
-  ├─ 成功 → break
-  ├─ HadFatalError → "Fatal error received - not attempting retries"
-  ├─ HadRetryError=false → "Can't retry any of the errors - not attempting retries"
-  └─ 所有尝试耗尽 → 退出码 RetryError
+  ▼
+L1  cmd/cmd.go cmd.Run()
+  ├─ 由于 Retry=false，for 循环只执行 1 次
+  └─ 调用 f() → operations.ListDir()
+  │
+  ▼
+L2  fs/operations/operations.go operations.ListDir()
+  └─ walk.ListR(ctx, f, "", false, 1, walk.ListDirs, fn)
+     // ↑ ConfigMaxDepth(ctx, false)=1，不递归
+  │
+  ▼
+L3  fs/walk/walk.go walk.ListR()
+  ├─ maxLevel=1 >= 0 → 条件成立
+  └─ 走 listRwalk 分支（不使用 ListR 优化）
+  │
+  ▼
+L4  fs/walk/walk.go walk.listRwalk()
+  └─ Walk(ctx, ...)  // 传入 listType=ListDirs
+  │
+  ▼
+L5  fs/walk/walk.go walk.Walk()
+  ├─ maxLevel=1，不满足 (maxLevel<0 || maxLevel>1)
+  └─ 走 walkListDirSorted 分支
+  │
+  ▼
+L6  fs/walk/walk.go walk.walkListDirSorted()
+  └─ walk(ctx, ..., list.DirSorted)  // 传入 list.DirSorted 回调
+  │
+  ▼
+L7  fs/walk/walk.go walk.walk()  // 内部 goroutine 池
+  ├─ 启动 ci.Checkers 个 worker goroutine
+  ├─ in <- listJob{remote: "", depth: 0}  // depth=maxLevel-1=0
+  └─ 某个 worker 取出 job，调用 listDir → list.DirSorted
+  │
+  ▼
+L8  fs/list/list.go list.DirSorted()
+  ├─ entries, err = f.List(ctx, dir)  // 调用 S3.List
+  └─ accounting.Stats(ctx).Listed(...) // 更新统计
+  │
+  ▼
+L9  backend/s3/s3.go s3.(*Fs).List()
+  └─ list.WithListP(ctx, dir, f)
+  │
+  ▼
+L10 fs/list/helpers.go list.WithListP()
+  └─ list.ListP(ctx, dir, callback)  // 调用 S3.ListP
+  │
+  ▼
+L11 backend/s3/s3.go s3.(*Fs).ListP()
+  ├─ bucket, directory := f.split(dir)
+  │  // dir=""，所以 bucket=""，directory=""
+  ├─ bucket == "" → 调用 f.listBuckets(ctx)
+  └─ 将 entries 通过 callback 逐层返回
+  │
+  ▼
+L12 backend/s3/s3.go s3.(*Fs).listBuckets()
+  └─ f.pacer.Call(...)  // ← 这里才进入唯一的重试层
 ```
+
+#### 8.5.3 各重试层生效情况总览
+
+在整个调用链中，6 层重试架构中实际生效的只有 1 层：
+
+| 层级 | 模块 | 是否生效 | 原因 |
+|------|------|---------|------|
+| L1 Cmd | `cmd.Run` | ❌ 无效 | `cmd.Run(false, ...)`，Retry 参数为 false，循环只跑 1 次 |
+| L2 sync | `sync.processError` | ❌ 无效 | lsd 不走 sync 命令流程 |
+| L3 Operations | `operations.Retry` | ❌ 无效 | `operations.ListDir` 没有用 `operations.Retry` 包装，直接调用 `walk.ListR` |
+| L4 ReOpen | `ReOpen.Read` | ❌ 无效 | 列表操作不涉及流式读取，没有 `Open()` 调用 |
+| L5 Pacer | `f.pacer.Call` | ✅ 生效 | 在 `listBuckets` 中显式调用，S3 设为 2 次 |
+
+**各层代码验证**：
+
+| 层级 | 验证代码位置 | 结论 |
+|------|-------------|------|
+| L1 禁用 | `cmd/lsd/lsd.go` L65 | `cmd.Run(false, false, command, ...)` |
+| L3 禁用 | `fs/operations/operations.go` L1040-L1047 | `ListDir` 函数体内直接调用 `walk.ListR`，无 `Retry` 包装 |
+| L5 生效 | `backend/s3/s3.go` L2629 | `err = f.pacer.Call(func() (bool, error) { ... })` |
+
+### 8.6 失败后实际停留点：只有 L5 Pacer 会重试
+
+当 S3 `ListBuckets` 失败时（例如返回 503 Slow Down），实际重试路径如下：
+
+```
+s3.listBuckets()
+  │
+  └─ f.pacer.Call() [retries=2]
+      │
+      ├─ 第 1 次调用 (i=1):
+      │   ├─ beginCall(): 取令牌（此时 SleepTime=minSleep=10ms）
+      │   ├─ f.c.ListBuckets() → 失败，返回 503
+      │   ├─ f.shouldRetry(ctx, err) → 503 ∈ [429,500,503] → return (true, err)
+      │   ├─ pacerInvoker: Debugf("low level retry 1/2") + err = RetryError(err)
+      │   └─ endCall(retry=true):
+      │       ├─ ConsecutiveRetries = 1
+      │       ├─ S3.Calculator.Calculate():
+      │       │   └─ state.ConsecutiveRetries=1 → sleepTime = 10ms × 2 = 20ms
+      │       └─ 归还令牌，goroutine sleep(20ms) 后放回 pacer 令牌
+      │
+      ├─ 第 2 次调用 (i=2):
+      │   ├─ beginCall(): 等待 pacer 令牌（阻塞 20ms）
+      │   ├─ f.c.ListBuckets() → 失败，返回 503
+      │   ├─ f.shouldRetry(ctx, err) → return (true, err)
+      │   ├─ pacerInvoker: Debugf("low level retry 2/2") + err = RetryError(err)
+      │   └─ endCall(retry=true):
+      │       ├─ ConsecutiveRetries = 2
+      │       ├─ S3.Calculator.Calculate():
+      │       │   └─ sleepTime = 20ms × 2 = 40ms
+      │       └─ 归还令牌
+      │
+      └─ 循环结束（i 已达 retries=2）→ 返回 RetryError 包装后的 err
+  │
+  ▼ 错误向上冒泡，不再重试
+  │
+  ├─ s3.ListP() → return err
+  ├─ list.WithListP() → return err
+  ├─ s3.List() → return err
+  ├─ list.DirSorted() → return err
+  ├─ walk.walk() 中的 worker 检测到 err → closeQuit()，通过 errs chan 返回 err
+  ├─ walk.Walk() → return err
+  ├─ walk.listRwalk() → return err
+  ├─ walk.ListR() → return err
+  ├─ operations.ListDir() → return err
+  └─ cmd.Run() → 由于 Retry=false，不会重试 → 直接退出，打印错误
+```
+
+**关键事实**：
+1. Pacer 内部循环 2 次耗尽后，错误被 `pacerInvoker` 包装为 `RetryError`
+2. 上层（L3/L2/L1）虽然检测到 `IsRetryError(err)=true`，但**因为这些层本身没有重试循环**，错误直接向上冒泡
+3. 最终 cmd.Run 接收到错误，但由于 `Retry=false`，不会进入重试逻辑
+4. 用户看到的就是原始错误信息，不会有 `Attempt 1/3 failed` 之类的重试日志
+
+> **与 `rclone sync` 的对比**：`sync` 命令调用 `cmd.Run(true, true, ...)`，即 `Retry=true`，所以 L1 命令级重试会生效；同时 sync 内部的 `processError` 和 `operations.Copy` 的 `Retry` 包装也会生效。但 `lsd` 是「简单列表」命令，设计者认为不需要多重重试。
+
+### 8.7 各命令的 `cmd.Run` 重试参数对比
+
+不同命令传入 `cmd.Run` 的第一个参数不同，决定了是否启用命令级重试：
+
+| 命令 | `cmd.Run` 调用 | 是否启用 L1 重试 | 设计考量 |
+|------|---------------|-----------------|---------|
+| `rclone sync` | `cmd.Run(true, true, ...)` | ✅ 启用 | 数据同步操作，失败重试价值高 |
+| `rclone copy` | `cmd.Run(true, true, ...)` | ✅ 启用 | 数据传输操作，失败重试价值高 |
+| `rclone move` | `cmd.Run(true, true, ...)` | ✅ 启用 | 数据传输操作 |
+| `rclone lsd` | `cmd.Run(false, false, ...)` | ❌ 禁用 | 只读列表操作，依赖 Pacer 层足够 |
+| `rclone ls` | `cmd.Run(false, false, ...)` | ❌ 禁用 | 只读列表操作 |
+| `rclone lsf` | `cmd.Run(false, false, ...)` | ❌ 禁用 | 只读列表操作 |
+| `rclone size` | `cmd.Run(false, false, ...)` | ❌ 禁用 | 只读统计操作 |
+| `rclone touch` | `cmd.Run(true, false, ...)` | ✅ 启用 | 有状态修改操作 |
+
+这也解释了为什么 `--retries` 参数对 `rclone lsd` 不起作用——该参数只影响 L1 循环次数，但 `Retry=false` 时循环根本不会跑第二次。
 
 ---
 
@@ -705,10 +872,10 @@ cmd.Run() 最终判定:
 
 ### 9.2 分层重试（Layered Retry）
 每层职责明确、独立计数：
+- L1 Cmd：全命令 × `--retries` 次（**视命令而定**，sync/copy/move 启用，lsd/ls 等只读命令禁用）
 - L5 Pacer：单 API 调用 × N 次（带智能退避，默认 fs 层为 10 次、S3 特化为 2 次、lib/pacer 底层默认 3 次）
 - L4 ReOpen：流读取 × LowLevelRetries 次（断点续传，默认 10 次）
-- L3 Operations：单操作 × LowLevelRetries 次（兜底，默认 10 次）
-- L1 Cmd：全命令 × `--retries` 次（面向统计，默认 3 次）
+- L3 Operations：单操作 × LowLevelRetries 次（兜底，默认 10 次，部分操作如 ListDir 不启用）
 
 避免了「一个超大重试次数循环」的反模式。
 
@@ -727,8 +894,8 @@ L1 命令级重试通过 `accounting.GlobalStats()` 做决策，而非检查单�
 
 | 参数 | 默认值 | 作用层级 | 说明 |
 |------|--------|---------|------|
-| `--retries` | 3 | L1 Cmd | 命令级最大重试次数 |
-| `--retries-interval` | 0 | L1 Cmd | 每次命令重试前的固定等待时间 |
+| `--retries` | 3 | L1 Cmd | 命令级最大重试次数（仅当 cmd.Run 第一参数为 true 时生效，lsd/ls 等只读命令传 false 时无效） |
+| `--retries-interval` | 0 | L1 Cmd | 每次命令重试前的固定等待时间（仅 L1 启用时生效） |
 | `--low-level-retries` | 10 | L3/L4/L5 | 操作级/流读取级/Pacer fs 层默认重试次数 |
 | `--max-connections` | 0 | L5 Pacer | 最大并发连接数（0=不限） |
 | `--tpslimit` | 0 | Pacer Config | 每秒事务数上限（0=不限） |

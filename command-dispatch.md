@@ -10,14 +10,14 @@ Rclone 使用 `cobra` 作为命令行框架，采用 **插件式注册 + 集中�
 
 ```
 【程序启动初始化 - main() 执行前】
-├─ 依赖包级变量初始化 (flags 包: All=nil)
-├─ 依赖包 init() 执行 (flags 包: 创建14个标志分组)
-├─ cmd 包级变量初始化
-│  ├─ help.go: Root 等帮助类 Command 实例创建
-│  └─ cmd.go: cpuProfile/statsInterval 等全局标志注册
-├─ 子命令包级变量初始化 (commandDefinition 实例创建)
-├─ 子命令包 init() 执行 (cmd.Root.AddCommand + 命令级标志注册)
-└─ backend 包 init() 执行 (后端注册到 fs.Registry)
+├─ 依赖包整体初始化 (flags 包: All=nil → init()创建14个标志分组)
+├─ cmd 包整体初始化（无 init()，仅包级变量）
+│  ├─ Root 等 Command 实例创建 (help.go)
+│  └─ cpuProfile/statsInterval 等全局标志注册 (cmd.go)
+├─ 子命令包整体初始化 (包级变量 + init())
+│  ├─ commandDefinition 实例创建
+│  └─ cmd.Root.AddCommand() + 命令级标志注册
+└─ backend 包整体初始化 (包级变量 + init()注册到 fs.Registry)
 
 【运行期 - main() 执行后】
         ↓
@@ -46,12 +46,15 @@ cmd.Run() 包装执行 [cmd/cmd.go] → 重试/统计/清理/退出码
 
 ### 2.1 Go 包初始化规则
 
-Go 程序在执行 `main()` 函数前，会严格按照以下规则完成所有导入包的初始化：
+Go 程序在执行 `main()` 函数前，会按照以下规则完成所有导入包的初始化：
 
-1. **依赖优先**：先初始化所有被导入的依赖包（递归）
-2. **包内顺序**：每个包内部
-   - 第一步：按源文件编译顺序，依次初始化**包级变量**（var 声明带赋值表达式的立即求值执行）
-   - 第二步：按源文件编译顺序，依次执行所有 `init()` 函数
+1. **依赖优先**：被导入的依赖包先于导入者完成初始化（递归）
+2. **包内两级初始化**：每个包内部
+   - 第一级：初始化**所有包级变量**（var 声明带赋值表达式的立即求值）
+   - 第二级：执行**所有 init() 函数**
+   - 包级变量全部就绪后，才会执行 init() 函数
+3. **跨文件顺序**：同一个包内不同源文件的包级变量初始化顺序**不由 Go 规范定义**，由编译器实现决定；同一源文件内则按声明顺序
+4. **包完整性**：一个包的所有包级变量和所有 init() 函数全部执行完毕后，才视为该包初始化完成；导入该包的其他包才会开始初始化
 
 ### 2.2 入口与依赖链
 
@@ -72,11 +75,11 @@ func main() {
 }
 ```
 
-### 2.3 初始化阶段时序（按实际执行顺序）
+### 2.3 初始化阶段时序
 
-#### 步骤 1：`fs/config/flags` 包初始化（cmd 包的依赖）
+#### 步骤 1：`fs/config/flags` 包整体初始化（cmd 包的依赖）
 
-由于 cmd 包 import 了 `fs/config/flags`，该包先完成初始化：
+由于 cmd 包 import 了 `fs/config/flags`，该包先于 cmd 包完成整体初始化：
 
 **包级变量初始化**（fs/config/flags/flags.go:108）：
 ```go
@@ -93,88 +96,62 @@ func init() {
     // ... 共 14 组
 }
 ```
-> **关键点**：标志分组的创建是在 `init()` 函数中，而非包级变量初始化。
+> 标志分组的创建在 init() 函数中完成。cmd 包的包级变量初始化依赖 flags 包已完全就绪（包括 All 分组），这由 Go 的依赖优先规则保证。
 
-#### 步骤 2：`cmd` 包级变量初始化
+#### 步骤 2：`cmd` 包整体初始化
 
-在所有依赖包（包括 flags 包）初始化完成后，开始 cmd 包自身的包级变量初始化。
+在所有依赖包（包括 flags 包）初始化完成后，cmd 包开始初始化。**cmd 包自身没有 init() 函数**，仅有包级变量需要初始化。
 
-**help.go 文件**中的包级变量（按声明顺序）：
+cmd 包的包级变量分布在多个源文件中：
+
+**help.go 中的关键包级变量**：
 ```go
-// cmd/help.go:26-40
-var Root = &cobra.Command{                    // ← 创建根命令实例
-    Use:   "rclone",
-    Short: "Show help for rclone commands...",
-    // ...
-}
-
-var GeneratingDocs = false
-
-var helpCommand = &cobra.Command{Use: "help", ...}  // help 子命令
-var helpFlags = &cobra.Command{Use: "flags", ...}   // flags 子命令
+var Root = &cobra.Command{Use: "rclone", ...}  // 根命令实例
+var helpCommand = &cobra.Command{Use: "help", ...}
+var helpFlags = &cobra.Command{Use: "flags", ...}
 var helpBackends = &cobra.Command{Use: "backends", ...}
 var helpBackend = &cobra.Command{Use: "backend", ...}
-
-// cmd/help.go:58-62
-var (
-    filterFlagsGroup     string
-    filterFlagsRe        *regexp.Regexp
-    filterFlagsNamesOnly bool
-)
 ```
 
-**cmd.go 文件**中的包级变量（按声明顺序）：
+**cmd.go 中的关键包级变量**：
 ```go
-// cmd/cmd.go:45-55
 var (
-    // ↓↓↓ 注意：这些赋值表达式会立即执行 ↓↓↓
     cpuProfile    = flags.StringP("cpuprofile", "", "", "...", "Debugging")
     memProfile    = flags.StringP("memprofile", "", "", "...", "Debugging")
     statsInterval = flags.DurationP("stats", "", time.Minute*1, "...", "Logging")
     version       bool
-
     errorCommandNotFound    = errors.New("command not found")
-    errorNotEnoughArguments = errors.New("not enough arguments")
-    errorTooManyArguments   = errors.New("too many arguments")
+    // ...
 )
-
-// cmd/cmd.go:519
-var backendFlags map[string]struct{}  // 初始化为 nil
+var backendFlags map[string]struct{}  // nil
 ```
 
-> **关键点**：`cpuProfile = flags.StringP(...)` 的赋值右侧是函数调用，**在包级变量初始化阶段立即执行**。`flags.StringP()` 内部会调用 `pflag.StringP()` 注册标志到 `pflag.CommandLine`，再调用 `installFlag()` 将标志加入 `flags.All` 的分组中。由于 flags 包已先初始化完成，此时 `flags.All` 及所有分组均已就绪。
+> **关于跨文件顺序**：Go 规范不定义同一包内不同源文件的包级变量初始化顺序。help.go 中的 `Root` 和 cmd.go 中的 `cpuProfile` 谁先初始化，取决于编译器的文件处理顺序。但这对 rclone 的正确性**没有影响**，因为：
+>
+> 1. `Root` 的初始化不依赖 `cpuProfile`，`cpuProfile` 的初始化也不依赖 `Root`，两者互不引用
+> 2. `flags.StringP()` 仅依赖 `flags.All` 分组已就绪，这由步骤 1 保证
+> 3. cmd 包的所有包级变量全部初始化完毕后，cmd 包才算整体初始化完成
+> 4. 子命令包的 init() 在 cmd 包整体初始化完成后才执行，此时 `Root`、`cpuProfile` 等变量必然都已就绪
 
-#### 步骤 3：子命令包级变量初始化
+#### 步骤 3：子命令包整体初始化
 
 以 `cmd/copy` 包为例（被 `cmd/all/all.go` 导入）：
 
+**包级变量初始化**：
 ```go
-// cmd/copy/copy.go:16-20
-var (
-    createEmptySrcDirs = false
-    loggerOpt          = operations.LoggerOpt{}
-    loggerFlagsOpt     = operationsflags.AddLoggerFlagsOptions{}
-)
-
-// cmd/copy/copy.go:30
-var commandDefinition = &cobra.Command{   // ← 创建命令实例
+var createEmptySrcDirs = false
+var commandDefinition = &cobra.Command{   // 命令实例
     Use:   "copy source:path dest:path",
     Short: `Copy files from source to dest...`,
-    // ...
-    Run: func(command *cobra.Command, args []string) { ... },
+    Run:   func(command *cobra.Command, args []string) { ... },
 }
 ```
 
-#### 步骤 4：子命令包 init() 执行
-
-继续以 `cmd/copy` 包为例：
-
+**init() 函数执行**：
 ```go
-// cmd/copy/copy.go:22-28
 func init() {
-    cmd.Root.AddCommand(commandDefinition)  // ← 注册到根命令
+    cmd.Root.AddCommand(commandDefinition)  // 注册到根命令
     cmdFlags := commandDefinition.Flags()
-    // 注册命令级标志
     flags.BoolVarP(cmdFlags, &createEmptySrcDirs,
         "create-empty-src-dirs", "", createEmptySrcDirs,
         "Create empty source dirs on destination after copy", "")
@@ -183,25 +160,24 @@ func init() {
 }
 ```
 
-> **关键点**：`cmd.Root.AddCommand()` 在 `init()` 中调用，而非包级变量初始化。这样保证 `Root` 变量已经存在（cmd 包级变量先初始化），同时 commandDefinition 实例也已就绪。
+> **子命令 init() 对 cmd 包的依赖**：`cmd.Root.AddCommand()` 依赖 `Root` 变量已初始化。这由 Go 的包初始化规则保证——cmd 包的整体初始化（所有包级变量）必然先于任何导入 cmd 的子命令包的 init() 执行。子命令包的 init() **仅依赖 cmd 包的整体初始化完成**，不需要关心 cmd 包内部各文件变量初始化的先后顺序。
 
-#### 步骤 5：后端包 init() 执行
+#### 步骤 4：后端包整体初始化
 
-同理，各 backend 包在 `init()` 中将自身注册到 `fs.Registry`，供后续 `AddBackendFlags()` 使用。
+各 backend 包在 init() 中将自身注册到 `fs.Registry`，供运行期 `AddBackendFlags()` 使用。
 
 ### 2.4 注册流程时序汇总表
 
-| 步骤 | 时机 | 包/文件 | 操作类型 | 具体动作 |
-|------|------|---------|----------|----------|
-| 1 | main 前 | fs/config/flags/flags.go | 包级变量 | `var All *Groups` = nil |
-| 2 | main 前 | fs/config/flags/flags.go | init() 函数 | 创建 14 个标志分组 |
-| 3 | main 前 | cmd/help.go | 包级变量 | 创建 `Root`/`helpCommand` 等 Command 实例 |
-| 4 | main 前 | cmd/cmd.go | 包级变量 | 调用 `flags.StringP()`/`DurationP()` 注册全局标志（cpuprofile/stats 等）到 pflag + 分组 |
-| 5 | main 前 | cmd/copy/copy.go 等 | 包级变量 | 创建子命令的 `commandDefinition` 实例及变量 |
-| 6 | main 前 | cmd/copy/copy.go 等 | init() 函数 | `cmd.Root.AddCommand()` 注册子命令 + 注册命令级标志 |
-| 7 | main 前 | backend/*/ 包 | init() 函数 | 注册后端到 `fs.Registry` |
-| 8 | 运行期 | cmd/cmd.go → help.go | main 中调用 | `setupRootCommand()` 追加全局标志配置、help 子命令关联 |
-| 9 | 运行期 | cmd/cmd.go | main 中调用 | `AddBackendFlags()` 遍历 `fs.Registry` 注册所有后端标志 |
+| 步骤 | 时机 | 包 | 操作类型 | 具体动作 |
+|------|------|-----|----------|----------|
+| 1 | main 前 | fs/config/flags | 包级变量 | `var All *Groups` = nil |
+| 2 | main 前 | fs/config/flags | init() | 创建 14 个标志分组 |
+| 3 | main 前 | cmd | 包级变量 | Root 实例创建（help.go）；cpuProfile/statsInterval 等全局标志注册到 pflag + 分组（cmd.go）；跨文件顺序不定，但互不依赖 |
+| 4 | main 前 | cmd/copy 等子命令包 | 包级变量 | 创建 commandDefinition 实例及命令级变量 |
+| 5 | main 前 | cmd/copy 等子命令包 | init() | `cmd.Root.AddCommand()` 注册子命令 + 注册命令级标志 |
+| 6 | main 前 | backend/*/ | init() | 注册后端到 `fs.Registry` |
+| 7 | 运行期 | cmd | main 中调用 | `setupRootCommand()` 追加全局标志、挂载帮助子命令 |
+| 8 | 运行期 | cmd | main 中调用 | `AddBackendFlags()` 遍历 `fs.Registry` 注册所有后端标志 |
 
 ---
 
@@ -211,25 +187,25 @@ func init() {
 
 | 层级 | 职责 | 注册时机 | 注册位置 |
 |------|------|----------|----------|
-| 全局标志 | 所有命令共享（--verbose、--transfers 等） | 包级变量初始化 / setupRootCommand | cmd/cmd.go 包级变量 + configflags.AddFlags() |
+| 全局标志 | 所有命令共享（--verbose、--transfers 等） | cmd 包级变量 / setupRootCommand | cmd.go 包级变量 + configflags.AddFlags() |
 | 后端标志 | 各存储后端专属（--s3-region 等） | main 运行期 | cmd/cmd.go: AddBackendFlags() |
 | 命令级标志 | 单个命令专属（--create-empty-src-dirs 等） | 子命令包 init() | 各 cmd/*/init() 中 |
 
 ### 3.2 全局标志注册（两阶段）
 
-**第一阶段 - 包级变量初始化**（cmd/cmd.go:45-55）：
+**第一阶段 - cmd 包级变量初始化**（cmd/cmd.go:45-55）：
 ```go
 cpuProfile    = flags.StringP("cpuprofile", "", "", "Write cpu profile...", "Debugging")
 memProfile    = flags.StringP("memprofile", "", "", "Write memory profile...", "Debugging")
 statsInterval = flags.DurationP("stats", "", time.Minute*1, "Interval between...", "Logging")
 ```
-> 仅注册 3 个最核心的全局标志（Debugging/Logging 组）
+> 仅注册 3 个核心全局标志（Debugging/Logging 组）。由于这些赋值的右侧是函数调用，包级变量初始化时立即执行 flags.StringP()，进而调用 pflag 注册 + installFlag() 加入分组。
 
 **第二阶段 - main 运行期 setupRootCommand()**（cmd/help.go:133-143）：
 ```go
 func setupRootCommand(rootCmd *cobra.Command) {
     ci := fs.GetConfig(context.Background())
-    configflags.AddFlags(ci, pflag.CommandLine)  // 配置类（--config/--cache-dir 等）
+    configflags.AddFlags(ci, pflag.CommandLine)  // 配置类（--config/--verbose/--transfers 等）
     filterflags.AddFlags(pflag.CommandLine)      // 过滤类（--include/--exclude 等）
     rcflags.AddFlags(pflag.CommandLine)          // RC API 类
     logflags.AddFlags(pflag.CommandLine)         // 日志类补充
@@ -242,17 +218,17 @@ func setupRootCommand(rootCmd *cobra.Command) {
 
 ### 3.3 后端标志注册
 
-**cmd/cmd.go:522-533** 的 `AddBackendFlags()` 在 main 运行期遍历所有后端：
+**cmd/cmd.go** 的 `AddBackendFlags()` 在 main 运行期遍历所有后端：
 
 ```go
 func AddBackendFlags() {
-    backendFlags = map[string]struct{}{}  // ← 之前包级变量初始化为 nil，这里实际赋值
+    backendFlags = map[string]struct{}{}  // 包级变量初始为 nil，此处实际赋值
     for _, fsInfo := range fs.Registry {
         flags.AddFlagsFromOptions(pflag.CommandLine, fsInfo.Prefix, fsInfo.Options)
         for i := range fsInfo.Options {
             opt := &fsInfo.Options[i]
             name := opt.FlagName(fsInfo.Prefix)
-            backendFlags[name] = struct{}{}  // 记录用于帮助文档分类
+            backendFlags[name] = struct{}{}
         }
     }
 }
@@ -284,7 +260,7 @@ func installFlag(flags *pflag.FlagSet, name string, groupsString string) {
 ```
 
 **执行时机**：每当调用 `flags.StringP()`、`flags.BoolVarP()` 等包装函数时立即调用。例如：
-- `cpuProfile = flags.StringP(...)` → 包级变量初始化阶段调用
+- `cpuProfile = flags.StringP(...)` → cmd 包级变量初始化阶段调用
 - `flags.BoolVarP(cmdFlags, &createEmptySrcDirs, ...)` → 子命令包 init() 阶段调用
 
 ### 3.5 参数解析流程
@@ -300,7 +276,7 @@ Root.Execute() [cobra 框架]
 │  └─ --transfers 8 → transfers=8
 └─ 触发 cobra.OnInitialize 钩子 → initConfig()
 
-initConfig() [cmd/cmd.go:383-482]:
+initConfig() [cmd/cmd.go]:
   ├─ fs.GlobalOptionsInit()    # 从已解析标志值写入全局 ConfigInfo
   ├─ fslog.InitLogging()       # 初始化日志系统
   ├─ configflags.SetFlags()    # 处理 -v/-q/--dump-headers 等特殊标志
@@ -320,7 +296,7 @@ initConfig() [cmd/cmd.go:383-482]:
 
 ```go
 func Main() {
-    setupRootCommand(Root)    // 阶段二：补充全局标志、挂载帮助子命令
+    setupRootCommand(Root)    // 补充全局标志、挂载帮助子命令
     AddBackendFlags()          // 注册所有后端专属标志
     if err := Root.Execute(); err != nil {  // 进入 cobra 框架
         if strings.HasPrefix(err.Error(), "unknown command") && selfupdateEnabled {
@@ -353,10 +329,10 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
         cmdErr = fs.CountError(ctx, cmdErr)
 
         if !Retry || !accounting.GlobalStats().Errored() {
-            break  // 无错误或禁用重试则跳出
+            break
         }
         if accounting.GlobalStats().HadFatalError() {
-            break  // 致命错误不重试
+            break
         }
         // Retry-After 退避等待
         if retryAfter := accounting.GlobalStats().RetryAfter(); !retryAfter.IsZero() {
@@ -388,7 +364,7 @@ var commandDefinition = &cobra.Command{
     Short: `Copy files from source to dest, skipping identical files.`,
     Long:  `...`,
     Annotations: map[string]string{
-        "groups": "Copy,Filter,Listing,Important",  // 帮助文档分组
+        "groups": "Copy,Filter,Listing,Important",
     },
     Run: func(command *cobra.Command, args []string) {
         // 1. 参数数量校验
@@ -401,7 +377,6 @@ var commandDefinition = &cobra.Command{
         cmd.Run(true, true, command, func() error {
             ctx := context.Background()
 
-            // 配置日志记录器（--log-file 等）
             close, err := operationsflags.ConfigureLoggers(
                 ctx, fdst, command, &loggerOpt, loggerFlagsOpt)
             if err != nil {
@@ -413,7 +388,6 @@ var commandDefinition = &cobra.Command{
                 ctx = operations.WithSyncLogger(ctx, loggerOpt)
             }
 
-            // 根据源是目录还是文件分发到不同实现
             if srcFileName == "" {
                 return sync.CopyDir(ctx, fdst, fsrc, createEmptySrcDirs)
             }
@@ -470,7 +444,7 @@ func resolveExitCode(err error) {
 
 ---
 
-## 五、完整调用链示例（按实际执行顺序）
+## 五、完整调用链示例
 
 以 `rclone copy src: dst: --verbose --transfers 16` 为例：
 
@@ -479,39 +453,24 @@ func resolveExitCode(err error) {
 【阶段 A：程序启动初始化 - main() 执行前】
 =================================================================
 
-  A1. 依赖包初始化
-      ├─ fs/config/flags 包
-      │   ├─ 包级变量: var All *Groups = nil
-      │   └─ init(): All = NewGroups() + 创建 14 个标志分组
-      └─ 其他依赖包按深度优先初始化
+  A1. fs/config/flags 包整体初始化
+      ├─ 包级变量: var All *Groups = nil
+      └─ init(): All = NewGroups() + 创建 14 个标志分组
 
-  A2. cmd 包级变量初始化（依赖包都初始化完成后）
-      ├─ cmd/help.go 源文件
-      │   ├─ var Root = &cobra.Command{Use:"rclone", ...}
-      │   ├─ var GeneratingDocs = false
-      │   ├─ var helpCommand = &cobra.Command{Use:"help", ...}
-      │   ├─ var helpFlags = &cobra.Command{Use:"flags", ...}
-      │   ├─ var helpBackends / helpBackend 实例创建
-      │   └─ var filterFlagsGroup/Re/NamesOnly 变量声明
-      └─ cmd/cmd.go 源文件
-          ├─ cpuProfile = flags.StringP("cpuprofile", ...)
-          │   → 立即: pflag 注册 + installFlag() 加入 Debugging 组
-          ├─ memProfile = flags.StringP("memprofile", ...)
-          │   → 立即: pflag 注册 + installFlag() 加入 Debugging 组
-          ├─ statsInterval = flags.DurationP("stats", ...)
-          │   → 立即: pflag 注册 + installFlag() 加入 Logging 组
-          ├─ version / error* 变量初始化
-          └─ backendFlags = nil (map 声明)
+  A2. cmd 包整体初始化（无 init()，仅包级变量）
+      ├─ help.go: Root = &cobra.Command{...}、helpCommand/helpFlags 等
+      ├─ cmd.go: cpuProfile = flags.StringP(...)、statsInterval = flags.DurationP(...) 等
+      └─ 注：help.go 与 cmd.go 的包级变量初始化顺序不由 Go 规范定义，
+           但互不依赖（Root 不引用 cpuProfile，反之亦然），不影响正确性
 
-  A3. 子命令包初始化（cmd/all 导入触发）
-      ├─ cmd/copy 等包级变量初始化:
-      │   ├─ createEmptySrcDirs = false
-      │   └─ commandDefinition = &cobra.Command{Use:"copy", ...}
-      └─ cmd/copy 包 init() 执行:
-          ├─ cmd.Root.AddCommand(commandDefinition)  ← 注册到根命令
-          └─ flags.BoolVarP(...) 注册 --create-empty-src-dirs
+  A3. 子命令包整体初始化（由 cmd/all/all.go 导入触发）
+      以 cmd/copy 为例：
+      ├─ 包级变量: commandDefinition = &cobra.Command{...} 等
+      └─ init(): cmd.Root.AddCommand(commandDefinition) + 注册命令级标志
+      注：init() 中引用 cmd.Root，由 Go 的依赖优先规则保证
+          cmd 包整体初始化（所有包级变量）已完成
 
-  A4. 后端包初始化（backend/all 导入触发）
+  A4. backend 包整体初始化（由 backend/all 导入触发）
       └─ 各后端包 init(): fs.Register(...) 注册到 fs.Registry
 
 =================================================================
@@ -528,12 +487,12 @@ func resolveExitCode(err error) {
       │   ├─ rcflags.AddFlags()     → 注册 RC API 相关标志
       │   ├─ logflags.AddFlags()    → 注册日志相关标志
       │   ├─ Root.Run = runRoot     → 设置根命令执行函数
-      │   ├─ 注册 help/flags/backends 子命令到 Root
-      │   ├─ cobra.OnInitialize(initConfig)  ← 注册解析后钩子
+      │   ├─ 挂载 help/flags/backends 子命令到 Root
+      │   ├─ cobra.OnInitialize(initConfig)
       │   └─ 设置 cobra 使用模板、补全函数等
       ├─ AddBackendFlags()
       │   └─ 遍历 fs.Registry，将所有后端选项注册为 pflag 标志
-      └─ Root.Execute()  ← 进入 cobra 框架
+      └─ Root.Execute()
 
   B3. cobra 框架执行 Root.Execute()
       ├─ 解析 os.Args 命令行
@@ -553,7 +512,7 @@ func resolveExitCode(err error) {
       └─ profiling 相关设置
 
   B5. cmd/copy/copy.go: copy 命令 Run 函数
-      ├─ cmd.CheckArgs(2, 2, ...) → 校验 "src:" "dst:" 两个参数
+      ├─ cmd.CheckArgs(2, 2, ...)
       ├─ cmd.NewFsSrcFileDst(args)
       │   ├─ cache.Get(ctx, "src:") → 创建源 Fs 实例
       │   └─ cache.Get(ctx, "dst:") → 创建目标 Fs 实例
@@ -563,14 +522,10 @@ func resolveExitCode(err error) {
       ├─ startProgress() / StartStats() → 启动进度/统计输出
       ├─ SigInfoHandler() 注册信号处理
       ├─ 重试循环 (try=1)
-      │   └─ 调用业务匿名函数
-      │       ├─ 配置 Logger (--log-file 等)
-      │       └─ sync.CopyDir(ctx, fdst, fsrc, createEmptySrcDirs)
-      │           └─ 实际的目录复制逻辑 (fs/sync/sync.go)
+      │   └─ sync.CopyDir(ctx, fdst, fsrc, createEmptySrcDirs)
       ├─ 停止统计输出
       ├─ cache.Clear() → 清理缓存、关闭后端连接
-      └─ resolveExitCode(nil)
-          └─ os.Exit(exitcode.Success) → 程序以 0 退出
+      └─ resolveExitCode(nil) → os.Exit(0)
 ```
 
 ---
@@ -582,11 +537,12 @@ func resolveExitCode(err error) {
 - 新增命令只需在 `cmd/all/all.go` 添加一行空白导入，无需修改注册中心代码
 - 命令与命令之间、命令与框架之间完全解耦
 
-### 6.2 初始化时序精确控制
-- **标志分组**（flags 包 init()）先于 **全局标志注册**（cmd 包级变量），保证分组可用
-- **Root 实例创建**（cmd/help.go 包级变量）先于 **子命令注册**（子命令包 init()），保证父节点存在
-- **子命令实例创建**（子命令包包级变量）先于 **其 init() 注册**，保证引用对象就绪
-- **后端注册**（backend 包 init()）先于 `AddBackendFlags()`（main 运行期）
+### 6.2 初始化时序的关键保证
+- **跨包保证**：`fs/config/flags` 包的整体初始化先于 `cmd` 包，保证 flags.All 分组在 `flags.StringP()` 调用前就绪
+- **包级变量先于 init()**：cmd 包的所有包级变量（Root、cpuProfile 等）在子命令包的 init() 执行前已全部就绪
+- **cmd 包无 init()**：cmd 包自身没有 init() 函数，子命令包的 init() 仅依赖 cmd 包的**整体初始化完成**（即所有包级变量已就绪），无需关心 cmd 包内部各文件变量的初始化先后
+- **互不依赖设计**：cmd 包内跨文件的包级变量（help.go 的 Root 与 cmd.go 的 cpuProfile）互不引用，无论编译器以何种顺序处理源文件，都不影响正确性
+- **后端注册先于使用**：backend 包 init() 中注册到 `fs.Registry`，运行期 `AddBackendFlags()` 才遍历它
 
 ### 6.3 统一横切关注点
 `cmd.Run()` 包装器集中处理：
@@ -614,8 +570,8 @@ func resolveExitCode(err error) {
 | 文件路径 | 职责 |
 |----------|------|
 | rclone.go | 程序入口，通过空白导入触发所有包的初始化链 |
-| cmd/cmd.go | 核心命令框架：Main()/Run()/CheckArgs()/initConfig()/resolveExitCode() |
-| cmd/help.go | 根命令 Root 定义、setupRootCommand()、帮助子命令及模板 |
+| cmd/cmd.go | 核心命令框架：Main()/Run()/CheckArgs()/initConfig()/resolveExitCode()、全局标志包级变量 |
+| cmd/help.go | 根命令 Root 包级变量定义、setupRootCommand()、帮助子命令及模板 |
 | cmd/all/all.go | 所有命令包的批量导入入口（触发子命令 init()） |
 | fs/config/flags/flags.go | 增强型 flag 系统：installFlag()、14 个标志分组定义 |
 | fs/config/configflags/configflags.go | 全局配置类标志的注册与应用 |

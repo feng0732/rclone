@@ -44,11 +44,11 @@ Rclone 的重试机制采用**洋葱式多层嵌套**设计，从最外层命令
 
 | 接口 | 含义 | 重试行为 | 代码位置 |
 |------|------|----------|---------|
-| `Retrier` (`.Retry() bool`) | 标记为「需要重试」 | 触发高层级重试 | [error.go:26-29](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/fserrors/error.go#L26-L29) |
-| `Fataler` (`.Fatal() bool`) | 标记为「致命错误」 | **立即终止**所有层级重试 | [error.go:96-99](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/fserrors/error.go#L96-L99) |
-| `NoRetrier` (`.NoRetry() bool`) | 标记为「不重试」 | **禁止**命令级 (L1) 重试 | [error.go:149-152](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/fserrors/error.go#L149-L152) |
-| `NoLowLevelRetrier` (`.NoLowLevelRetry() bool`) | 标记为「不做低级重试」 | **禁止** L3~L5 的低级别重试 | [error.go:196-199](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/fserrors/error.go#L196-L199) |
-| `RetryAfter` (`.RetryAfter() time.Time`) | 携带「服务器建议延迟」 | 按指定时间 sleep 后重试 | [error.go:245-248](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/fserrors/error.go#L245-L248) |
+| `Retrier` (`.Retry() bool`) | 标记为「需要重试」 | 触发高层级重试 | `fs/fserrors/error.go` L26-L29 |
+| `Fataler` (`.Fatal() bool`) | 标记为「致命错误」 | **立即终止**所有层级重试 | `fs/fserrors/error.go` L96-L99 |
+| `NoRetrier` (`.NoRetry() bool`) | 标记为「不重试」 | **禁止**命令级 (L1) 重试 | `fs/fserrors/error.go` L149-L152 |
+| `NoLowLevelRetrier` (`.NoLowLevelRetry() bool`) | 标记为「不做低级重试」 | **禁止** L3~L5 的低级别重试 | `fs/fserrors/error.go` L196-L199 |
+| `RetryAfter` (`.RetryAfter() time.Time`) | 携带「服务器建议延迟」 | 按指定时间 sleep 后重试 | `fs/fserrors/error.go` L245-L248 |
 
 ### 2.2 包装器模式：Decorator 风格的错误标记
 
@@ -75,7 +75,7 @@ func NoRetryError(err error) error {
 
 ### 2.3 智能判定函数：`ShouldRetry()`
 
-这是重试机制中最「聪明」的函数，位于 [error.go:404-434](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/fserrors/error.go#L404-L434)。它通过**四步递进式判定**识别「可重试的网络瞬态错误」：
+这是重试机制中最「聪明」的函数，位于 `fs/fserrors/error.go` L404-L434。它通过**四步递进式判定**识别「可重试的网络瞬态错误」：
 
 ```
 ShouldRetry(err) 判定流程：
@@ -102,7 +102,7 @@ ShouldRetry(err) 判定流程：
 
 ### 2.4 错误优先级汇总
 
-在 `fs/sync/sync.go` 的 `currentError()` 方法（[sync.go:356-366](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/sync/sync.go#L356-L366)）中，明确了错误优先级：
+在 `fs/sync/sync.go` 的 `currentError()` 方法（`fs/sync/sync.go` L356-L366）中，明确了错误优先级：
 
 ```
 FatalError  >  普通错误(err)  >  NoRetryError
@@ -118,7 +118,7 @@ FatalError  >  普通错误(err)  >  NoRetryError
 
 ### 3.1 Calculator 接口与 State 状态
 
-核心接口定义在 [pacer.go:22-27](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/lib/pacer/pacer.go#L22-L27)：
+核心接口定义在 `lib/pacer/pacer.go` L22-L27：
 
 ```go
 type State struct {
@@ -134,7 +134,7 @@ type Calculator interface {
 
 ### 3.2 Default：截断指数攻击-衰减模型
 
-这是默认算法，位于 [pacers.go:30-102](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/lib/pacer/pacers.go#L30-L102)。
+这是默认算法，位于 `lib/pacer/pacers.go` L30-L102。
 
 **核心参数**：
 | 参数 | 默认值 | 含义 |
@@ -148,7 +148,7 @@ type Calculator interface {
 
 ```go
 func (c *Default) Calculate(state State) time.Duration {
-    // 分支1: 如果错误携带 RetryAfter 指示 → 直接用服务器指定的时间
+    // 分支1: 如果错误携带 pacer.RetryAfter 指示 → 直接用服务器指定的时间
     if t, ok := IsRetryAfter(state.LastError); ok {
         return max(t, c.minSleep)
     }
@@ -179,7 +179,7 @@ Sleep:    10ms → 10ms → 10ms → 20ms → 40ms → 80ms → 60ms → 45ms �
 
 ### 3.3 GoogleDrive：带抖动的指数退避 + 令牌桶
 
-专门适配 Google Drive API，符合 Google 官方推荐的退避策略，位于 [pacers.go:149-210](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/lib/pacer/pacers.go#L149-L210)。
+专门适配 Google Drive API，符合 Google 官方推荐的退避策略，位于 `lib/pacer/pacers.go` L149-L210。
 
 **双模式设计**：
 ```
@@ -197,7 +197,7 @@ Sleep:    10ms → 10ms → 10ms → 20ms → 40ms → 80ms → 60ms → 45ms �
 
 ### 3.4 S3：零延迟成功 + 失败退避
 
-适配 S3 的高稳定性特性，位于 [pacers.go:220-294](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/lib/pacer/pacers.go#L220-L294)。
+适配 S3 的高稳定性特性，位于 `lib/pacer/pacers.go` L220-L294。
 
 **与 Default 的关键区别**：
 ```
@@ -221,7 +221,7 @@ type Pacer struct {
     pacer      chan struct{} // 速率控制令牌（容量 1）
     connTokens chan struct{} // 并发连接数令牌（容量 = maxConnections）
     state      State         // 退避状态机
-    retries    int           // 最大重试次数（默认 3）
+    retries    int           // 最大重试次数（lib/pacer 默认 3，见下文说明）
     calculator Calculator    // 退避算法
 }
 ```
@@ -251,7 +251,7 @@ endCall():
 
 ### 4.2 重试主循环：`call()` 方法
 
-核心循环位于 [pacer.go:220-235](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/lib/pacer/pacer.go#L220-L235)：
+核心循环位于 `lib/pacer/pacer.go` L220-L235：
 
 ```go
 func (p *Pacer) call(fn Paced, retries int) (err error) {
@@ -278,9 +278,19 @@ if p.maxConnections > 0 && !caller.Present("(*Pacer).call") {
 
 通过 `caller.Present()` 检查调用栈中是否已存在 `Pacer.call`——如果 Pacer 被重入调用（嵌套调用），内层不再限制连接数，否则会导致**自死锁**（外层持有 connTokens，内层等待同一个）。
 
-### 4.3 `fs.Pacer`：带日志的装饰器
+### 4.3 重试次数的三层配置体系
 
-[fs/pacer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/pacer.go) 中对底层 `lib/pacer.Pacer` 做了两层装饰：
+Pacer 的 `retries` 并不是单一值，而是分三层配置：
+
+| 配置层 | 位置 | 默认值 | 说明 |
+|--------|------|--------|------|
+| 底层默认 | `lib/pacer/pacer.go` L80-L83 | 3 | `pacer.New()` 的默认 retries=3 |
+| fs 层覆盖 | `fs/pacer.go` L23-L33 | **10** | `fs.NewPacer()` 取 `max(ci.LowLevelRetries, 1)`，而 `ci.LowLevelRetries` 默认值为 **10**（`fs/config.go` L175-L178） |
+| 后端覆盖 | 各后端 `NewFs()` 中 | 各异 | 例如 S3 显式调用 `pc.SetRetries(2)`（见下文） |
+
+### 4.4 `fs.Pacer`：带日志的装饰器
+
+`fs/pacer.go` 中对底层 `lib/pacer.Pacer` 做了两层装饰：
 
 **① `logCalculator`：退避日志装饰器**
 
@@ -318,7 +328,7 @@ func pacerInvoker(try, retries int, f pacer.Paced) (retry bool, err error) {
 
 ---
 
-## 五、L4 流读取重试：`operations/reopen.go`
+## 五、L4 流读取重试：`fs/operations/reopen.go`
 
 网络传输中最脆弱的环节是**大文件流式读取**——读到一半连接断开是家常便饭。`ReOpen` 结构体专门解决此问题。
 
@@ -329,13 +339,13 @@ type ReOpen struct {
     offset      int64           // 当前已读取到的偏移量（相对 start）
     rangeOption fs.RangeOption  // HTTP Range 请求选项
     tries       int             // 已尝试次数
-    maxTries    int             // 最大重试次数（= LowLevelRetries）
+    maxTries    int             // 最大重试次数（= LowLevelRetries，默认 10）
 }
 ```
 
 ### 5.2 Read() 中的重试逻辑
 
-[reopen.go:186-234](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/operations/reopen.go#L186-L234)：
+`fs/operations/reopen.go` L186-L234：
 
 ```go
 func (h *ReOpen) Read(p []byte) (n int, err error) {
@@ -379,11 +389,11 @@ func (h *ReOpen) reopen() error {
 
 ---
 
-## 六、L3 操作级重试：`operations/operations.go`
+## 六、L3 操作级重试：`fs/operations/operations.go`
 
 ### 6.1 通用 `Retry()` 函数
 
-[operations.go:739-762](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/operations/operations.go#L739-L762)：
+`fs/operations/operations.go` L739-L762：
 
 ```go
 func Retry(ctx context.Context, o any, maxTries int, fn func() error) (err error) {
@@ -398,7 +408,7 @@ func Retry(ctx context.Context, o any, maxTries int, fn func() error) (err error
             Debugf(o, "Received error: %v - low level retry %d/%d", err, tries, maxTries)
             continue  // 立即重试（无退避！退避留给 Pacer 做）
         }
-        // 判定 2: pacer.RetryAfter → 按服务器指示 sleep
+        // 判定 2: pacer.IsRetryAfter → 按服务器指示 sleep
         else if t, ok := pacer.IsRetryAfter(err); ok {
             Debugf(o, "Sleeping for %v (as indicated by the server)", t)
             time.Sleep(t)
@@ -414,7 +424,7 @@ func Retry(ctx context.Context, o any, maxTries int, fn func() error) (err error
 
 ### 6.2 Copy 专用重试：`copy.copy()`
 
-[copy.go:307-352](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/fs/operations/copy.go#L307-L352) 是更复杂的版本，核心差异：
+`fs/operations/copy.go` L307-L352 是更复杂的版本，核心差异：
 
 ```go
 func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
@@ -443,7 +453,7 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 
 ## 七、L1 命令级重试：`cmd/cmd.go`
 
-最外层的全局重试入口是 `Run()` 函数，位于 [cmd.go:240-293](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/cmd/cmd.go#L240-L293)。
+最外层的全局重试入口是 `Run()` 函数，位于 `cmd/cmd.go` L240-L293。
 
 ### 7.1 重试决策流程
 
@@ -483,74 +493,206 @@ L1 重试不直接检查错误本身，而是通过 `accounting.GlobalStats()` �
 
 ## 八、后端实战：S3 的完整串联示例
 
-以 S3 后端的 `listBuckets` 为例（[s3.go:2626-2634](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/backend/s3/s3.go#L2626-L2634)），看完整的调用链：
+以 S3 后端的 `listBuckets` 为例，对照代码讲清每一个环节。
+
+### 8.1 S3 Pacer 初始化：显式覆盖重试次数
+
+在 `backend/s3/s3.go` L1845-L1850：
 
 ```go
-func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error) {
-    req := s3.ListBucketsInput{}
-    var resp *s3.ListBucketsV2Output
+ci := fs.GetConfig(ctx)
+pc := fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep)))
+// Set pacer retries to 2 (1 try and 1 retry) because we are
+// relying on SDK retry mechanism, but we allow 2 attempts to
+// retry directory listings after XMLSyntaxError
+pc.SetRetries(2)
+```
 
-    // 步骤③: 通过 fs.Pacer 发起调用（L5 Pacer 在此生效）
-    err = f.pacer.Call(func() (bool, error) {
-        resp, err = f.c.ListBuckets(ctx, &req)       // 步骤④: 实际 SDK 调用
-        return f.shouldRetry(ctx, err)                // 步骤⑤: 后端自定义判定
-    })
-    // ...
+**关键点**：
+- 虽然 `fs.NewPacer()` 默认从 `ci.LowLevelRetries` 取值（默认 10），但 S3 **显式覆盖为 2**
+- 原因：AWS SDK 自身已经内置了重试逻辑，rclone 外层只需额外兜底 1 次重试（应对目录列表 XML 语法错误等 SDK 未覆盖的场景）
+- 实际是「1 次初调 + 1 次重试」= 总共 2 次
+
+### 8.2 S3 可重试 HTTP 状态码
+
+在 `backend/s3/s3.go` L1265-L1271：
+
+```go
+// retryErrorCodes is a slice of error codes that we will retry
+// See: https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
+var retryErrorCodes = []int{
+    429, // Too Many Requests
+    500, // Internal Server Error - "We encountered an internal error. Please try again."
+    503, // Service Unavailable/Slow Down - "Reduce your request rate"
 }
 ```
 
-`shouldRetry()` 的判定链（[s3.go:1280-1311](file:///d:/fz/0601-2/solo-dogfeeding/code/101-rclone/backend/s3/s3.go#L1280-L1311)）：
+**可重试状态码为 `[429, 500, 503]`**：
+- **429 Too Many Requests**：请求频率超限
+- **500 Internal Server Error**：服务端内部错误（AWS 官方明确建议重试）
+- **503 Service Unavailable**：服务不可用或 Slow Down 降速提示
+
+> 注意：没有 502。S3 的错误处理中不包含 502 Bad Gateway。
+
+### 8.3 S3 `listBuckets` 返回类型与调用链
+
+代码位于 `backend/s3/s3.go` L2626-L2643：
+
+```go
+// listBuckets lists the buckets to out
+// 返回值: (entries fs.DirEntries, err error)
+func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error) {
+    req := s3.ListBucketsInput{}
+    // ↓ 返回类型是 *s3.ListBucketsOutput（不是 V2 版本）
+    var resp *s3.ListBucketsOutput
+
+    err = f.pacer.Call(func() (bool, error) {
+        resp, err = f.c.ListBuckets(ctx, &req)       // 实际 AWS SDK 调用
+        return f.shouldRetry(ctx, err)                // 后端自定义重试判定
+    })
+    if err != nil {
+        return nil, err
+    }
+    // 将 SDK 返回的 Buckets 转换为 rclone 的 fs.DirEntries
+    for _, bucket := range resp.Buckets {
+        bucketName := f.opt.Enc.ToStandardName(deref(bucket.Name))
+        f.cache.MarkOK(bucketName)
+        d := fs.NewDir(bucketName, deref(bucket.CreationDate))
+        entries = append(entries, d)
+    }
+    return entries, nil
+}
+```
+
+**返回类型对照**：
+| 变量 | 类型 | 说明 |
+|------|------|------|
+| `req` | `s3.ListBucketsInput` | AWS SDK 请求输入（结构体，不含分页参数） |
+| `resp` | `*s3.ListBucketsOutput` | AWS SDK 响应输出（指针，含 `Buckets []types.Bucket`） |
+| `entries` | `fs.DirEntries` | rclone 抽象层的目录条目列表（最终返回给上层） |
+
+> 注意：S3 ListBuckets API **没有 V2 版本**，返回类型是 `s3.ListBucketsOutput`。只有对象列表有 V1/V2 之分（`ListObjectsV2Output`）。
+
+### 8.4 S3 `shouldRetry()` 的真实判定路径
+
+代码位于 `backend/s3/s3.go` L1276-L1312：
+
+```go
+// 返回值: (shouldRetry bool, err error)
+// 注意: S3 后端不会将错误包装为 pacer.RetryAfterError —— 没有服务器退避专用路径
+func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
+    if fserrors.ContextError(ctx, &err) {
+        return false, err  // context 取消/超时 → 不重试
+    }
+
+    var awsError smithy.APIError
+    if errors.As(err, &awsError) {
+        // ① 通用瞬态网络错误判定（Timeout/Temporary/EOF 等）
+        if fserrors.ShouldRetry(awsError) {
+            return true, err
+        }
+        // ② S3 专属错误码: RequestTimeout
+        if awsError.ErrorCode() == "RequestTimeout" {
+            return true, err
+        }
+    }
+
+    // ③ 301 MovedPermanently → 跨区域桶 → 自动更新 region 后重试
+    if httpStatusCode := getHTTPStatusCode(err); httpStatusCode > 0 {
+        if f.rootBucket != "" {
+            if httpStatusCode == http.StatusMovedPermanently {
+                urfbErr := f.updateRegionForBucket(ctx, f.rootBucket)
+                if urfbErr != nil {
+                    fs.Errorf(f, "Failed to update region for bucket: %v", urfbErr)
+                    return false, err
+                }
+                return true, err  // region 已更新 → 重试
+            }
+        }
+        // ④ HTTP 状态码白名单: [429, 500, 503]
+        if slices.Contains(retryErrorCodes, httpStatusCode) {
+            return true, err
+        }
+    }
+
+    // ⑤ 兜底: 通用网络错误判定（ShouldRetry）
+    return fserrors.ShouldRetry(err), err
+}
+```
+
+**判定流程图解**：
 
 ```
-f.shouldRetry(ctx, err)
+f.shouldRetry(ctx, err)  →  返回 (bool, error)
   │
-  ├─ 是 smithy.APIError (AWS SDK 错误)？
-  │   ├─ ① fserrors.ShouldRetry(awsError) → 通用瞬态网络错误？
-  │   ├─ ② ErrorCode == "RequestTimeout" → S3 专属超时码？
-  │   ├─ ③ ErrorCode == "SlowDown" / "InternalError" → 包装为 RetryAfterError（带退避）
-  │   └─ ④ HTTP 状态码在 retryErrorCodes [500, 502, 503] → 重试
+  ├─ context 已取消/超时？ → 是 → 返回 (false, err)
   │
-  └─ 非 AWS 错误 → fserrors.ShouldRetry(err) → 通用判定
+  ├─ 是 smithy.APIError (AWS SDK 错误类型)？
+  │   ├─ ① fserrors.ShouldRetry(awsError) = true？ → 返回 (true, err)
+  │   └─ ② ErrorCode == "RequestTimeout"？        → 返回 (true, err)
+  │
+  ├─ 能提取到 HTTP 状态码？
+  │   ├─ ③ 状态码 301 + rootBucket 非空？
+  │   │   └─ 自动 updateRegionForBucket() 成功 → 返回 (true, err)
+  │   └─ ④ 状态码 ∈ [429, 500, 503]？ → 返回 (true, err)
+  │
+  └─ ⑤ 兜底 fserrors.ShouldRetry(err) → 返回 (判定结果, err)
 ```
 
-**完整执行路径**（一次 ListBuckets 的生命周期）：
+> **重要澄清**：S3 的 `shouldRetry()` **不会将错误包装为 `pacer.RetryAfterError`**，即没有「服务器建议延迟」的特殊处理路径。S3 的退避完全由 `pacer.NewS3()` 算法根据连续重试次数自动指数增长，不依赖服务器返回的 Retry-After 头。搜索整个 S3 后端代码，不存在任何 `RetryAfterError`、`SlowDown`、`InternalError` 的特殊分支——这与 Google Drive 不同。
+
+### 8.5 完整执行路径（一次 ListBuckets 的生命周期）
 
 ```
 用户执行: rclone lsd s3:
   ↓
 cmd.Run() [L1, ci.Retries=3]
   ↓
-sync / list 操作
+list 操作
   ↓
-operations.ListFn()
+s3.(*Fs).List() → list.WithListP()
   ↓
-s3.listBuckets()
-  ↓
-fs.Pacer.Call() [L5, retries=2]
+s3.(*Fs).listBuckets()
   │
-  ├─ pacer.beginCall(): 取 pacer + connTokens 令牌
-  ├─ pacerInvoker(): 进入
-  │   ↓
-  │   s3.shouldRetry(): 判定 (返回 retry=true, err)
-  │   ↓
-  │   pacerInvoker(): Debugf 日志 + 包装为 fserrors.RetryError(err)
-  │   ↓
-  ├─ pacer.endCall(retry=true):
-  │   ├─ ConsecutiveRetries++
-  │   ├─ S3.Calculator.Calculate(): 计算新 SleepTime（翻倍增长）
-  │   └─ 归还 connTokens
+  │  返回类型: entries fs.DirEntries, err error
   │
-  └─ 循环 2 次后退出 → 返回 RetryError
+  └─ f.pacer.Call() [L5, retries=2 ← S3 显式设置]
+      │
+      ├─ pacer.beginCall(): 取 pacer 令牌（connTokens 通常为 nil，S3 不限并发）
+      ├─ pacerInvoker() 进入:
+      │   ↓
+      │   f.c.ListBuckets(ctx, &s3.ListBucketsInput{})
+      │     → AWS SDK 内部已含自身重试机制
+      │     → 返回 (*s3.ListBucketsOutput, error)
+      │   ↓
+      │   f.shouldRetry(ctx, err)
+      │     → 判定链: Context → smithy.APIError → HTTP 429/500/503 → ShouldRetry
+      │     → 返回 (retry=true/false, err)
+      │   ↓
+      │   若 retry=true:
+      │     Debugf("low level retry %d/2 (error %v)")
+      │     err = fserrors.RetryError(err)  ← 包装语义标记，供上层判定
+      │   ↓
+      ├─ pacer.endCall(retry, err):
+      │   ├─ retry=true: ConsecutiveRetries++
+      │   ├─ retry=false: ConsecutiveRetries = 0
+      │   ├─ S3.Calculator.Calculate(state):
+      │   │   ├─ retry=true → sleepTime 指数上升（×2，截断在 maxSleep）
+      │   │   └─ retry=false → sleepTime 衰减（可降到 0）
+      │   └─ 更新 state.SleepTime
+      │
+      └─ 循环最多 2 次 → 返回最终 err（可能是包装后的 RetryError）
   ↓
-operations.Retry() [L3, maxTries=10]:
-  ├─ 检测到 IsRetryError(err)=true → continue
-  └─ 重新调用 s3.listBuckets() → 回到 Pacer（此时 Pacer SleepTime 已升高）
+（如果 Pacer 仍失败且被包装为 RetryError）
   ↓
-... (重复直到成功或所有层耗尽)
+L3 或 L2 层检测到 IsRetryError(err)=true → 继续更高级别重试
   ↓
-cmd.Run() 最终:
+... 重复直到成功或所有层耗尽 ...
+  ↓
+cmd.Run() 最终判定:
   ├─ 成功 → break
-  ├─ FatalError → "Fatal error received - not attempting retries"
+  ├─ HadFatalError → "Fatal error received - not attempting retries"
+  ├─ HadRetryError=false → "Can't retry any of the errors - not attempting retries"
   └─ 所有尝试耗尽 → 退出码 RetryError
 ```
 
@@ -563,10 +705,10 @@ cmd.Run() 最终:
 
 ### 9.2 分层重试（Layered Retry）
 每层职责明确、独立计数：
-- L5 Pacer：单 API 调用 × 3 次（带智能退避）
-- L4 ReOpen：流读取 × LowLevelRetries 次（断点续传）
-- L3 Operations：单操作 × LowLevelRetries 次（兜底）
-- L1 Cmd：全命令 × `--retries` 次（面向统计）
+- L5 Pacer：单 API 调用 × N 次（带智能退避，默认 fs 层为 10 次、S3 特化为 2 次、lib/pacer 底层默认 3 次）
+- L4 ReOpen：流读取 × LowLevelRetries 次（断点续传，默认 10 次）
+- L3 Operations：单操作 × LowLevelRetries 次（兜底，默认 10 次）
+- L1 Cmd：全命令 × `--retries` 次（面向统计，默认 3 次）
 
 避免了「一个超大重试次数循环」的反模式。
 
@@ -587,10 +729,12 @@ L1 命令级重试通过 `accounting.GlobalStats()` 做决策，而非检查单�
 |------|--------|---------|------|
 | `--retries` | 3 | L1 Cmd | 命令级最大重试次数 |
 | `--retries-interval` | 0 | L1 Cmd | 每次命令重试前的固定等待时间 |
-| `--low-level-retries` | 10 | L3/L4 | 操作级和流读取级重试次数 |
+| `--low-level-retries` | 10 | L3/L4/L5 | 操作级/流读取级/Pacer fs 层默认重试次数 |
 | `--max-connections` | 0 | L5 Pacer | 最大并发连接数（0=不限） |
 | `--tpslimit` | 0 | Pacer Config | 每秒事务数上限（0=不限） |
 | `--tpslimit-burst` | 1 | Pacer Config | TPS 限制的突发容量 |
-| Pacer Calculator | per-backend | L5 Pacer | 退避算法（S3/GoogleDrive/Default） |
+| Pacer Calculator | per-backend | L5 Pacer | 退避算法（S3/GoogleDrive/Default/AzureIMDS） |
+| lib/pacer 默认 retries | 3 | L5 Pacer | `pacer.New()` 内置默认值（通常被 fs.NewPacer 覆盖为 10） |
+| S3 专属 retries | 2 | L5 Pacer | S3 后端显式覆盖（1 try + 1 retry，依赖 SDK 自身重试） |
 | `minSleep` | 10ms | Calculator | 退避下限 |
 | `maxSleep` | 2s | Calculator | 退避上限 |

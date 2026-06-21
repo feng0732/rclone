@@ -11,15 +11,15 @@
 
 ### 1.1 选项定义
 
-相关配置在 [fs/config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/config.go) 中声明：
+相关配置在 [fs/config.go](./fs/config.go) 中声明：
 
 | 标志 | 结构体字段 | 位置 | 说明 |
 |---|---|---|---|
-| `--backup-dir <DIR>` | `BackupDir string` | [config.go L616](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/config.go#L616-L616) | 备份目录远程路径 |
-| `--suffix <SUF>` | `Suffix string` | [config.go L617](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/config.go#L617-L617) | 追加到被覆盖/删除文件名的后缀 |
-| `--suffix-keep-extension` | `SuffixKeepExtension bool` | [config.go L618](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/config.go#L618-L618) | 加后缀时保留扩展名 |
+| `--backup-dir <DIR>` | `BackupDir string` | [config.go L616](./fs/config.go#L616-L616) | 备份目录远程路径 |
+| `--suffix <SUF>` | `Suffix string` | [config.go L617](./fs/config.go#L617-L617) | 追加到被覆盖/删除文件名的后缀 |
+| `--suffix-keep-extension` | `SuffixKeepExtension bool` | [config.go L618](./fs/config.go#L618-L618) | 加后缀时保留扩展名 |
 
-标志注册位于 [config.go L261-L274](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/config.go#L261-L274)，属于 `Sync` 组。
+标志注册位于 [config.go L261-L274](./fs/config.go#L261-L274)，属于 `Sync` 组。
 
 ### 1.2 三种触发模式
 
@@ -43,8 +43,8 @@
 
 | 调用场景 | 调用位置 | 传入的 `srcFileName` | 说明 |
 |---|---|---|---|
-| **批量同步**（sync/copy/move 命令） | [sync.go L271-L278](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/sync/sync.go#L271-L278) | `""`（空字符串） | `newSyncCopyMove()` 初始化时一次性构造 |
-| **单文件操作**（copyto/moveto/transform） | [operations.go L2068-L2075](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L2068-L2075) | 具体源文件名（如 `"docs/a.txt"`） | `moveOrCopyFile()` 中按文件构造 |
+| **批量同步**（sync/copy/move 命令） | [sync.go L271-L278](./fs/sync/sync.go#L271-L278) | `""`（空字符串） | `newSyncCopyMove()` 初始化时一次性构造 |
+| **单文件操作**（copyto/moveto/transform） | [operations.go L2068-L2075](./fs/operations/operations.go#L2068-L2075) | 具体源文件名（如 `"docs/a.txt"`） | `moveOrCopyFile()` 中按文件构造 |
 
 对应的调用代码：
 
@@ -64,7 +64,7 @@ if ci.BackupDir != "" || ci.Suffix != "" {
 
 ### 2.2 BackupDir() 校验全景
 
-核心函数：[operations.go L1916-L1952](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1916-L1952)
+核心函数：[operations.go L1916-L1952](./fs/operations/operations.go#L1916-L1952)
 
 完整的分支决策树如下：
 
@@ -141,7 +141,7 @@ BackupDir(ctx, fdst, fsrc, srcFileName)
 
 #### 2.3.1 SameConfig — 配置名比较
 
-[operations.go L661-L663](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L661-L663)
+[operations.go L661-L663](./fs/operations/operations.go#L661-L663)
 
 ```go
 func SameConfig(fdst, fsrc fs.Info) bool {
@@ -154,7 +154,7 @@ func SameConfig(fdst, fsrc fs.Info) bool {
 
 #### 2.3.2 SameDir — 根目录精确匹配（单文件模式用）
 
-[operations.go L729-L736](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L729-L736)
+[operations.go L729-L736](./fs/operations/operations.go#L729-L736)
 
 ```go
 func SameDir(fdst, fsrc fs.Info) bool {
@@ -176,7 +176,7 @@ func SameDir(fdst, fsrc fs.Info) bool {
 
 #### 2.3.3 OverlappingFilterCheck — 目录重叠+过滤检查（批量场景用）
 
-[operations.go L697-L725](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L697-L725)
+[operations.go L697-L725](./fs/operations/operations.go#L697-L725)
 
 批量同步（`srcFileName == ""`）下用更严格的重叠检测：
 
@@ -238,7 +238,7 @@ backupDir = fdst   // [operations.go L1942-L1944]
 
 ### 2.6 最后一关：CanServerSideMove
 
-[operations.go L526-L530](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L526-L530)
+[operations.go L526-L530](./fs/operations/operations.go#L526-L530)
 
 ```go
 func CanServerSideMove(fdst fs.Fs) bool {
@@ -255,7 +255,7 @@ func CanServerSideMove(fdst fs.Fs) bool {
 
 ## 三、核心跳转函数 MoveBackupDir 详解
 
-[operations.go L1954-L1960](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1954-L1960)
+[operations.go L1954-L1960](./fs/operations/operations.go#L1954-L1960)
 
 ```go
 func MoveBackupDir(ctx context.Context, backupDir fs.Fs, dst fs.Object) (err error) {
@@ -276,7 +276,7 @@ func MoveBackupDir(ctx context.Context, backupDir fs.Fs, dst fs.Object) (err err
 
 ### 3.2 SuffixName 的命名规则
 
-[operations.go L532-L543](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L532-L543)
+[operations.go L532-L543](./fs/operations/operations.go#L532-L543)
 
 ```
 Suffix 为空
@@ -301,7 +301,7 @@ Suffix 非空 + SuffixKeepExtension = false（默认）
 
 ## 四、Move() 函数：服务端移动与 Copy+Delete 降级边界
 
-[operations.go L433-L519](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L433-L519)
+[operations.go L433-L519](./fs/operations/operations.go#L433-L519)
 
 这是备份跳转真正落地的**核心桥梁**。调用链为：
 
@@ -418,9 +418,9 @@ move(ctx, fdst=backupDir, dst=overwritten, remote=remoteWithSuffix, src=原dst�
 
 | 条件 | 行为 | 代码位置 |
 |---|---|---|
-| `doMove` 返回 **非 `ErrorCantMove` 的任何错误**（HTTP 5xx、权限错误、网络超时等） | 立即 return err，不尝试 Copy | [L501-L505](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L501-L505) |
-| `DeleteFile(dst)` 删除旧备份失败（L468） | 立即 return err，不尝试 doMove 或 Copy | [L468-L471](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L468-L471) |
-| `Copy` 本身失败 | 保留源文件不删，返回 Copy 的错误 | [L513-L515](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L513-L515) |
+| `doMove` 返回 **非 `ErrorCantMove` 的任何错误**（HTTP 5xx、权限错误、网络超时等） | 立即 return err，不尝试 Copy | [L501-L505](./fs/operations/operations.go#L501-L505) |
+| `DeleteFile(dst)` 删除旧备份失败（L468） | 立即 return err，不尝试 doMove 或 Copy | [L468-L471](./fs/operations/operations.go#L468-L471) |
+| `Copy` 本身失败 | 保留源文件不删，返回 Copy 的错误 | [L513-L515](./fs/operations/operations.go#L513-L515) |
 
 #### 4.2.3 Copy 成功后 DeleteFile 的边界
 
@@ -433,7 +433,7 @@ move(ctx, fdst=backupDir, dst=overwritten, remote=remoteWithSuffix, src=原dst�
 
 ### 4.3 Copy 内部的后端交互
 
-由 [copy.go L390-L425](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/copy.go#L390-L425) 发起：
+由 [copy.go L390-L425](./fs/operations/copy.go#L390-L425) 发起：
 
 ```
 Copy(ctx, f, dst, remote, src)
@@ -467,7 +467,7 @@ Copy(ctx, f, dst, remote, src)
 
 ### 5.2 O1：copyDest 中的备份（服务器端复制优化路径）
 
-[operations.go L1661-L1702](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1661-L1702)
+[operations.go L1661-L1702](./fs/operations/operations.go#L1661-L1702)
 
 ```
 copyDest(ctx, fdst, dst, src, CopyDestFs, backupDir)
@@ -500,7 +500,7 @@ dst 里的旧文件要被替换，该备份的还是得备份。
 
 ### 5.3 O2：pairChecker 主路径（批量同步核心）
 
-[sync.go L371-L476](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/sync/sync.go#L371-L476)
+[sync.go L371-L476](./fs/sync/sync.go#L371-L476)
 
 主处理流程：
 
@@ -553,7 +553,7 @@ Immutable 且 dst 存在 → 报错（不能修改）
 
 ### 5.4 O3：moveOrCopyFile 单文件路径
 
-[operations.go L2014-L2121](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L2014-L2121)
+[operations.go L2014-L2121](./fs/operations/operations.go#L2014-L2121)
 
 单文件操作（rclone copyto / moveto / transform）直接在函数内构造 backupDir 并完成跳转：
 
@@ -596,9 +596,9 @@ Op(ctx, fdst, dstObj, dstFileName, srcObj)     ← Op = Copy 或 MoveTransfer
 
 | 入口 | 对应标志 | 调用时机 | 位置 |
 |---|---|---|---|
-| D1. `deleteFiles()` 函数 | `--delete-before` / `--delete-after`（默认） | 同步前或全部传完后，集中处理 dst 多出的文件 | [sync.go L627-L666](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/sync/sync.go#L627-L666) |
-| D2. `startDeleters()` + `deleteFilesCh` | `--delete-during` / `--delete-only` | 边遍历边删，march 过程中发现 dst 多出就送入管道，后台并发删 | [sync.go L602-L620](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/sync/sync.go#L602-L620) |
-| D3. `DeleteFile(ctx, src)` 直接调用 | `DoMove=true` 且不需要传输时 | pairChecker 中如果 DoMove 且 src 与 dst 相等，直接删除 src | [sync.go L467](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/sync/sync.go#L467-L470) |
+| D1. `deleteFiles()` 函数 | `--delete-before` / `--delete-after`（默认） | 同步前或全部传完后，集中处理 dst 多出的文件 | [sync.go L627-L666](./fs/sync/sync.go#L627-L666) |
+| D2. `startDeleters()` + `deleteFilesCh` | `--delete-during` / `--delete-only` | 边遍历边删，march 过程中发现 dst 多出就送入管道，后台并发删 | [sync.go L602-L620](./fs/sync/sync.go#L602-L620) |
+| D3. `DeleteFile(ctx, src)` 直接调用 | `DoMove=true` 且不需要传输时 | pairChecker 中如果 DoMove 且 src 与 dst 相等，直接删除 src | [sync.go L467](./fs/sync/sync.go#L467-L470) |
 
 > 注意 D3：它调用的是**无 backupDir 版本**的 `DeleteFile`（`operations.DeleteFile`
 > 即 `DeleteFileWithBackupDir(ctx, dst, nil)`），所以 move 命令中清理 src 不会触发备份——
@@ -606,7 +606,7 @@ Op(ctx, fdst, dstObj, dstFileName, srcObj)     ← Op = Copy 或 MoveTransfer
 
 ### 6.2 DeleteFilesWithBackupDir 并发模型
 
-[operations.go L588-L628](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L588-L628)
+[operations.go L588-L628](./fs/operations/operations.go#L588-L628)
 
 ```
 DeleteFilesWithBackupDir(ctx, toBeDeleted chan Object, backupDir Fs)
@@ -630,7 +630,7 @@ DeleteFilesWithBackupDir(ctx, toBeDeleted chan Object, backupDir Fs)
 
 ### 6.3 DeleteFileWithBackupDir 精确决策
 
-[operations.go L545-L578](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L545-L578)
+[operations.go L545-L578](./fs/operations/operations.go#L545-L578)
 
 ```
 DeleteFileWithBackupDir(ctx, dst, backupDir)
@@ -778,13 +778,13 @@ deleteFiles()                                   march() 匹配中写入 deleteFi
 
 | 约束项 | 生效模式 | 代码位置 |
 |---|---|---|
-| backup-dir 必须与 dst 同 remote（`SameConfig`） | 模式 A、C | [L1924-L1926](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1924-L1926) |
-| 批量同步：backup-dir 与 src/dst 不能重叠，考虑 filter 规则 | 模式 A、C + `srcFileName==""` | [L1927-L1933](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1927-L1933) |
-| 单文件 + 仅 backup-dir：backup-dir 与 src/dst 非同目录 | 模式 A + `srcFileName!=""` | [L1934-L1940](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1934-L1940) |
-| 单文件 + 两者皆设：**豁免目录检查** | 模式 C + `srcFileName!=""` | [L1934 条件不满足，跳过整个分支](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1934-L1941) |
-| 仅 suffix：**豁免所有目录检查**，直接复用 fdst | 模式 B | [L1942-L1944](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1942-L1944) |
-| 后端必须支持 Move 或 Copy | 所有模式 | [L1948-L1950](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/operations/operations.go#L1948-L1950) |
-| 不能与 `--no-check-dest` 同用 | 批量同步 | [sync.go L236-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/102-rclone/fs/sync/sync.go#L236-L238) |
+| backup-dir 必须与 dst 同 remote（`SameConfig`） | 模式 A、C | [L1924-L1926](./fs/operations/operations.go#L1924-L1926) |
+| 批量同步：backup-dir 与 src/dst 不能重叠，考虑 filter 规则 | 模式 A、C + `srcFileName==""` | [L1927-L1933](./fs/operations/operations.go#L1927-L1933) |
+| 单文件 + 仅 backup-dir：backup-dir 与 src/dst 非同目录 | 模式 A + `srcFileName!=""` | [L1934-L1940](./fs/operations/operations.go#L1934-L1940) |
+| 单文件 + 两者皆设：**豁免目录检查** | 模式 C + `srcFileName!=""` | [L1934 条件不满足，跳过整个分支](./fs/operations/operations.go#L1934-L1941) |
+| 仅 suffix：**豁免所有目录检查**，直接复用 fdst | 模式 B | [L1942-L1944](./fs/operations/operations.go#L1942-L1944) |
+| 后端必须支持 Move 或 Copy | 所有模式 | [L1948-L1950](./fs/operations/operations.go#L1948-L1950) |
+| 不能与 `--no-check-dest` 同用 | 批量同步 | [sync.go L236-L238](./fs/sync/sync.go#L236-L238) |
 
 ### 9.2 Move() 降级边界易错点
 

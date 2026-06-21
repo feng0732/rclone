@@ -5,8 +5,8 @@
 rclone 的 `dedupe` 命令用于查找并处理重复文件，主要针对 Google Drive、Mega 等允许同名文件存在的云存储后端。该功能支持两种去重模式：按名称（by name）和按哈希（by hash）。
 
 核心代码位于：
-- [cmd/dedupe/dedupe.go](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/cmd/dedupe/dedupe.go) — CLI 命令入口，负责参数解析和标志注册
-- [fs/operations/dedupe.go](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go) — 核心业务逻辑实现
+- cmd/dedupe/dedupe.go — CLI 命令入口，负责参数解析和标志注册
+- fs/operations/dedupe.go — 核心业务逻辑实现
 
 ---
 
@@ -14,7 +14,7 @@ rclone 的 `dedupe` 命令用于查找并处理重复文件，主要针对 Googl
 
 ### 1.1 包级变量与标志注册
 
-命令入口的初始化部分位于 [cmd/dedupe/dedupe.go#L15-L25](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/cmd/dedupe/dedupe.go#L15-L25)：
+命令入口的初始化部分位于 cmd/dedupe/dedupe.go#L15-L25：
 
 ```go
 var (
@@ -36,7 +36,7 @@ func init() {
 
 ### 1.2 Cobra Run 处理函数：从命令行到核心 Deduplicate
 
-实际执行逻辑在 [cmd/dedupe/dedupe.go#L151-L167](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/cmd/dedupe/dedupe.go#L151-L167)，完整的参数传递链如下：
+实际执行逻辑在 cmd/dedupe/dedupe.go#L151-L167，完整的参数传递链如下：
 
 ```
 命令行: rclone dedupe [mode] remote:path [--by-hash] [--dedupe-mode xxx]
@@ -64,7 +64,7 @@ func init() {
 
 ### 1.3 模式字符串解析：DeduplicateMode.Set
 
-[fs/operations/dedupe.go#L222-L246](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L222-L246) 实现了模式从字符串到枚举的转换，不区分大小写：
+fs/operations/dedupe.go#L222-L246 实现了模式从字符串到枚举的转换，不区分大小写：
 
 ```go
 case "interactive" → DeduplicateInteractive   默认值
@@ -83,7 +83,7 @@ default           → 返回错误 "unknown mode for dedupe"
 
 ## 二、整体执行流程（Deduplicate 函数内部）
 
-主入口函数见 [fs/operations/dedupe.go#L402-L506](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L402-L506)。
+主入口函数见 fs/operations/dedupe.go#L402-L506。
 
 ```
 Deduplicate(ctx, f, mode, byHash)
@@ -111,7 +111,7 @@ Deduplicate(ctx, f, mode, byHash)
           │     │     └─ 剩余对象返回 remainingObjs
           │     └─ 若 len(remainingObjs) <= 1 → 日志 "All duplicates removed"，跳过后续
           │
-          └─ 4.2 根据 mode 执行最终保留策略
+          └─ 4.2 根据 mode 执行最终保留策略（switch 无 byHash 守卫，所有模式均会执行）
                 interactive / skip / first / newest
                 oldest / rename / largest / smallest / list
 ```
@@ -122,7 +122,7 @@ Deduplicate(ctx, f, mode, byHash)
 
 ### 3.1 哈希类型选择：GetOne() 的实现
 
-代码位于 [fs/operations/dedupe.go#L404-L413](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L404-L413)：
+代码位于 fs/operations/dedupe.go#L404-L413：
 
 ```go
 func Deduplicate(ctx context.Context, f fs.Fs, mode DeduplicateMode, byHash bool) error {
@@ -142,7 +142,7 @@ func Deduplicate(ctx context.Context, f fs.Fs, mode DeduplicateMode, byHash bool
 }
 ```
 
-`GetOne()` 的实现位于 [fs/hash/hash.go#L346-L360](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/hash/hash.go#L346-L360)，它从 `hash.Set`（位集合）中取最低位对应的哈希类型：
+`GetOne()` 的实现位于 fs/hash/hash.go#L346-L360，它从 `hash.Set`（位集合）中取最低位对应的哈希类型：
 
 ```go
 func (h Set) GetOne() Type {
@@ -159,7 +159,7 @@ func (h Set) GetOne() Type {
 }
 ```
 
-哈希类型的注册顺序（决定 GetOne 的优先级）见 [fs/hash/hash.go#L122-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/hash/hash.go#L122-L132)：
+哈希类型的注册顺序（决定 GetOne 的优先级）见 fs/hash/hash.go#L122-L132：
 MD5 → SHA1 → Whirlpool → CRC32 → SHA256 → SHA512 → BLAKE3 → XXH3 → XXH128
 
 因此如果后端同时支持 MD5 和 SHA256，`GetOne()` 会优先返回 MD5。
@@ -182,7 +182,7 @@ MD5 → SHA1 → Whirlpool → CRC32 → SHA256 → SHA512 → BLAKE3 → XXH3 �
 
 在文件分组阶段（按哈希模式），单个对象哈希计算失败会导致该对象被排除，不计入任何分组。
 
-代码位于 [fs/operations/dedupe.go#L443-L456](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L443-L456)：
+代码位于 fs/operations/dedupe.go#L443-L456：
 
 ```go
 var remote string
@@ -220,7 +220,7 @@ remote != "" 判断为 false
 
 ### 3.4 dedupeDeleteIdentical 中的哈希路径
 
-在按名称模式下，`dedupeDeleteIdentical` 内部还有一层哈希处理，位于 [fs/operations/dedupe.go#L104-L135](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L104-L135)：
+在按名称模式下，`dedupeDeleteIdentical` 内部还有一层哈希处理，位于 fs/operations/dedupe.go#L104-L135：
 
 ```go
 dupesByID := make(map[string][]fs.Object, len(objs))
@@ -269,11 +269,11 @@ for _, o := range objs {
 | 按名称 (byHash=false) | `o.Remote()` 即文件远程路径 | Google Drive 等同名后端 |
 | 按哈希 (byHash=true) | `o.Hash(ctx, ht)` 即文件内容哈希 | 任意支持哈希的后端 |
 
-分组逻辑位于 [fs/operations/dedupe.go#L437-L462](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L437-L462)。遍历结束后只处理 `len(objs) > 1` 的分组。
+分组逻辑位于 fs/operations/dedupe.go#L437-L462。遍历结束后只处理 `len(objs) > 1` 的分组。
 
 ### 4.2 重复目录识别（仅按名称模式）
 
-在处理文件之前，先处理同名目录。关键函数 [dedupeFindDuplicateDirs](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L281-L344)：
+在处理文件之前，先处理同名目录。关键函数 dedupeFindDuplicateDirs（fs/operations/dedupe.go#L281-L344）：
 
 1. 使用 `walk.ListR` 递归遍历所有目录条目
 2. 每个目录条目尝试获取：
@@ -282,7 +282,7 @@ for _, o := range objs {
 3. 以路径 `remote` 为 key 聚合目录数组，`len(dirs[remote]) > 1` 即判定为重复目录
 4. 按路径字典序排序（`sort.Strings`），确保父目录先于子目录被处理
 
-相关接口定义见 [fs/types.go#L167-L176](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/types.go#L167-L176)：
+相关接口定义见 fs/types.go#L167-L176：
 
 ```go
 type IDer interface {
@@ -297,7 +297,7 @@ type ParentIDer interface {
 
 ## 五、保留策略实现
 
-rclone 提供了 9 种去重模式，定义为 [fs/operations/dedupe.go#L182-L195](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L182-L195) 枚举：
+rclone 提供了 9 种去重模式，定义为 fs/operations/dedupe.go#L182-L195 枚举：
 
 ```go
 const (
@@ -315,7 +315,7 @@ const (
 
 ### 5.1 前置步骤：自动删除内容完全相同的副本
 
-**仅在按名称模式（`!byHash`）且模式不是 `DeduplicateList` 时执行**，入口位于 [fs/operations/dedupe.go#L469-L475](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L469-L475)：
+**仅在按名称模式（`!byHash`）且模式不是 `DeduplicateList` 时执行**，入口位于 fs/operations/dedupe.go#L469-L475：
 
 ```go
 if !byHash && mode != DeduplicateList {
@@ -327,7 +327,7 @@ if !byHash && mode != DeduplicateList {
 }
 ```
 
-[dedupeDeleteIdentical](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L76-L138) 逻辑：
+dedupeDeleteIdentical（fs/operations/dedupe.go#L76-L138）逻辑：
 
 1. **ID 重复安全检查**：先统计 `fs.IDer.ID()` 出现次数。若某 ID 在列表中出现 >1 次（可能是后端列表 API 返回重复条目），则这些对象被排除出删除候选，防止误删。
 2. **按内容分组**（详见上文 3.4 节）：
@@ -340,35 +340,62 @@ if !byHash && mode != DeduplicateList {
 
 对于基于时间或大小的策略，先排序再选择保留下标：
 
-- **Oldest/Newest**：使用 [sortOldestFirst](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L386-L390)，按 `ModTime()` 升序（最旧在前）
+- **Oldest/Newest**：使用 sortOldestFirst（fs/operations/dedupe.go#L386-L390），按 `ModTime()` 升序（最旧在前）
   - Oldest → 保留下标 0
   - Newest → 保留下标 `len(objs)-1`
 
-- **Smallest/Largest**：使用 [sortSmallestFirst](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L393-L397)，按 `Size()` 升序（最小在前）
+- **Smallest/Largest**：使用 sortSmallestFirst（fs/operations/dedupe.go#L393-L397），按 `Size()` 升序（最小在前）
   - Smallest → 保留下标 0
   - Largest → 保留下标 `len(objs)-1`
 
 ### 5.3 各模式最终行为总览
 
-| 模式 | 操作 | 核心代码位置 |
-|------|------|-------------|
-| `interactive` | 列出后询问用户：跳过(s) / 保留一个(k) / 改名(r) / 退出(q) | [dedupeInteractive](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L161-L179) |
-| `skip` | 不做任何操作，仅输出日志 | [fs/operations/dedupe.go#L497-L498](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L497-L498) |
-| `first` | `dedupeDeleteAllButOne(ctx, 0, ...)` 删除除第一个以外的所有副本 | [fs/operations/dedupe.go#L481-L482](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L481-L482) |
-| `newest` | 排序后保留最后一个（ModTime 最大） | [fs/operations/dedupe.go#L483-L485](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L483-L485) |
-| `oldest` | 排序后保留第一个（ModTime 最小） | [fs/operations/dedupe.go#L486-L488](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L486-L488) |
-| `rename` | 所有对象重命名，加 `-1/-2/-3` 数字后缀 | `dedupeRename()` |
-| `largest` | 排序后保留最后一个（Size 最大） | [fs/operations/dedupe.go#L491-L493](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L491-L493) |
-| `smallest` | 排序后保留第一个（Size 最小） | [fs/operations/dedupe.go#L494-L496](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L494-L496) |
-| `list` | 仅打印重复项信息（大小/时间/哈希/路径），不修改 | [dedupeList](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L141-L158) |
+switch 语句（fs/operations/dedupe.go#L476-L503）**没有任何 `byHash` 守卫**，所有模式在按名称和按哈希两种去重方式下都会进入执行分支：
+
+| 模式 | 操作 | 代码位置 |
+|------|------|----------|
+| `interactive` | 列出后询问用户：跳过(s) / 保留一个(k) / 改名(r,仅按名称) / 退出(q) | dedupeInteractive（fs/operations/dedupe.go#L161-L179） |
+| `skip` | 不做任何操作，仅输出日志 | fs/operations/dedupe.go#L497-L498 |
+| `first` | `dedupeDeleteAllButOne(ctx, 0, ...)` 删除除第一个以外的所有副本 | fs/operations/dedupe.go#L481-L482 |
+| `newest` | 排序后保留最后一个（ModTime 最大） | fs/operations/dedupe.go#L483-L485 |
+| `oldest` | 排序后保留第一个（ModTime 最小） | fs/operations/dedupe.go#L486-L488 |
+| `rename` | 所有对象重命名，加数字后缀 | fs/operations/dedupe.go#L489-L490 |
+| `largest` | 排序后保留最后一个（Size 最大） | fs/operations/dedupe.go#L491-L493 |
+| `smallest` | 排序后保留第一个（Size 最小） | fs/operations/dedupe.go#L494-L496 |
+| `list` | 仅打印重复项信息（大小/时间/哈希/路径），不修改 | dedupeList（fs/operations/dedupe.go#L141-L158） |
 
 ---
 
 ## 六、改名操作实现
 
-改名操作由 [dedupeRename](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L20-L56) 实现。注意：**按哈希模式下 interactive 菜单不提供 r 选项，rename 模式也不会对 hash 分组执行改名**——改名逻辑仅在按名称模式下有意义。
+改名操作由 dedupeRename（fs/operations/dedupe.go#L20-L56）实现。
 
-### 6.1 算法流程
+### 6.1 按哈希模式下 rename 的实际行为
+
+**关键事实**：switch 语句中 `case DeduplicateRename` 分支（fs/operations/dedupe.go#L489-L490）**没有 `byHash` 守卫**，在按哈希去重时同样会执行 `dedupeRename()`。
+
+但这两种模式下 `remote` 参数的含义完全不同：
+
+| 去重方式 | `remote` 值 | 改名结果 |
+|---------|------------|---------|
+| 按名称 (`byHash=false`) | 文件路径，如 `"photos/one.txt"` | `photos/one-1.txt`, `photos/one-2.txt` — 语义正确 |
+| 按哈希 (`byHash=true`) | 哈希字符串，如 `"1eedaa9fe86fd4b8632e2ac549403b36"` | `1eedaa9fe86fd4b8632e2ac549403b36-1` — 无扩展名，文件名即哈希串 |
+
+原因是 `dedupeRename` 使用 `path.Ext(remote)` 分离扩展名，而哈希字符串无扩展名，因此 `ext=""`, `base=哈希串`，新文件名形如 `<哈希>-<序号>`。这在功能上可行但语义上不合理——通常用户不会期望按哈希去重后文件被重命名为哈希串。
+
+**交互模式下的区别**：`dedupeInteractive`（fs/operations/dedupe.go#L161-L179）仅在 `!byHash` 时才在菜单中显示 rename 选项：
+
+```go
+commands := []string{"sSkip and do nothing", "kKeep just one (choose which in next step)"}
+if !byHash {
+    commands = append(commands, "rRename all to be different (by changing file.jpg to file-1.jpg)")
+}
+commands = append(commands, "qQuit")
+```
+
+因此在交互模式下按哈希去重时，用户不会看到 rename 选项。但非交互的 `--dedupe-mode rename` 在按哈希模式下仍会执行。
+
+### 6.2 算法流程
 
 ```
 对重复组中每个对象 objs[i] (i 从 0 开始):
@@ -402,7 +429,7 @@ if !byHash && mode != DeduplicateList {
     }
 ```
 
-### 6.2 关键细节
+### 6.3 关键细节
 
 - **命名规则**：`file.txt` → `file-1.txt`, `file-2.txt`, ...
   - 使用 `path.Ext()` 分离扩展名（保留后缀 `.txt`）
@@ -422,7 +449,7 @@ if !byHash && mode != DeduplicateList {
 
 ### 7.1 dedupeDeleteAllButOne
 
-[dedupeDeleteAllButOne](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L59-L73) 是通用的"保留一个，删除其余"函数：
+dedupeDeleteAllButOne（fs/operations/dedupe.go#L59-L73）是通用的"保留一个，删除其余"函数：
 
 ```go
 func dedupeDeleteAllButOne(ctx context.Context, keep int, remote string, objs []fs.Object) {
@@ -447,7 +474,7 @@ func dedupeDeleteAllButOne(ctx context.Context, keep int, remote string, objs []
 
 ### 7.2 DeleteFile 完整调用链
 
-实际删除操作位于 [fs/operations/operations.go#L550-L586](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/operations.go#L550-L586)：
+实际删除操作位于 fs/operations/operations.go#L550-L586：
 
 ```
 DeleteFile(ctx, obj)
@@ -472,7 +499,7 @@ DeleteFile(ctx, obj)
 
 ### 7.3 破坏性操作安全检查
 
-[SkipDestructive](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/operations.go#L2600-L2631) 是所有改名/删除/合并操作的统一安全闸：
+SkipDestructive（fs/operations/operations.go#L2600-L2631）是所有改名/删除/合并操作的统一安全闸：
 
 | 配置标志 | 行为 |
 |---------|------|
@@ -482,7 +509,7 @@ DeleteFile(ctx, obj)
 
 ### 7.4 目录合并
 
-对于重复目录，调用后端特性 `Features().MergeDirs` 进行合并，实现位于 [dedupeMergeDuplicateDirs](file:///d:/fz/0601-2/solo-dogfeeding/code/104-rclone/fs/operations/dedupe.go#L347-L383)：
+对于重复目录，调用后端特性 `Features().MergeDirs` 进行合并，实现位于 dedupeMergeDuplicateDirs（fs/operations/dedupe.go#L347-L383）：
 
 1. 选择条目数最多（`d.count` 最大）的目录置于数组首位，最小化后续文件移动次数
 2. `SkipDestructive` 检查是否跳过

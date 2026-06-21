@@ -701,7 +701,9 @@ for try := 1; try <= ci.Retries; try++ {
 
 > **结论**：L1 命令级重试**完全禁用**。无论 `ci.Retries` 设为多少（默认 3），循环只会执行 1 次。
 
-#### 8.5.2 完整调用链路追踪（共 11 层函数调用）
+#### 8.5.2 完整调用链路追踪（共 13 层函数调用）
+
+> 注意：本节的 `L0~L12` 是**调用栈物理顺序编号**（从外到内、从命令入口到 API 调用），与 §1 的「重试架构层级」（L1~L6，关注哪些层有重试逻辑）是两套不同的编号体系。§8.8 会用 `B1~B12` 从内到外描述错误冒泡路径，编号方向相反但栈是同一个。
 
 ```
 用户执行: rclone lsd s3:
@@ -840,11 +842,11 @@ s3.listBuckets()
 
 **关键事实**：
 1. Pacer 内部循环 2 次耗尽后，错误被 `pacerInvoker` 包装为 `RetryError`
-2. 上层（L3/L2/L1）虽然检测到 `IsRetryError(err)=true`，但**因为这些层本身没有重试循环**，错误直接向上冒泡
-3. 最终 cmd.Run 接收到错误，但由于 `Retry=false`，不会进入重试逻辑
+2. 上层所有中间层（`ListP` → `WithListP` → `List` → `DirSorted` → `walk` → `Walk` → `ListR` → `ListDir`）**都没有检测 `IsRetryError(err)` 的逻辑**，它们只是原样 return err，错误直接向上冒泡
+3. 最终 `cmd.Run` 接收到错误，但由于 `Retry=false`，不会进入重试逻辑
 4. 用户看到的就是原始错误信息，不会有 `Attempt 1/3 failed` 之类的重试日志
 
-> **与 `rclone sync` 的对比**：`sync` 命令调用 `cmd.Run(true, true, ...)`，即 `Retry=true`，所以 L1 命令级重试会生效；同时 sync 内部的 `processError` 和 `operations.Copy` 的 `Retry` 包装也会生效。但 `lsd` 是「简单列表」命令，设计者认为不需要多重重试。
+> **与 `rclone sync` 的对比**：`sync` 命令调用 `cmd.Run(true, true, ...)`，即 `Retry=true`，所以命令级重试会生效；同时 sync 内部的 `processError` 和 `operations.Copy` 的 `Retry` 包装也会生效。但 `lsd` 是「简单列表」命令，设计者认为不需要多重重试。
 
 ### 8.7 各命令的 `cmd.Run` 重试参数对比
 
@@ -865,11 +867,13 @@ s3.listBuckets()
 
 ### 8.8 RetryError 标记向上传递后的真实命运
 
-这是最容易被误解的部分：**Pacer 层产生的 RetryError 标记，在 lsd 命令中只是随错误一路返回，不会触发任何上层重试**。让我们沿着代码逐层追踪它的真实去向。
+这是最容易被误解的部分：**Pacer 层产生的 `RetryError` 标记，在 lsd 命令中只是随错误一路返回，不会触发任何上层重试**。让我们沿着代码逐层追踪它的真实去向。
+
+> 注意：本节的「调用栈层级编号」（B1~B12）是列表调用链的内部编号，与 §1 的「重试架构层级」（L1~L6）是两套不同的编号体系。架构层级关注「哪些层有重试逻辑」，调用栈层级关注「函数调用的物理顺序」。
 
 #### 8.8.1 标记起源：`pacerInvoker` 中的包装
 
-RetryError 标记诞生于 `fs/pacer.go` 的 `pacerInvoker` 函数（`fs/pacer.go` L24-L30）：
+`RetryError` 标记诞生于 `fs/pacer.go` 的 `pacerInvoker` 函数（`fs/pacer.go` L85-L92）：
 
 ```go
 func pacerInvoker(try, retries int, f pacer.Paced) (retry bool, err error) {
@@ -882,50 +886,58 @@ func pacerInvoker(try, retries int, f pacer.Paced) (retry bool, err error) {
 }
 ```
 
-当 Pacer 内部重试时（第 1 次失败、第 2 次失败...），每次失败的 err 都会被包装上 `RetryError` 标记。最终 Pacer 耗尽重试次数后，最后一次返回的 err 也是带 `RetryError` 标记的。
+当 Pacer 内部重试时（第 1 次失败、第 2 次失败……），每次失败的 err 都会被包装上 `RetryError` 标记。最终 Pacer 耗尽重试次数后，最后一次返回的 err 也是带 `RetryError` 标记的。
 
-#### 8.8.2 逐层向上：每层都只是"原样返回，不做重试决策
+#### 8.8.2 逐层向上：每层都只是「原样返回」，不做重试决策
 
-从 L12 `listBuckets` 到 L2 `ListDir`，共 11 层函数调用，每一层对错误的处理都**只有一件事：return err**。
+从 `s3.listBuckets` 到 `operations.ListDir`，共 11 层函数调用，每一层对错误的处理都**只有一件事：return err**。
 
-让我们按调用栈从下往上看：
+让我们按调用栈从下往上看（越靠下越接近实际 API 调用）：
 
-| 层级 | 函数 | 对错误的处理 | 代码位置 |
+| 栈层 | 函数 | 对错误的处理 | 代码位置 |
 |------|------|-------------|---------|
-| L12 | `s3.listBuckets()` | `return nil, err` | `backend/s3/s3.go` L2634 |
-| L11 | `s3.ListP()` | `return err`（通过 callback 或直接返回 | `backend/s3/s3.go` L2665 |
-| L10 | `list.WithListP()` | `return err` | `fs/list/helpers.go` L20 |
-| L9 | `s3.List()` | `return nil, err` | `backend/s3/s3.go` L2657 |
-| L8 | `list.DirSorted()` | `return nil, err` | `fs/list/list.go` L29 |
-| L7 | `walk.walk()` worker | `err = fs.CountError(ctx, err)` + 塞入 errs channel | `fs/walk/walk.go` L418 |
-| L6 | `walk.walkListDirSorted()` | 通过 walk 函数返回 err | `fs/walk/walk.go` L377 |
-| L5 | `walk.Walk()` | `return <-errs` | `fs/walk/walk.go` L338 |
-| L4 | `walk.listRwalk()` | `return err` | `fs/walk/walk.go` L196 |
-| L3 | `walk.ListR()` | `return err` | `fs/walk/walk.go` L127 |
-| L2 | `operations.ListDir()` | `return err` | `fs/operations/operations.go` L1047 |
+| B12 | `operations.ListDir()` | 通过 `walk.ListR` 透传返回 | `fs/operations/operations.go` L1040-L1049 |
+| B11 | `walk.ListR()` | 通过 `listRwalk` 透传返回 | `fs/walk/walk.go` L149-L163 |
+| B10 | `walk.listRwalk()` | 通过 `Walk` 透传返回 | `fs/walk/walk.go` L168-L197 |
+| B9  | `walk.Walk()` | 通过 `walkListDirSorted` 透传返回 | `fs/walk/walk.go` L65-L107 |
+| B8  | `walk.walkListDirSorted()` | 通过 `walk()` 透传返回 | `fs/walk/walk.go` L348-L350 |
+| B7  | `walk.walk()` 内部 worker | `err = fs.CountError(ctx, err)` 统计 + 塞入 errs channel | `fs/walk/walk.go` L416-L425 |
+| B6  | `list.DirSorted()` | `return nil, err` | `fs/list/list.go` L24-L30 |
+| B5  | `s3.List()` | 通过 `list.WithListP` 透传返回 | `backend/s3/s3.go` L2654-L2656 |
+| B4  | `list.WithListP()` | `return entries, err` | `fs/list/helpers.go` L54-L61 |
+| B3  | `s3.ListP()` | bucket 为空时调用 `listBuckets`，错误直接返回 | `backend/s3/s3.go` L2671-L2695 |
+| B2  | `s3.listBuckets()` | `return nil, err` | `backend/s3/s3.go` L2626-L2643 |
+| B1  | `pacerInvoker` 内的 `shouldRetry` | 产生 `RetryError` 标记 | `fs/pacer.go` L85-L92 |
 
 **关键观察**：
-- 所有中间层（L3~L11）**没有任何一层检查 `IsRetryError(err)` 并决定重试**
+- 所有中间层（B3~B12）**没有任何一层检查 `IsRetryError(err)` 并决定重试**
 - 它们要么直接 `return err`，要么通过 channel 传递
 - 错误像烫手山芋一样被层层向上扔，直到最外层来决定怎么办
+- 唯一的例外是 B7 层 `walk.walk()` 中的 `fs.CountError`——它不改变错误本身，只做统计记账
 
-#### 8.8.3 唯一的"副作用"：`fs.CountError` 统计
+#### 8.8.3 唯一的「副作用」：`fs.CountError` 统计
 
-在 L7 `walk.walk()` 中的这行代码是 RetryError 标记在冒泡过程中**唯一产生实际效果的地方：
+在 B7 层 `walk.walk()` 中的这行代码，是 `RetryError` 标记在冒泡过程中**唯一产生实际效果的地方**：
 
 ```go
 // fs/walk/walk.go L418
 err = fs.CountError(ctx, err)
 ```
 
-`fs.CountError` 不是一个普通函数，而是一个**函数指针**，依赖注入**：
+`fs.CountError` 不是一个普通函数，而是一个**包级函数指针（依赖注入模式）**：
 
 | 阶段 | 定义 | 位置 | 行为 |
 |------|------|------|------|
-| 默认 | `func(ctx, err) error { return err }` | `fs/config.go` L44 | 空实现，直接返回 |
-| 运行时 | 被 accounting 包覆盖 | `fs/accounting/accounting.go` L48 | 实际调用 `Stats(ctx).Error(err)` |
+| 默认空实现 | `func(ctx, err) error { return err }` | `fs/config.go` L39-L44 | 直接返回 err，什么都不做 |
+| 运行时注入 | 被 `accounting.Start()` 覆盖 | `fs/accounting/accounting.go` L34-L50 | 实际调用 `Stats(ctx).Error(err)` |
 
-> 这是 Go 中罕见的「包级依赖注入」模式——fs 包定义接口（函数指针），accounting 包在 `init()` 中注入实现，避免了 fs 包直接依赖 accounting 包（防止循环依赖）。
+**注入时机**：
+- **不是** `init()` 函数（注释明确说明 "We can't do this in an init() method as it uses fs.Config and that isn't set up then."）
+- **而是** `accounting.Start(ctx)` 函数中
+- `accounting.Start()` 由 `initConfig()`（cobra 的 `PersistentPreRun` 钩子）在命令执行前调用（`cmd/cmd.go` L403）
+- 所以当 `walk.walk()` 被调用时，注入已经完成
+
+> 这是 Go 中罕见的「包级依赖注入」模式——fs 包定义接口（函数指针），accounting 包在运行时注入实现，避免了 fs 包直接依赖 accounting 包（防止循环依赖）。
 
 #### 8.8.4 `accounting.Stats.Error()` 对 RetryError 的处理
 
@@ -936,30 +948,33 @@ func (s *StatsInfo) Error(err error) error {
     if err == nil || fserrors.IsCounted(err) {
         return err  // 已统计过的错误不再重复统计
     }
-    s.errors++        // 错误计数 +1
-    s.lastError = err  // 记录最后一个错误
-    err = fserrors.FsError(err)  // 包装为 FsError
-    fserrors.Count(err)            // 标记为已统计
+    s.errors++                         // 错误计数 +1
+    s.lastError = err                   // 记录最后一个错误
+    err = fserrors.FsError(err)         // 包装为 FsError
+    fserrors.Count(err)                 // 标记为已统计（防止重复计数）
 
     switch {
     case fserrors.IsFatalError(err):
-        s.fatalError = true           // 标记：出现过致命错误
+        s.fatalError = true             // 标记：出现过致命错误
     case fserrors.IsRetryAfterError(err):
-        s.retryAfter = ...           // 记录服务器建议重试时间
-        s.retryError = true           // 标记：出现过可重试错误
+        retryAfter := fserrors.RetryAfterErrorTime(err)
+        if s.retryAfter.IsZero() || retryAfter.Sub(s.retryAfter) > 0 {
+            s.retryAfter = retryAfter   // 记录服务器建议重试时间
+        }
+        s.retryError = true             // 标记：出现过可重试错误
     case !fserrors.IsNoRetryError(err):
-        s.retryError = true           // 标记：出现过可重试错误（默认都是可重试的，除非显式标记 NoRetry
+        s.retryError = true             // 标记：出现过可重试错误
     }
     return err
 }
 ```
 
-**RetryError 标记在这里的作用：
-- `IsNoRetryError(err)` 返回 **false**（因为 RetryError 不是 NoRetryError）
+**`RetryError` 标记在这里的作用**：
+- `IsNoRetryError(err)` 返回 **false**（因为 `RetryError` 不是 `NoRetryError`）
 - 所以会进入 `case !fserrors.IsNoRetryError(err):` 分支
 - `s.retryError = true` → 全局统计中标记为「可重试错误」
 
-> 但这只是**统计记账**，不是**重试决策**。`retryError` 标记被设置了，但它是否会导致实际重试，取决于最外层 cmd.Run 的 `Retry` 参数。
+> 但这只是**统计记账**，不是**重试决策**。`retryError` 标记被设置了，但它是否会导致实际重试，取决于最外层 `cmd.Run` 的 `Retry` 参数。
 
 #### 8.8.5 终点：`cmd.Run` 中 `Retry=false` 时的命运
 
@@ -987,8 +1002,8 @@ for try := 1; try <= ci.Retries; try++ {
 ```
 第 1 次循环 (try=1):
   ├─ f() 执行 → 失败，返回 RetryError
-  ├─ accounting stats.retryError = true  ← 已被设置了
-  ├─ accounting stats.errors = 1
+  ├─ walk 内部已调用过 fs.CountError → stats.retryError = true
+  ├─ stats.errors = 1
   │
   ├─ if !Retry || !Errored()
   │    = !false || !true
@@ -1002,13 +1017,13 @@ for try := 1; try <= ci.Retries; try++ {
 ```
 
 **关键结论**：
-1. ✅ `retryError 统计标记**确实被设置为 true**（因为错误不是 NoRetryError）
+1. ✅ `retryError` 统计标记**确实被设置为 true**（因为错误不是 NoRetryError）
 2. ❌ 但这个标记**永远不会被用于重试决策**（因为 `Retry=false` 直接 break 了）
-3. RetryError 标记在 lsd 命令中，只是一个「有状态但不用」——它存在于错误链上、存在于统计数据中，但不会触发任何实际的重试行为
+3. `RetryError` 标记在 lsd 命令中，只是一个「有状态但不用」的标记——它存在于错误链上、存在于统计数据中，但不会触发任何实际的重试行为
 
 #### 8.8.6 对比：`rclone sync` 中 RetryError 的不同命运
 
-作为对比，在 `rclone sync` 命令中（`cmd.Run(true, true, ...)`），RetryError 标记会经历完全不同的旅程：
+作为对比，在 `rclone sync` 命令中（`cmd.Run(true, true, ...)`），`RetryError` 标记会经历完全不同的旅程：
 
 ```
 sync 命令 (Retry=true):
@@ -1030,9 +1045,9 @@ sync 命令 (Retry=true):
      └─ ...
 ```
 
-> 在 sync 命令中，RetryError 标记是**真正参与重试决策的关键依据**——只有当 `HadRetryError()=true` 时，命令级重试才会继续；如果所有错误都是 NoRetryError，`HadRetryError()=false`，则直接放弃重试。
+> 在 sync 命令中，`RetryError` 标记是**真正参与重试决策的关键依据**——只有当 `HadRetryError()=true` 时，命令级重试才会继续；如果所有错误都是 NoRetryError，`HadRetryError()=false`，则直接放弃重试。
 
-但在 lsd 命令中，RetryError 标记只是一个**沉默的旁观者**——它被设置了，但从未被问过。
+但在 lsd 命令中，`RetryError` 标记只是一个**沉默的旁观者**——它被设置了，但从未被问过。
 
 ---
 

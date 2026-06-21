@@ -27,11 +27,151 @@
 
 | 模式 | `ci.BackupDir` | `ci.Suffix` | backupDir Fs 的来源 | 行为语义 |
 |---|---|---|---|---|
-| A. 仅 `--backup-dir` | 非空 | 任意 | `cache.Get(ci.BackupDir)` 新 Fs | 跨目录移动，文件结构不变 |
-| B. 仅 `--suffix` | 空 | 非空 | **直接复用 `fdst`** | 同目录内重命名（加后缀） |
+| A. 仅 `--backup-dir` | 非空 | 空（未设置） | `cache.Get(ci.BackupDir)` 新 Fs | 跨目录移动，文件名不变 |
+| B. 仅 `--suffix` | 空（未设置） | 非空 | **直接复用 `fdst`** | 同目录内重命名（加后缀），不跨目录 |
 | C. 两者皆设 | 非空 | 非空 | `cache.Get(ci.BackupDir)` 新 Fs | 跨目录移动 + 文件名加后缀 |
 
-> 关键：模式 B 下 `backupDir == fdst`，所以**同目录判断完全走另一条路**。
+> 关键区分：
+> - **模式 A vs 模式 C**：是否同时设置了 `--suffix`。两者 backupDir Fs 的来源相同（都是 `cache.Get(ci.BackupDir)`），但校验分支和备份文件名不同——模式 A 下备份文件名与原文件相同（靠目录隔离），模式 C 下还会追加 suffix（双重隔离）。
+> - **模式 B vs 其他**：backupDir 直接复用 `fdst` 而非独立 Fs，因此**不做 SameDir / Overlapping 检查**，也无法跨目录移动。
+
+---
+
+### 1.3 `--no-check-dest` 与目标对象读取的关系
+
+`--no-check-dest` 的语义是「不检查目标，无条件传输」（定义见 [config.go L231-L234](./fs/config.go#L231-L234)）。
+它对**覆盖前备份的触发**有决定性影响，并且在**批量同步**和**单文件操作**两条路径上的处理方式有本质差异。
+
+#### 1.3.1 核心原理：备份触发的前提
+
+覆盖前备份（`MoveBackupDir`）的判断条件**无论在哪条路径上都是同一套逻辑**：
+
+```go
+// 覆盖前备份触发的必要条件（AND 关系）
+dstObj != nil    // ① 目标对象存在（已被读取到）
+&& backupDir != nil  // ② 备份功能已启用
+```
+
+`--no-check-dest` 的影响点就在于**条件 ①**：它会直接跳过目标对象的读取步骤，
+导致 `dstObj` 永远为 `nil`，从而使覆盖前备份无法触发。
+
+#### 1.3.2 批量同步路径：显式互斥禁止
+
+批量同步（sync/copy/move 命令）在初始化阶段就**直接禁止**了 `--no-check-dest`
+与 backup-dir 的组合使用。位置：[sync.go L229-L238](./fs/sync/sync.go#L229-L238)
+
+```go
+if s.noCheckDest {
+    if s.deleteMode != fs.DeleteModeOff {
+        return nil, errors.New("can't use --no-check-dest with sync: use copy instead")
+    }
+    if ci.Immutable {
+        return nil, errors.New("can't use --no-check-dest with --immutable")
+    }
+    if s.backupDir != nil {     // ← 核心：与 backup-dir 直接互斥
+        return nil, errors.New("can't use --no-check-dest with --backup-dir")
+    }
+}
+```
+
+具体影响链路（如果去掉这道互斥检查，会发生什么）：
+
+```
+批量同步 + --no-check-dest
+    │
+    ▼
+newSyncCopyMove() 构造 March 匹配器
+    m.NoCheckDest = s.noCheckDest    [sync.go L962]
+    │
+    ▼
+march.Run() → processJob() 遍历目录
+    │
+    ├─ 正常遍历路径（!NoTraverse）：
+    │   L407: if !m.NoTraverse && !job.noDst
+    │           → job.noDst=true （即 NoCheckDest=true）
+    │           → **不发起 dst 目录列表**，dstChan 空
+    │
+    └─ NoTraverse 路径（逐个 head dst）：
+        L421: if m.NoTraverse && !m.NoCheckDest
+                → NoCheckDest=true 时条件不成立
+                → **不逐个 head dst 对象**
+    │
+    ▼
+matchListings() 生成 ObjectPair
+    因为 dstChan 中没有任何对象 → **所有 pair.Dst = nil**
+    │
+    ▼
+pairChecker 中覆盖前备份判断：
+    pair.Dst != nil && s.backupDir != nil
+    → pair.Dst 恒为 nil → 条件永远不成立
+    → ★ 覆盖前备份不触发，旧文件被直接覆盖 ★
+```
+
+这也解释了为什么代码要在 [sync.go L236-L238](./fs/sync/sync.go#L236-L238)
+加一道硬互斥：**否则用户以为启用了备份，实际上因为 dst 根本没被读取，
+任何覆盖都不会触发备份，等于静默丢了保护层**，是严重的数据安全风险。
+
+#### 1.3.3 单文件操作路径：无显式互斥，但备份静默失效
+
+单文件操作（copyto/moveto/transform 命令）走 `moveOrCopyFile()` 函数路径。
+与批量路径的关键区别：**没有 `--no-check-dest` 与 backup-dir 的互斥检查**。
+
+位置：[operations.go L2043-L2053](./fs/operations/operations.go#L2043-L2053)
+
+```go
+// moveOrCopyFile 内部
+var dstObj fs.Object
+if !ci.NoCheckDest {              // ← 影响点：NoCheckDest=true 时跳过
+    dstObj, err = fdst.NewObject(ctx, dstFileName)  // 读取目标对象
+    if errors.Is(err, fs.ErrorObjectNotFound) {
+        dstObj = nil
+    } else if err != nil { ... }
+}
+
+// 后面备份相关代码（L2068-L2107）正常执行：
+var backupDir fs.Fs
+if ci.BackupDir != "" || ci.Suffix != "" {
+    backupDir, err = BackupDir(...)  // ← backupDir 正常构造，不报错
+}
+...
+if dstObj != nil && backupDir != nil {   // ← 判断条件
+    err = MoveBackupDir(ctx, backupDir, dstObj)  // ← 永远走不到
+    dstObj = nil
+}
+```
+
+行为汇总表：
+
+| 组合 | backupDir 是否构造成功 | dstObj 值 | 覆盖前备份是否触发 | 实际效果 |
+|---|---|---|---|---|
+| `--no-check-dest` + `--backup-dir` | ✓ 正常构造（不报错） | 恒为 `nil`（跳过读取） | ✗ **不触发** | 用户以为有保护层，实际旧文件被直接覆盖 |
+| `--no-check-dest` + `--suffix` | ✓ 正常构造（fdst 复用） | 恒为 `nil` | ✗ **不触发** | suffix 也不会对旧文件生效 |
+| 仅 `--no-check-dest`（无 backup 标志） | 不构造 | 恒为 `nil` | N/A | 正常语义：无条件覆盖 |
+| 仅 backup-dir/suffix（无 NoCheckDest） | 正常构造 | 实际值，存在即非空 | ✓ 触发 | 正常语义：先备份再覆盖 |
+
+**注意**：单文件路径下这种"静默失效"是用户需要特别小心的坑——
+rclone 不会报错，但备份功能的核心效果完全达不到，因为连"目标上有什么需要备份"都不知道。
+
+#### 1.3.4 删除路径不受 `--no-check-dest` 直接影响
+
+`--no-check-dest` 的作用域是**目标对象查找（找 dstObj）**，而删除前备份走的是完全另一条路径：
+
+- `--delete-before/after`：通过 `dstFiles` map（完整扫描 dst 所得）找"多出的文件"，
+  **与 `--no-check-dest` 无关**，因为 `--no-check-dest` 不能和 sync 同用（见 L230-L231）。
+- `--delete-during`：同样在 march 匹配阶段识别 `dstOnly`，sync 模式已被互斥。
+
+也就是说：`--no-check-dest` 只可能影响** copy/move 命令的覆盖前备份**（sync 已被硬互斥屏蔽）。
+
+#### 1.3.5 小结：`--no-check-dest` 与备份的交互原则
+
+| 场景 | 互斥手段 | 触发备份？ |
+|---|---|---|
+| sync + `--no-check-dest` + backup-dir | [sync.go L236-L238](./fs/sync/sync.go#L236-L238) 硬报错 | 不可能出现这种组合 |
+| sync + `--no-check-dest` | [sync.go L230-L231](./fs/sync/sync.go#L230-L231) 硬报错（sync 本身禁用） | N/A |
+| copy/move（批量）+ NoCheckDest + backup-dir | 同上硬报错 | 不可能出现 |
+| copy/move（批量）+ NoCheckDest（无 backup） | 允许 | N/A（本来就不备份） |
+| copyto/moveto（单文件）+ NoCheckDest + backup-dir | **无互斥** | ✗ 不触发，静默失效 |
+| copyto/moveto（单文件）+ NoCheckDest（无 backup） | 允许 | N/A |
 
 ---
 
@@ -778,13 +918,15 @@ deleteFiles()                                   march() 匹配中写入 deleteFi
 
 | 约束项 | 生效模式 | 代码位置 |
 |---|---|---|
-| backup-dir 必须与 dst 同 remote（`SameConfig`） | 模式 A、C | [L1924-L1926](./fs/operations/operations.go#L1924-L1926) |
-| 批量同步：backup-dir 与 src/dst 不能重叠，考虑 filter 规则 | 模式 A、C + `srcFileName==""` | [L1927-L1933](./fs/operations/operations.go#L1927-L1933) |
-| 单文件 + 仅 backup-dir：backup-dir 与 src/dst 非同目录 | 模式 A + `srcFileName!=""` | [L1934-L1940](./fs/operations/operations.go#L1934-L1940) |
-| 单文件 + 两者皆设：**豁免目录检查** | 模式 C + `srcFileName!=""` | [L1934 条件不满足，跳过整个分支](./fs/operations/operations.go#L1934-L1941) |
-| 仅 suffix：**豁免所有目录检查**，直接复用 fdst | 模式 B | [L1942-L1944](./fs/operations/operations.go#L1942-L1944) |
-| 后端必须支持 Move 或 Copy | 所有模式 | [L1948-L1950](./fs/operations/operations.go#L1948-L1950) |
-| 不能与 `--no-check-dest` 同用 | 批量同步 | [sync.go L236-L238](./fs/sync/sync.go#L236-L238) |
+| backup-dir 必须与 dst 同 remote（`SameConfig`） | 模式 A、C | [operations.go L1924-L1926](./fs/operations/operations.go#L1924-L1926) |
+| 批量同步：backup-dir 与 src/dst 不能重叠，结合 filter 规则判断 | 模式 A、C + `srcFileName==""` | [operations.go L1927-L1933](./fs/operations/operations.go#L1927-L1933) |
+| 单文件 + 仅 backup-dir：backup-dir 与 src/dst 非同目录 | 模式 A + `srcFileName!=""` | [operations.go L1934-L1940](./fs/operations/operations.go#L1934-L1940) |
+| 单文件 + 两者皆设：**豁免目录检查**（靠 suffix 文件名隔离） | 模式 C + `srcFileName!=""` | [operations.go L1934 条件不满足，跳过整个分支](./fs/operations/operations.go#L1934-L1941) |
+| 仅 suffix：**豁免所有目录检查**，直接复用 fdst | 模式 B | [operations.go L1942-L1944](./fs/operations/operations.go#L1942-L1944) |
+| 后端必须支持 Move 或 Copy | 所有模式 | [operations.go L1948-L1950](./fs/operations/operations.go#L1948-L1950) |
+| `--no-check-dest` 不能与 backup-dir 同用（硬互斥报错） | 批量同步（sync/copy/move） | [sync.go L236-L238](./fs/sync/sync.go#L236-L238) |
+| `--no-check-dest` 不能与 sync 同用（sync 本身禁用） | 批量同步（sync 命令） | [sync.go L230-L231](./fs/sync/sync.go#L230-L231) |
+| `--no-check-dest` + backup：**无互斥但备份静默失效**（dstObj 恒为 nil） | 单文件操作（copyto/moveto） | [operations.go L2045](./fs/operations/operations.go#L2045-L2045) 导致 [L2099 条件不成立](./fs/operations/operations.go#L2099-L2099) |
 
 ### 9.2 Move() 降级边界易错点
 

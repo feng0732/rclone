@@ -4,24 +4,26 @@
 
 Rclone 使用 `cobra` 作为命令行框架，采用 **插件式注册 + 集中分发** 的架构模式。整个链路分为三个核心阶段：
 
-1. **命令注册阶段** - 编译期通过空白导入触发所有命令的自动注册
+1. **命令注册阶段** - 程序启动初始化阶段（main 执行前）通过空白导入触发所有命令的自动注册
 2. **参数解析阶段** - 运行期由 cobra 解析命令行参数和环境变量
 3. **运行分发阶段** - 根据解析结果分发到具体命令的执行函数
 
 ```
+程序启动初始化 (包 init() 顺序执行)
+        ↓
 启动入口 (rclone.go:main)
         ↓
-cmd.Main() [cmd/cmd.go:536-546]
+cmd.Main() [cmd/cmd.go]
         ↓
-setupRootCommand() [cmd/help.go:133-192]
+setupRootCommand() [cmd/help.go]
         ↓
 Root.Execute() [cobra 框架入口]
         ↓
-cobra.OnInitialize → initConfig() [cmd/cmd.go:383-482]
+cobra.OnInitialize → initConfig() [cmd/cmd.go]
         ↓
-子命令 Run 函数 (如 cmd/copy/copy.go:113-133)
+子命令 Run 函数 (如 cmd/copy/copy.go)
         ↓
-cmd.Run() 包装执行 [cmd/cmd.go:240-340]
+cmd.Run() 包装执行 [cmd/cmd.go]
         ↓
 实际业务逻辑 (如 sync.CopyDir / operations.CopyFile)
 ```
@@ -30,9 +32,11 @@ cmd.Run() 包装执行 [cmd/cmd.go:240-340]
 
 ## 二、命令注册机制
 
-### 2.1 入口触发链
+### 2.1 程序启动初始化阶段
 
-**[rclone.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/rclone.go#L1-L15)** 是程序启动的唯一入口：
+Go 程序在执行 `main()` 函数前，会按照导入依赖顺序依次执行所有被导入包的 `init()` 函数。Rclone 正是利用这一特性实现命令的自动注册。
+
+**rclone.go** 是程序启动的唯一入口：
 
 ```go
 package main
@@ -49,11 +53,11 @@ func main() {
 }
 ```
 
-通过 `_ "github.com/rclone/rclone/cmd/all"` 空白导入，触发所有命令包的 `init()` 函数执行。
+通过 `_ "github.com/rclone/rclone/cmd/all"` 空白导入，Go 运行时在 main 执行前会递归初始化该包及其所有依赖的包，从而触发所有命令包的 `init()` 函数执行。
 
 ### 2.2 命令批量导入
 
-**[cmd/all/all.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/all/all.go#L1-L83)** 集中导入所有命令包：
+**cmd/all/all.go** 集中导入所有命令包，确保它们的 `init()` 函数都被执行：
 
 ```go
 package all
@@ -70,7 +74,7 @@ import (
 
 ### 2.3 单个命令注册
 
-每个命令包在 `init()` 函数中将自身注册到根命令。以 **[cmd/copy/copy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/copy/copy.go#L22-L28)** 为例：
+每个命令包在 `init()` 函数中将自身注册到根命令。以 **cmd/copy/copy.go** 为例：
 
 ```go
 func init() {
@@ -86,7 +90,7 @@ func init() {
 
 ### 2.4 根命令定义
 
-**[cmd/help.go:26-40](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/help.go#L26-L40)** 定义了根命令 `Root`：
+**cmd/help.go** 定义了根命令 `Root`：
 
 ```go
 var Root = &cobra.Command{
@@ -102,14 +106,17 @@ var Root = &cobra.Command{
 }
 ```
 
-### 2.5 注册流程总结
+`Root` 作为包级变量，其初始化发生在 `cmd` 包的 `init()` 执行之前（包级变量初始化先于 `init()` 函数）。
 
-| 阶段 | 位置 | 核心动作 |
-|------|------|----------|
-| 编译期 | `rclone.go` | 空白导入 `cmd/all` 包 |
-| 包初始化 | `cmd/all/all.go` | 导入所有子命令包 |
-| 子命令 init | 各 `cmd/*/` 包 | 调用 `cmd.Root.AddCommand()` |
-| 运行期 | `cmd/cmd.go:Main()` | 调用 `setupRootCommand()` 完成最终配置 |
+### 2.5 注册流程总结（按实际执行顺序）
+
+| 阶段 | 时机 | 位置 | 核心动作 |
+|------|------|------|----------|
+| 包级变量初始化 | main 前 | cmd/help.go | `Root` 变量被创建为 `&cobra.Command{...}` |
+| 包 init() 执行 | main 前 | cmd 包自身 init | cmd 包的其他初始化逻辑 |
+| 子命令包 init() | main 前 | 各 cmd/*/ 包 init | 调用 `cmd.Root.AddCommand()` 注册子命令及标志 |
+| 标志分组 init() | main 前 | fs/config/flags/flags.go | 创建 14 个标志分组 |
+| main 函数执行 | 运行期 | rclone.go → cmd/cmd.go | 调用 `setupRootCommand()` 添加全局标志、帮助命令等 |
 
 ---
 
@@ -121,13 +128,13 @@ Rclone 的参数解析分为三层：
 
 | 层级 | 职责 | 核心代码 |
 |------|------|----------|
-| 全局标志 | 所有命令共享的通用参数 | `configflags.AddFlags()` |
-| 后端标志 | 各存储后端特有的参数 | `AddBackendFlags()` |
-| 命令标志 | 单个命令专属的参数 | 各命令 `init()` 中定义 |
+| 全局标志 | 所有命令共享的通用参数 | configflags.AddFlags() |
+| 后端标志 | 各存储后端特有的参数 | AddBackendFlags() |
+| 命令标志 | 单个命令专属的参数 | 各命令 init() 中定义 |
 
 ### 3.2 全局标志注册
 
-**[cmd/help.go:133-143](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/help.go#L133-L143)** 在 `setupRootCommand()` 中注册全局标志：
+**cmd/help.go** 的 `setupRootCommand()` 中注册全局标志：
 
 ```go
 func setupRootCommand(rootCmd *cobra.Command) {
@@ -146,7 +153,7 @@ func setupRootCommand(rootCmd *cobra.Command) {
 
 ### 3.3 后端标志注册
 
-**[cmd/cmd.go:522-533](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/cmd.go#L522-L533)** 遍历所有后端注册其标志：
+**cmd/cmd.go** 的 `AddBackendFlags()` 遍历所有后端注册其标志：
 
 ```go
 func AddBackendFlags() {
@@ -164,7 +171,7 @@ func AddBackendFlags() {
 
 ### 3.4 增强型 Flag 包装
 
-**[fs/config/flags/flags.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/fs/config/flags/flags.go)** 对 `pflag` 进行了增强，核心是 `installFlag()` 函数：
+**fs/config/flags/flags.go** 对 `pflag` 进行了增强，核心是 `installFlag()` 函数：
 
 ```go
 func installFlag(flags *pflag.FlagSet, name string, groupsString string) {
@@ -194,7 +201,7 @@ func installFlag(flags *pflag.FlagSet, name string, groupsString string) {
 
 ### 3.5 标志分组定义
 
-**[fs/config/flags/flags.go:111-127](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/fs/config/flags/flags.go#L111-L127)** 预定义了 14 个标志组：
+**fs/config/flags/flags.go** 预定义了 14 个标志组（同样在包 init() 阶段执行）：
 
 ```go
 func init() {
@@ -227,7 +234,7 @@ cobra 匹配子命令 "copy"
         ↓
 cobra.OnInitialize 触发 initConfig()
         ↓
-initConfig() [cmd/cmd.go:383-482]:
+initConfig() [cmd/cmd.go]:
   ├─ fs.GlobalOptionsInit()    # 从标志初始化全局配置
   ├─ fslog.InitLogging()       # 初始化日志系统
   ├─ configflags.SetFlags()    # 设置非配置系统的标志
@@ -243,7 +250,7 @@ initConfig() [cmd/cmd.go:383-482]:
 
 ### 4.1 主入口 Main 函数
 
-**[cmd/cmd.go:536-546](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/cmd.go#L536-L546)**：
+**cmd/cmd.go**:
 
 ```go
 func Main() {
@@ -261,7 +268,7 @@ func Main() {
 
 ### 4.2 命令执行包装器 cmd.Run()
 
-**[cmd/cmd.go:240-340](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/cmd.go#L240-L340)** 是所有命令执行的统一包装器，提供横切关注点：
+**cmd/cmd.go** 的 `Run()` 是所有命令执行的统一包装器，提供横切关注点：
 
 ```go
 func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
@@ -305,7 +312,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 
 ### 4.3 典型命令执行流程
 
-以 **[copy 命令](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/copy/copy.go#L113-L133)** 为例：
+以 **cmd/copy/copy.go** 中的 copy 命令为例：
 
 ```go
 var commandDefinition = &cobra.Command{
@@ -346,7 +353,7 @@ var commandDefinition = &cobra.Command{
 
 ### 4.4 参数校验 CheckArgs
 
-**[cmd/cmd.go:343-353](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/cmd.go#L343-L353)** 统一校验参数数量：
+**cmd/cmd.go** 的 `CheckArgs()` 统一校验参数数量：
 
 ```go
 func CheckArgs(MinArgs, MaxArgs int, cmd *cobra.Command, args []string) {
@@ -364,7 +371,7 @@ func CheckArgs(MinArgs, MaxArgs int, cmd *cobra.Command, args []string) {
 
 ### 4.5 退出码解析
 
-**[cmd/cmd.go:484-517](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/cmd.go#L484-L517)** 根据错误类型映射退出码：
+**cmd/cmd.go** 的 `resolveExitCode()` 根据错误类型映射退出码：
 
 ```go
 func resolveExitCode(err error) {
@@ -395,36 +402,53 @@ func resolveExitCode(err error) {
 
 ---
 
-## 五、完整调用链示例
+## 五、完整调用链示例（按实际执行顺序）
 
 以 `rclone copy src: dst: --verbose --transfers 16` 为例：
 
 ```
-1. [rclone.go:14] main() → cmd.Main()
-2. [cmd/cmd.go:537] setupRootCommand(Root)
-   ├─ 注册全局标志 (--verbose, --transfers 等)
-   └─ cobra.OnInitialize(initConfig)
-3. [cmd/cmd.go:538] AddBackendFlags() → 注册所有后端标志
-4. [cmd/cmd.go:539] Root.Execute()
-   ├─ cobra 解析命令行，匹配到 "copy" 子命令
-   ├─ 解析 --verbose → verbose=1
-   ├─ 解析 --transfers 16 → transfers=16
-   └─ 触发 cobra.OnInitialize → initConfig()
-5. [cmd/cmd.go:383] initConfig()
-   ├─ fs.GlobalOptionsInit() → transfers=16 写入全局配置
-   ├─ configflags.SetFlags() → verbose=1 → LogLevel=Info
-   ├─ configfile.Install() → 加载 rclone.conf
-   └─ accounting.Start() → 启动统计
-6. [cmd/copy/copy.go:113] copy 命令 Run 函数
-   ├─ cmd.CheckArgs(2, 2, ...) → 校验参数
-   ├─ cmd.NewFsSrcFileDst(args) → 创建 src 和 dst 文件系统
-   └─ cmd.Run(true, true, command, func() error { ... })
-7. [cmd/cmd.go:240] cmd.Run()
-   ├─ 启动统计 goroutine
-   ├─ 重试循环 (默认 3 次)
-   ├─ 调用匿名函数 → sync.CopyDir(...)
-   └─ 清理缓存，解析退出码
-8. [fs/sync/sync.go] sync.CopyDir() → 实际业务逻辑
+【程序启动初始化阶段 - main() 执行前】
+ 1. 包级变量初始化
+    ├─ cmd/help.go: Root = &cobra.Command{...}
+    └─ fs/config/flags/flags.go: All = NewGroups() + 14 个标志组
+ 2. 各包 init() 按导入顺序执行
+    ├─ cmd 包 init(): 全局标志定义 (--cpuprofile, --stats 等)
+    ├─ cmd/copy 等子命令包 init(): cmd.Root.AddCommand() 注册命令及标志
+    └─ backend 包 init(): 各后端注册到 fs.Registry
+
+【运行期阶段 - main() 执行】
+ 3. rclone.go: main() → cmd.Main()
+ 4. cmd/cmd.go: Main()
+    ├─ setupRootCommand(Root)
+    │   ├─ configflags.AddFlags() 注册配置类全局标志
+    │   ├─ filterflags.AddFlags() 注册过滤类全局标志
+    │   ├─ rcflags.AddFlags() 注册 RC API 标志
+    │   ├─ logflags.AddFlags() 注册日志标志
+    │   ├─ 添加 help/flags/backends 等帮助子命令
+    │   └─ cobra.OnInitialize(initConfig) 注册钩子
+    └─ AddBackendFlags() → 遍历 fs.Registry 添加所有后端标志
+ 5. Root.Execute() [cobra 框架]
+    ├─ 解析命令行: --verbose → verbose=1, --transfers 16 → transfers=16
+    ├─ 匹配子命令: "copy"
+    └─ 触发 cobra.OnInitialize → initConfig()
+ 6. cmd/cmd.go: initConfig()
+    ├─ fs.GlobalOptionsInit() → transfers=16 等写入全局 ConfigInfo
+    ├─ fslog.InitLogging() → 初始化日志系统
+    ├─ configflags.SetFlags() → verbose=1 → LogLevel=Info
+    ├─ configfile.Install() → 加载 rclone.conf 配置文件
+    └─ accounting.Start() → 启动统计系统
+ 7. cmd/copy/copy.go: copy 命令 Run 函数
+    ├─ cmd.CheckArgs(2, 2, ...) → 校验参数数量
+    ├─ cmd.NewFsSrcFileDst(args) → 创建源和目标文件系统实例
+    └─ cmd.Run(true, true, command, func() error { ... })
+ 8. cmd/cmd.go: cmd.Run() 包装执行
+    ├─ 启动统计/进度显示 goroutine
+    ├─ 注册信号处理
+    ├─ 重试循环 (默认最多 3 次)
+    │   └─ 调用匿名函数 → sync.CopyDir(ctx, fdst, fsrc, ...)
+    ├─ 停止统计输出
+    ├─ cache.Clear() → 清理缓存和后端连接
+    └─ resolveExitCode(cmdErr) → 根据执行结果退出
 ```
 
 ---
@@ -432,8 +456,8 @@ func resolveExitCode(err error) {
 ## 六、设计要点总结
 
 ### 6.1 插件式注册
-- 利用 Go 的空白导入机制实现命令自动注册
-- 新增命令只需在 `cmd/all/all.go` 添加一行导入
+- 利用 Go 程序的 **包初始化机制**（main 执行前自动执行所有导入包的 `init()`）实现命令自动注册
+- 新增命令只需在 `cmd/all/all.go` 添加一行空白导入，无需修改其他代码
 - 命令间完全解耦，符合开闭原则
 
 ### 6.2 统一横切关注点
@@ -459,11 +483,11 @@ func resolveExitCode(err error) {
 
 ### 6.5 关键文件索引
 
-| 文件 | 职责 |
-|------|------|
-| [rclone.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/rclone.go) | 程序入口，触发所有导入 |
-| [cmd/cmd.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/cmd.go) | 核心命令框架，Main/Run/CheckArgs 等 |
-| [cmd/help.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/help.go) | 根命令定义，setupRootCommand |
-| [cmd/all/all.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/all/all.go) | 所有命令的批量导入 |
-| [fs/config/flags/flags.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/fs/config/flags/flags.go) | 增强型 flag 系统 |
-| [cmd/copy/copy.go](file:///d:/fz/0601-2/solo-dogfeeding/code/105-rclone/cmd/copy/copy.go) | 典型命令实现示例 |
+| 文件路径 | 职责 |
+|----------|------|
+| rclone.go | 程序入口，通过空白导入触发所有包初始化 |
+| cmd/cmd.go | 核心命令框架，Main/Run/CheckArgs/initConfig 等 |
+| cmd/help.go | 根命令 Root 定义，setupRootCommand |
+| cmd/all/all.go | 所有命令的批量导入入口 |
+| fs/config/flags/flags.go | 增强型 flag 系统，支持环境变量和分组 |
+| cmd/copy/copy.go | 典型命令实现示例 |
